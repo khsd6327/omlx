@@ -1065,11 +1065,10 @@ def test_full_integration(model_path):
     print("Phase 2: VLM engine (mlx-vlm)")
     print(f"{'='*40}")
 
-    from omlx.engine.vlm import _patch_gemma4_vision_tower, _patch_video_processor_bug
+    from omlx.engine.vlm import _patch_video_processor_bug
     from omlx.models.vlm import VLMModelAdapter
 
     _patch_video_processor_bug()
-    _patch_gemma4_vision_tower(None)
 
     try:
         from mlx_vlm.utils import load as vlm_load

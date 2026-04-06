@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+
 from openai_harmony import load_harmony_encoding
 
 from omlx.adapter.gemma4 import Gemma4OutputParserSession
@@ -25,8 +27,20 @@ class FakeDetokenizer:
 
 
 class GemmaTokenizer:
-    def __init__(self, token_map: dict[int, str]):
+    def __init__(
+        self,
+        token_map: dict[int, str],
+        *,
+        has_tool_calling: bool = False,
+        tool_call_start: str | None = None,
+        tool_call_end: str | None = None,
+        tool_parser=None,
+    ):
         self._token_map = token_map
+        self.has_tool_calling = has_tool_calling
+        self.tool_call_start = tool_call_start
+        self.tool_call_end = tool_call_end
+        self.tool_parser = tool_parser
 
     @property
     def detokenizer(self):
@@ -141,6 +155,56 @@ class TestGemma4OutputParserSession:
         text = "".join(parts)
         assert text == "<think>\nreasoning</think>\nanswer"
         assert "<turn|>" not in text
+
+    def test_extracts_tool_calls_and_hides_gemma4_markup(self):
+        def parse_gemma4_tool_call(payload: str, _tools=None):
+            assert payload.startswith("call:describe_scene")
+            name, args = payload[len("call:"):].split("{", 1)
+            return {
+                "name": name,
+                "arguments": json.loads("{" + args),
+            }
+
+        token_map = {
+            1: "Look",
+            2: " here",
+            3: "<|tool_call>",
+            4: 'call:describe_scene{"summary":"solid colors"}',
+            5: "<tool_call|>",
+        }
+        tokenizer = GemmaTokenizer(
+            token_map,
+            has_tool_calling=True,
+            tool_call_start="<|tool_call>",
+            tool_call_end="<tool_call|>",
+            tool_parser=parse_gemma4_tool_call,
+        )
+        session = Gemma4OutputParserSession(tokenizer)
+
+        stream = []
+        visible = []
+        for token_id in [1, 2, 3, 4, 5]:
+            result = session.process_token(token_id)
+            stream.append(result.stream_text)
+            visible.append(result.visible_text)
+        final = session.finalize()
+        stream.append(final.stream_text)
+        visible.append(final.visible_text)
+
+        full_stream = "".join(stream)
+        full_visible = "".join(visible)
+
+        assert full_stream == "Look here"
+        assert full_visible == "Look here"
+        assert "<|tool_call>" not in full_stream
+        assert "<tool_call|>" not in full_stream
+        assert final.tool_calls == [
+            {
+                "name": "describe_scene",
+                "arguments": '{"summary": "solid colors"}',
+            }
+        ]
+        assert final.finish_reason == "tool_calls"
 
 
 class TestOutputParserFactory:

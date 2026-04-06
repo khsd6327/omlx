@@ -159,16 +159,22 @@ class TestInjectToolCalling:
 
         assert getattr(tokenizer, "has_tool_calling", False) is False
 
-    def test_skips_when_mlx_lm_not_available(self):
-        """ImportError from mlx_lm → silently skipped."""
+    def test_skips_when_tool_parser_modules_not_available(self):
+        """Missing mlx-vlm and mlx-lm tool parser modules → silently skipped."""
         engine = _make_engine()
         tokenizer = MockVLMTokenizer(
             chat_template="<tool_call> tool_call.name",
             vocab={"<tool_call>": 100, "</tool_call>": 101},
         )
 
-        with patch.dict("sys.modules", {"mlx_lm": None, "mlx_lm.tokenizer_utils": None}):
-            # Import will fail
+        with patch.dict(
+            "sys.modules",
+            {
+                "mlx_vlm.tool_parsers": None,
+                "mlx_lm": None,
+                "mlx_lm.tokenizer_utils": None,
+            },
+        ):
             engine._inject_tool_calling(tokenizer)
 
         # Should not crash, attributes not set
@@ -191,6 +197,44 @@ class TestInjectToolCalling:
         # After injection, instance attribute takes precedence
         assert tokenizer.has_tool_calling is True
         assert isinstance(tokenizer.tool_call_start, str)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="mlx required")
+def test_upstream_gemma4_vision_tower_accepts_mixed_size_image_lists():
+    """Gemma 4 mixed-resolution multi-image inputs should work upstream."""
+    pytest.importorskip("mlx_vlm.models.gemma4")
+
+    from mlx_vlm.models.gemma4.config import VisionConfig
+    from mlx_vlm.models.gemma4.vision import VisionModel
+
+    config = VisionConfig(
+        model_type="gemma4_vision",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=16,
+        rms_norm_eps=1e-6,
+        patch_size=16,
+        pooling_kernel_size=2,
+        default_output_length=4,
+        position_embedding_size=64,
+        use_clipped_linears=False,
+    )
+    model = VisionModel(config)
+
+    pixel_values = [
+        mx.random.uniform(shape=(3, 64, 64)),
+        mx.random.uniform(shape=(3, 32, 64)),
+    ]
+
+    features = model(pixel_values)
+
+    assert features.ndim == 3
+    assert features.shape[0] == 1
+    assert features.shape[1] > 0
+    assert features.shape[2] == config.hidden_size
 
 
 # ---------------------------------------------------------------------------

@@ -48,7 +48,7 @@ def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     """Run all vision cache tests for a single model."""
     from mlx_vlm.utils import load as vlm_load, prepare_inputs
 
-    from omlx.engine.vlm import _patch_gemma4_vision_tower, _patch_video_processor_bug
+    from omlx.engine.vlm import _patch_video_processor_bug
     from omlx.utils.image import compute_image_hash
 
     print(f"\n{'='*60}")
@@ -58,7 +58,6 @@ def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     # ── Step 1: Load model ──────────────────────────────────────
     print("\n[1/6] Loading model...")
     _patch_video_processor_bug()
-    _patch_gemma4_vision_tower(None)
     vlm_model, processor = vlm_load(model_path)
 
     model_type = getattr(vlm_model.config, "model_type", "unknown")
