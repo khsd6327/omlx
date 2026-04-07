@@ -1545,6 +1545,42 @@ class TestDetectNeedsThinkPrefix:
         request = self._make_request([1, 2, 100, 101])
         assert scheduler._detect_needs_think_prefix(request) is True
 
+    def test_typeerror_from_think_start_id_is_treated_as_no_single_token_start(
+        self, mock_model
+    ):
+        """Latest mlx-lm may raise TypeError when think_start is multi-token/None."""
+        from conftest import MockTokenizer
+
+        class _Tokenizer(MockTokenizer):
+            @property
+            def think_start_id(self):
+                raise TypeError("object of type 'NoneType' has no len()")
+
+        scheduler = Scheduler(model=mock_model, tokenizer=_Tokenizer())
+        request = self._make_request([1, 2, 3])
+        assert scheduler._detect_needs_think_prefix(request) is False
+
+    def test_typeerror_from_think_end_id_falls_back_to_string_resolution(
+        self, mock_model
+    ):
+        """Latest mlx-lm may raise TypeError when think_end is multi-token/None."""
+        from conftest import MockTokenizer
+
+        class _Tokenizer(MockTokenizer):
+            think_end = "</think>"
+
+            @property
+            def think_end_id(self):
+                raise TypeError("object of type 'NoneType' has no len()")
+
+            def encode(self, text, add_special_tokens=False):
+                if text == "</think>":
+                    return [101]
+                return []
+
+        scheduler = Scheduler(model=mock_model, tokenizer=_Tokenizer())
+        assert scheduler._resolve_think_end_token_ids() == [101]
+
 
 class TestOutputParserSmoke:
     """Smoke tests for scheduler output parser session integration."""
