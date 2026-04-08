@@ -705,51 +705,6 @@ class TestChatCompletionEndpoint:
         assert message["tool_calls"][0]["function"]["arguments"] == '{"city": "SF"}'
         assert data["choices"][0]["finish_reason"] == "tool_calls"
 
-    def test_chat_completion_uses_parser_tool_calls_for_gemma4(self, client, mock_llm_engine):
-        """Parser-extracted tool_calls should work for non-Harmony models too."""
-        mock_llm_engine._model_type = "gemma4"
-        mock_llm_engine.chat = AsyncMock(return_value=MockGenerationOutput(
-            text="",
-            prompt_tokens=10,
-            completion_tokens=5,
-            finish_reason="tool_calls",
-            finished=True,
-            tool_calls=[{
-                "name": "describe_scene",
-                "arguments": '{"summary":"solid colors"}',
-            }],
-        ))
-
-        response = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hi"}],
-                "tools": [{
-                    "type": "function",
-                    "function": {
-                        "name": "describe_scene",
-                        "description": "Describe the image",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"summary": {"type": "string"}},
-                            "required": ["summary"],
-                        },
-                    },
-                }],
-            },
-        )
-
-        assert response.status_code == 200
-        data = response.json()
-        message = data["choices"][0]["message"]
-
-        assert message.get("content") is None
-        assert len(message["tool_calls"]) == 1
-        assert message["tool_calls"][0]["function"]["name"] == "describe_scene"
-        assert message["tool_calls"][0]["function"]["arguments"] == '{"summary":"solid colors"}'
-        assert data["choices"][0]["finish_reason"] == "tool_calls"
-
 
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""

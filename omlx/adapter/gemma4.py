@@ -11,8 +11,6 @@ try:
 except ImportError:
     NaiveStreamingDetokenizer = None
 
-from ..api.thinking import extract_thinking
-from ..api.tool_calling import ToolCallStreamFilter, extract_tool_calls_with_thinking
 from ..api.utils import _PRESERVE_BOUNDARY_KEY
 from .output_parser import OutputParserFinalizeResult, OutputParserTokenResult
 
@@ -23,17 +21,6 @@ _TOOL_RESPONSE_OPEN = "<|tool_response>"
 _TOOL_RESPONSE_CLOSE = "<tool_response|>"
 _THINK_OPEN = "<think>\n"
 _THINK_CLOSE = "</think>\n"
-
-
-def _normalize_gemma4_protocol_text(text: str) -> str:
-    """Convert Gemma 4 protocol markers into the generic parser format."""
-    return (
-        text.replace(_OPEN_MARKER, _THINK_OPEN)
-        .replace(_CLOSE_MARKER, _THINK_CLOSE)
-        .replace(_TURN_END_MARKER, "")
-        .replace(_TOOL_RESPONSE_OPEN, "")
-        .replace(_TOOL_RESPONSE_CLOSE, "")
-    )
 
 
 def _try_parse_json(s: str) -> Any:
@@ -272,8 +259,6 @@ class Gemma4OutputParserSession:
         self._tokenizer = tokenizer
         self._buffer = ""
         self._in_thought = False
-        self._raw_text = ""
-        self._tool_filter = ToolCallStreamFilter(tokenizer)
 
         if hasattr(tokenizer, "detokenizer"):
             self._detokenizer = tokenizer.detokenizer
@@ -291,11 +276,10 @@ class Gemma4OutputParserSession:
         visible_parts: list[str],
         text: str,
     ) -> None:
-        cleaned_text = self._tool_filter.feed(text)
-        if not cleaned_text:
+        if not text:
             return
-        stream_parts.append(cleaned_text)
-        visible_parts.append(cleaned_text)
+        stream_parts.append(text)
+        visible_parts.append(text)
 
     def _active_markers(self) -> list[str]:
         markers = [_TURN_END_MARKER, _TOOL_RESPONSE_OPEN, _TOOL_RESPONSE_CLOSE]
@@ -375,7 +359,6 @@ class Gemma4OutputParserSession:
             text = self._detokenizer.last_segment
         else:
             text = self._tokenizer.decode([token_id])
-        self._raw_text += text
         return self._consume_text(text)
 
     def finalize(self) -> OutputParserFinalizeResult:
@@ -383,7 +366,6 @@ class Gemma4OutputParserSession:
         if self._detokenizer is not None:
             self._detokenizer.finalize()
             text = self._detokenizer.last_segment
-        self._raw_text += text
 
         token_result = self._consume_text(text, final=True)
 
@@ -391,43 +373,16 @@ class Gemma4OutputParserSession:
         visible_text = token_result.visible_text
 
         if self._buffer:
-            cleaned_tail = self._tool_filter.feed(self._buffer)
-            stream_text += cleaned_tail
-            visible_text += cleaned_tail
+            stream_text += self._buffer
+            visible_text += self._buffer
             self._buffer = ""
-
-        flushed_tail = self._tool_filter.finish()
-        if flushed_tail:
-            stream_text += flushed_tail
-            visible_text += flushed_tail
 
         if self._in_thought:
             stream_text += _THINK_CLOSE
             visible_text += _THINK_CLOSE
             self._in_thought = False
 
-        normalized_text = _normalize_gemma4_protocol_text(self._raw_text)
-        thinking_content, regular_content = extract_thinking(normalized_text)
-        extraction = extract_tool_calls_with_thinking(
-            thinking_content,
-            regular_content,
-            tokenizer=self._tokenizer,
-        )
-        tool_calls = None
-        finish_reason = None
-        if extraction.tool_calls:
-            tool_calls = [
-                {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                }
-                for tc in extraction.tool_calls
-            ]
-            finish_reason = "tool_calls"
-
         return OutputParserFinalizeResult(
             stream_text=stream_text,
             visible_text=visible_text,
-            tool_calls=tool_calls or [],
-            finish_reason=finish_reason,
         )

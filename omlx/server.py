@@ -2023,8 +2023,10 @@ async def create_chat_completion(
     thinking_content, regular_content = extract_thinking(raw_text)
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
-    # Parser-backed models may already have structured tool_calls.
-    if output.tool_calls:
+    # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
+    # For other models, parse from text output
+    if engine.model_type == "gpt_oss" and output.tool_calls:
+        # Harmony model with tool calls - convert format
         from .api.openai_models import ToolCall, FunctionCall
         tool_calls = [
             ToolCall(
@@ -3184,8 +3186,10 @@ async def create_anthropic_message(
     thinking_content, regular_content = extract_thinking(raw_text)
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
-    # Parser-backed models may already have structured tool_calls.
-    if output.tool_calls:
+    # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
+    # For other models, parse from text output
+    if engine.model_type == "gpt_oss" and output.tool_calls:
+        # Harmony model with tool calls - convert format
         from .api.openai_models import ToolCall, FunctionCall
         tool_calls = [
             ToolCall(
@@ -3552,8 +3556,8 @@ async def create_response(
     raw_text = clean_special_tokens(output.text) if output.text else ""
     thinking_content, regular_content = extract_thinking(raw_text)
 
-    # Parser-backed models may already have structured tool_calls.
-    if output.tool_calls:
+    # Parse tool calls
+    if engine.model_type == "gpt_oss" and output.tool_calls:
         tool_calls = output.tool_calls
         cleaned_text = regular_content
     else:
