@@ -994,6 +994,8 @@ class VLMBatchedEngine(BaseEngine):
             specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
         if kwargs.get("specprefill_keep_pct") is not None:
             specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop("specprefill_keep_pct")
+        if kwargs.get("specprefill_threshold") is not None:
+            specprefill_kwargs["specprefill_threshold"] = kwargs.pop("specprefill_threshold")
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
@@ -1215,6 +1217,13 @@ class VLMBatchedEngine(BaseEngine):
                 chat_template_kwargs=ct_kwargs,
                 tools=template_tools,
             )
+            # Free Metal intermediates from vision encoding.
+            # Vision tower + projector produce large intermediate buffers
+            # that stay in the Metal cache pool until explicitly cleared.
+            # Without this, repeated VLM requests accumulate memory and
+            # eventually trigger ProcessMemoryEnforcer aborts (see #667).
+            mx.synchronize()
+            mx.clear_cache()
             return token_ids, vlm_embeds, vlm_kwargs, image_hash
         else:
             # Text-only path: standard chat template

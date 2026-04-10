@@ -1545,42 +1545,43 @@ class TestDetectNeedsThinkPrefix:
         request = self._make_request([1, 2, 100, 101])
         assert scheduler._detect_needs_think_prefix(request) is True
 
-    def test_typeerror_from_think_start_id_is_treated_as_no_single_token_start(
-        self, mock_model
-    ):
-        """Latest mlx-lm may raise TypeError when think_start is multi-token/None."""
+    def test_think_start_id_raises_type_error(self, mock_model):
+        """Tokenizer whose think_start_id raises TypeError -> False.
+
+        Models like context-1 (harmony parser) have _think_start_tokens=None
+        in their mlx-lm tokenizer, causing think_start_id to raise TypeError.
+        """
         from conftest import MockTokenizer
 
-        class _Tokenizer(MockTokenizer):
-            @property
-            def think_start_id(self):
-                raise TypeError("object of type 'NoneType' has no len()")
-
-        scheduler = Scheduler(model=mock_model, tokenizer=_Tokenizer())
+        tokenizer = MockTokenizer()
+        type(tokenizer).think_start_id = PropertyMock(
+            side_effect=TypeError("object of type 'NoneType' has no len()")
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
         request = self._make_request([1, 2, 3])
         assert scheduler._detect_needs_think_prefix(request) is False
 
-    def test_typeerror_from_think_end_id_falls_back_to_string_resolution(
+    def test_think_end_id_raises_type_error_falls_back_to_string_resolution(
         self, mock_model
     ):
-        """Latest mlx-lm may raise TypeError when think_end is multi-token/None."""
+        """Tokenizer whose think_end_id raises TypeError still resolves via think_end."""
         from conftest import MockTokenizer
 
-        class _Tokenizer(MockTokenizer):
-            think_end = "</think>"
+        tokenizer = MockTokenizer()
+        tokenizer.think_end = "</think>"
+        type(tokenizer).think_end_id = PropertyMock(
+            side_effect=TypeError("object of type 'NoneType' has no len()")
+        )
 
-            @property
-            def think_end_id(self):
-                raise TypeError("object of type 'NoneType' has no len()")
+        def _encode(text, add_special_tokens=False):
+            if text == "</think>":
+                return [101]
+            return []
 
-            def encode(self, text, add_special_tokens=False):
-                if text == "</think>":
-                    return [101]
-                return []
+        tokenizer.encode = _encode
 
-        scheduler = Scheduler(model=mock_model, tokenizer=_Tokenizer())
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
         assert scheduler._resolve_think_end_token_ids() == [101]
-
 
 class TestOutputParserSmoke:
     """Smoke tests for scheduler output parser session integration."""
