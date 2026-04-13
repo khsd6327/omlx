@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the in-memory hot cache tier in PagedSSDCacheManager."""
 
+import queue
 import threading
 import time
 from pathlib import Path
@@ -636,6 +637,62 @@ class TestHotCacheWriteBack:
             ssd_files = list((tmp_path / "wb_evict_test").rglob("*.safetensors"))
             assert len(ssd_files) >= 1, "Evicted block should be written to SSD"
         finally:
+            mgr.close()
+
+    def test_queue_saturation_rejects_new_block_without_dropping_hot_set(self, tmp_path):
+        """A full spill queue should reject the new block and preserve the hot set."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "wb_full_queue_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+        )
+
+        try:
+            for i in range(2):
+                block_hash = f"wb_full_blk_{i}__".encode()
+                cache_data = self._make_cache_data()
+                assert mgr.save_block(
+                    block_hash=block_hash,
+                    cache_data=cache_data,
+                    token_count=16,
+                    model_name="test",
+                    layer_cache_types=["KVCache"] * 2,
+                )
+
+            # Stop the writer so the replacement queue stays saturated.
+            mgr._writer_shutdown.set()
+            try:
+                mgr._write_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            mgr._writer_thread.join(timeout=2)
+
+            mgr._write_queue = queue.Queue(maxsize=1)
+            mgr._write_queue.put_nowait(
+                (b"busy", {}, {}, tmp_path / "busy.safetensors")
+            )
+
+            cache_data = self._make_cache_data()
+            assert not mgr.save_block(
+                block_hash=b"wb_full_blk_2__",
+                cache_data=cache_data,
+                token_count=16,
+                model_name="test",
+                layer_cache_types=["KVCache"] * 2,
+            )
+
+            assert mgr._hot_cache_get(b"wb_full_blk_0__") is not None
+            assert mgr._hot_cache_get(b"wb_full_blk_1__") is not None
+            assert mgr._hot_cache_get(b"wb_full_blk_2__") is None
+            assert mgr.get_stats().hot_cache_evictions == 0
+        finally:
+            with mgr._hot_cache_lock:
+                mgr._hot_cache.clear()
+                mgr._hot_cache_total_bytes = 0
+            mgr._write_queue = queue.Queue(maxsize=4)
             mgr.close()
 
     def test_close_flushes_hot_cache_to_ssd(self, tmp_path):

@@ -613,39 +613,96 @@ class PagedSSDCacheManager(CacheManager):
         """Calculate memory footprint of a hot cache entry (sum of raw bytes)."""
         return sum(len(raw) for raw, _, _ in tensors_raw.values())
 
-    def _hot_cache_put(self, block_hash: bytes, entry: Dict) -> None:
+    def _hot_cache_put(self, block_hash: bytes, entry: Dict) -> bool:
         """Add entry to hot cache, evicting LRU entries if capacity exceeded.
 
         Evicted entries are flushed to SSD via the background writer thread.
+        If the spill queue cannot absorb the required evictions, the new block
+        is rejected and the current hot set is preserved.
         """
         entry_size = self._hot_cache_entry_size(entry['tensors_raw'])
-        evicted_entries: list = []
-        with self._hot_cache_lock:
-            # Remove old entry if updating
-            if block_hash in self._hot_cache:
-                old = self._hot_cache.pop(block_hash)
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(
-                    old['tensors_raw']
+        with self._lock:
+            with self._hot_cache_lock:
+                existing = self._hot_cache.get(block_hash)
+                existing_size = (
+                    self._hot_cache_entry_size(existing['tensors_raw'])
+                    if existing is not None
+                    else 0
                 )
-
-            # Evict LRU entries until we have room
-            while (
-                self._hot_cache_total_bytes + entry_size > self._hot_cache_max_bytes
-                and self._hot_cache
-            ):
-                evicted_hash, evicted = self._hot_cache.popitem(last=False)
-                self._hot_cache_total_bytes -= self._hot_cache_entry_size(
-                    evicted['tensors_raw']
+                projected_total = (
+                    self._hot_cache_total_bytes - existing_size + entry_size
                 )
-                self._stats["hot_cache_evictions"] += 1
-                evicted_entries.append((evicted_hash, evicted))
+                bytes_to_free = max(
+                    0, projected_total - self._hot_cache_max_bytes
+                )
+                evicted_entries: list = []
+                if bytes_to_free > 0:
+                    for evicted_hash, evicted in self._hot_cache.items():
+                        if evicted_hash == block_hash:
+                            continue
+                        evicted_entries.append((evicted_hash, evicted))
+                        bytes_to_free -= self._hot_cache_entry_size(
+                            evicted['tensors_raw']
+                        )
+                        if bytes_to_free <= 0:
+                            break
 
-            self._hot_cache[block_hash] = entry
-            self._hot_cache_total_bytes += entry_size
+                if bytes_to_free > 0:
+                    logger.warning(
+                        "Hot cache full, rejecting block %s because no spill "
+                        "set can free enough space",
+                        block_hash.hex()[:16],
+                    )
+                    return False
 
-        # Flush evicted entries to SSD outside the hot cache lock
-        for evicted_hash, evicted in evicted_entries:
-            self._enqueue_ssd_write(evicted_hash, evicted)
+                if self._write_queue.maxsize > 0:
+                    available_slots = (
+                        self._write_queue.maxsize - self._write_queue.qsize()
+                    )
+                    if len(evicted_entries) > available_slots:
+                        logger.warning(
+                            "SSD write queue saturated, rejecting new hot cache "
+                            "block %s (need %d spill slots, have %d)",
+                            block_hash.hex()[:16],
+                            len(evicted_entries),
+                            available_slots,
+                        )
+                        return False
+
+            # Reserve spill capacity before mutating the hot set so we do not
+            # drop old blocks just to discover the queue is already saturated.
+            for evicted_hash, evicted in evicted_entries:
+                if not self._enqueue_ssd_write(evicted_hash, evicted):
+                    logger.warning(
+                        "Failed to spill hot cache block %s while admitting %s; "
+                        "preserving the current hot set",
+                        evicted_hash.hex()[:16],
+                        block_hash.hex()[:16],
+                    )
+                    return False
+
+            with self._hot_cache_lock:
+                # Remove old entry if updating
+                if block_hash in self._hot_cache:
+                    old = self._hot_cache.pop(block_hash)
+                    self._hot_cache_total_bytes -= self._hot_cache_entry_size(
+                        old['tensors_raw']
+                    )
+
+                # Commit evictions only after spill reservation succeeded
+                for evicted_hash, _evicted in evicted_entries:
+                    evicted = self._hot_cache.pop(evicted_hash, None)
+                    if evicted is None:
+                        continue
+                    self._hot_cache_total_bytes -= self._hot_cache_entry_size(
+                        evicted['tensors_raw']
+                    )
+                    self._stats["hot_cache_evictions"] += 1
+
+                self._hot_cache[block_hash] = entry
+                self._hot_cache_total_bytes += entry_size
+
+        return True
 
     def _enqueue_ssd_write(self, block_hash: bytes, entry: Dict) -> bool:
         """Enqueue a hot cache entry for SSD background write.
@@ -722,8 +779,8 @@ class PagedSSDCacheManager(CacheManager):
                 'layer_cache_types': metadata.layer_cache_types,
                 'block_metadata': metadata,
             }
-            self._hot_cache_put(block_hash, entry)
-            self._stats["hot_cache_promotions"] += 1
+            if self._hot_cache_put(block_hash, entry):
+                self._stats["hot_cache_promotions"] += 1
         except Exception:
             pass  # Promotion failure is non-critical
 
@@ -1114,7 +1171,8 @@ class PagedSSDCacheManager(CacheManager):
                 # Write-back mode: store only in hot cache, no SSD index entry.
                 # SSD index entry is created later when block is evicted or
                 # flushed to SSD (in _enqueue_ssd_write).
-                self._hot_cache_put(block_hash, cache_entry)
+                if not self._hot_cache_put(block_hash, cache_entry):
+                    return False
                 self._stats["saves"] += 1
                 return True
 
@@ -1918,5 +1976,3 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
-
-
