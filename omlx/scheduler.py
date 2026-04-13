@@ -3707,6 +3707,25 @@ class Scheduler:
         # Cancel any pending deferred Metal cache clear
         self._deferred_clear_steps = None
 
+    def _close_boundary_snapshot_store(self, cleanup: bool = True) -> None:
+        """Stop the boundary snapshot writer thread and release the store."""
+        store = self._boundary_snapshot_store
+        if store is None:
+            return
+
+        if cleanup:
+            try:
+                store.cleanup_all()
+            except Exception as e:
+                logger.debug("Failed to clean up boundary snapshots on close: %s", e)
+
+        try:
+            store.shutdown()
+        except Exception as e:
+            logger.debug("Failed to stop boundary snapshot store: %s", e)
+
+        self._boundary_snapshot_store = None
+
     def deep_reset(self) -> None:
         """
         Deep reset that clears ALL cache state including model-level caches.
@@ -3716,6 +3735,10 @@ class Scheduler:
         """
         # Standard reset first
         self.reset()
+
+        # reset() clears snapshot contents but intentionally keeps the writer
+        # alive for continued scheduler use. Engine unload must stop it.
+        self._close_boundary_snapshot_store(cleanup=False)
 
         # Clear any model-level cache state
         # MLX models may have internal cache references
@@ -3754,6 +3777,7 @@ class Scheduler:
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         logger.info("Scheduler shutdown initiated...")
+        self._close_boundary_snapshot_store(cleanup=True)
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None

@@ -1063,6 +1063,38 @@ class TestSchedulerBoundarySnapshots:
 
         assert request.request_id not in scheduler._boundary_cache_snapshots
 
+    def test_deep_reset_shuts_down_boundary_snapshot_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """deep_reset must stop the background snapshot writer before dropping refs."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        store = MagicMock()
+        scheduler._boundary_snapshot_store = store
+
+        scheduler.deep_reset()
+
+        store.cleanup_all.assert_called_once()
+        store.shutdown.assert_called_once()
+        assert scheduler._boundary_snapshot_store is None
+
+    def test_shutdown_shuts_down_boundary_snapshot_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """shutdown must stop boundary snapshot writer threads on engine unload."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        store = MagicMock()
+        paged_ssd_cache_manager = MagicMock()
+        scheduler._boundary_snapshot_store = store
+        scheduler.paged_ssd_cache_manager = paged_ssd_cache_manager
+
+        scheduler.shutdown()
+
+        store.cleanup_all.assert_called_once()
+        store.shutdown.assert_called_once()
+        paged_ssd_cache_manager.close.assert_called_once()
+        assert scheduler._boundary_snapshot_store is None
+        assert scheduler.paged_ssd_cache_manager is None
+
 
 class TestSchedulerRotatingBlockAlignment:
     """Tests for rotating window/block-size alignment."""
