@@ -940,6 +940,197 @@ class TestStreamingHelperFunctions:
         assert "tool_use" in stop_reasons
 
     @pytest.mark.asyncio
+    async def test_stream_chat_completion_normalizes_supergemma_channel_markers(self):
+        """SuperGemma channel markers should be normalized before streaming deltas."""
+        from omlx.server import stream_chat_completion
+        from omlx.api.openai_models import ChatCompletionRequest, Message
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<|channel><|channel>42thought\nI will inspect ",
+                new_text="<|channel><|channel>42thought\nI will inspect ",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="<|channel><|channel>42thought\nI will inspect hina_cli/gateway.py<channel|>",
+                new_text="hina_cli/gateway.py<channel|>",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="tool_calls",
+                tool_calls=[{
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"hina_cli/gateway.py\"}",
+                }],
+            ),
+        ])
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }]
+
+        request = ChatCompletionRequest(
+            model="TedKim/supergemma4-26b-abliterated-multimodal-oQ8",
+            messages=[Message(role="user", content="Hi")],
+            stream=True,
+            tools=tools,
+        )
+
+        events = []
+        async for event in stream_chat_completion(
+            engine,
+            [{"role": "user", "content": "Hi"}],
+            request,
+            resolved_model=request.model,
+            max_tokens=128,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=tools,
+        ):
+            events.append(event)
+
+        payloads = [
+            json.loads(event[6:-2])
+            for event in events
+            if event.startswith("data: {")
+        ]
+
+        reasoning_deltas = []
+        content_deltas = []
+        tool_call_deltas = []
+        for payload in payloads:
+            choices = payload.get("choices", [])
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            if delta.get("reasoning_content"):
+                reasoning_deltas.append(delta["reasoning_content"])
+            if delta.get("content"):
+                content_deltas.append(delta["content"])
+            if delta.get("tool_calls"):
+                tool_call_deltas.extend(delta["tool_calls"])
+
+        streamed_reasoning = "".join(reasoning_deltas)
+        streamed_content = "".join(content_deltas)
+        assert "<|channel>" not in streamed_reasoning
+        assert "<channel|>" not in streamed_reasoning
+        assert "<|channel>" not in streamed_content
+        assert "<channel|>" not in streamed_content
+        assert "I will inspect hina_cli/gateway.py" in streamed_reasoning
+        assert len(tool_call_deltas) == 1
+        assert tool_call_deltas[0]["function"]["name"] == "read_file"
+
+    @pytest.mark.asyncio
+    async def test_stream_anthropic_messages_normalizes_supergemma_channel_markers(self):
+        """Anthropic SSE should not leak SuperGemma raw channel markers."""
+        from omlx.server import stream_anthropic_messages
+        from omlx.api.anthropic_models import MessagesRequest
+
+        engine = MockBaseEngine()
+        engine.set_stream_outputs([
+            MockGenerationOutput(
+                text="<|channel><|channel>42thought\nI will inspect ",
+                new_text="<|channel><|channel>42thought\nI will inspect ",
+                completion_tokens=1,
+                finished=False,
+            ),
+            MockGenerationOutput(
+                text="<|channel><|channel>42thought\nI will inspect hina_cli/gateway.py<channel|>",
+                new_text="hina_cli/gateway.py<channel|>",
+                completion_tokens=2,
+                finished=True,
+                finish_reason="tool_calls",
+                tool_calls=[{
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"hina_cli/gateway.py\"}",
+                }],
+            ),
+        ])
+
+        anthropic_tools = [{
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        }]
+        internal_tools = [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }]
+
+        request = MessagesRequest(
+            model="TedKim/supergemma4-26b-abliterated-multimodal-oQ8",
+            max_tokens=128,
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+            tools=anthropic_tools,
+        )
+
+        events = []
+        async for event in stream_anthropic_messages(
+            engine,
+            [{"role": "user", "content": "Hi"}],
+            request,
+            resolved_model=request.model,
+            max_tokens=128,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=40,
+            tools=internal_tools,
+        ):
+            events.append(event)
+
+        parsed_events = []
+        for event in events:
+            for line in event.split("\n"):
+                if line.startswith("data: "):
+                    try:
+                        parsed_events.append(json.loads(line[6:]))
+                    except json.JSONDecodeError:
+                        pass
+
+        thinking_deltas = []
+        tool_use_blocks = []
+        for event in parsed_events:
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "thinking_delta":
+                    thinking_deltas.append(delta["thinking"])
+            elif event.get("type") == "content_block_start":
+                content_block = event.get("content_block", {})
+                if content_block.get("type") == "tool_use":
+                    tool_use_blocks.append(content_block)
+
+        streamed_thinking = "".join(thinking_deltas)
+        assert "<|channel>" not in streamed_thinking
+        assert "<channel|>" not in streamed_thinking
+        assert "I will inspect hina_cli/gateway.py" in streamed_thinking
+        assert len(tool_use_blocks) == 1
+        assert tool_use_blocks[0]["name"] == "read_file"
+
+    @pytest.mark.asyncio
     async def test_stream_chat_completion_with_tools_and_tool_calls_keeps_prior_content(self):
         """A tool_call finish should end the turn, not suppress already-generated text."""
         from omlx.server import stream_chat_completion

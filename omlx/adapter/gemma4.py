@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, List
 
 try:
@@ -15,12 +16,18 @@ from ..api.utils import _PRESERVE_BOUNDARY_KEY
 from .output_parser import OutputParserFinalizeResult, OutputParserTokenResult
 
 _OPEN_MARKER = "<|channel>thought\n"
+_OPEN_MARKER_PREFIX = "<|channel>"
 _CLOSE_MARKER = "<channel|>"
 _TURN_END_MARKER = "<turn|>"
 _TOOL_RESPONSE_OPEN = "<|tool_response>"
 _TOOL_RESPONSE_CLOSE = "<tool_response|>"
 _THINK_OPEN = "<think>\n"
 _THINK_CLOSE = "</think>\n"
+_OPEN_MARKER_RE = re.compile(
+    r"(?:<\|channel>)+(?:[^<\r\n]{0,24})?thought(?:\r?\n)?"
+)
+_CLOSE_MARKER_RE = re.compile(r"(?:<channel\|>)+")
+_SUPPRESSED_MARKERS = (_TURN_END_MARKER, _TOOL_RESPONSE_OPEN, _TOOL_RESPONSE_CLOSE)
 
 
 def _try_parse_json(s: str) -> Any:
@@ -252,13 +259,163 @@ def _matching_prefix_len(text: str, marker: str) -> int:
     return 0
 
 
+def _find_open_candidate_start(text: str) -> int | None:
+    """Return the first likely start of a Gemma reasoning channel marker."""
+    idx = text.find(_OPEN_MARKER_PREFIX)
+    if idx != -1:
+        return idx
+
+    last_lt = text.rfind("<")
+    if last_lt == -1:
+        return None
+
+    candidate = text[last_lt:]
+    if _OPEN_MARKER_PREFIX.startswith(candidate):
+        return last_lt
+    return None
+
+
+class Gemma4ReasoningTextNormalizer:
+    """Normalize Gemma 4 channel markers into ``<think>`` tags.
+
+    Handles the standard marker as well as malformed variants seen in the
+    wild, such as repeated ``<|channel>`` prefixes or numeric junk before
+    ``thought`` (for example ``<|channel><|channel>42thought``).
+    """
+
+    def __init__(self):
+        self._buffer = ""
+        self._in_thought = False
+        self._suppress_next_leading_newline = False
+
+    def _find_next_marker(
+        self, source: str, pos: int
+    ) -> tuple[int, int, str] | tuple[None, None, None]:
+        candidates: list[tuple[int, int, str]] = []
+
+        open_match = _OPEN_MARKER_RE.search(source, pos)
+        if open_match:
+            candidates.append((open_match.start(), open_match.end(), "open"))
+
+        close_match = _CLOSE_MARKER_RE.search(source, pos)
+        if close_match:
+            candidates.append((close_match.start(), close_match.end(), "close"))
+
+        for marker in _SUPPRESSED_MARKERS:
+            idx = source.find(marker, pos)
+            if idx != -1:
+                candidates.append((idx, idx + len(marker), "suppress"))
+
+        if not candidates:
+            return None, None, None
+        return min(candidates, key=lambda item: item[0])
+
+    def _partial_suffix_len(self, text: str) -> int:
+        keep = 0
+        for marker in (_CLOSE_MARKER, *_SUPPRESSED_MARKERS):
+            keep = max(keep, _matching_prefix_len(text, marker))
+
+        open_candidate_start = _find_open_candidate_start(text)
+        if open_candidate_start is not None:
+            keep = max(keep, len(text) - open_candidate_start)
+
+        return min(keep, 128)
+
+    def _append_text(self, out: list[str], text: str) -> None:
+        if not text:
+            return
+        if self._suppress_next_leading_newline:
+            if text.startswith("\r\n"):
+                text = text[2:]
+            elif text.startswith("\n"):
+                text = text[1:]
+            self._suppress_next_leading_newline = False
+            if not text:
+                return
+        out.append(text)
+
+    def _consume_text(self, text: str, *, final: bool = False) -> str:
+        source = self._buffer + text
+        self._buffer = ""
+
+        out: list[str] = []
+        pos = 0
+
+        while pos < len(source):
+            start, end, kind = self._find_next_marker(source, pos)
+
+            if start is None or end is None or kind is None:
+                remainder = source[pos:]
+                if not final:
+                    open_candidate_start = _find_open_candidate_start(remainder)
+                    if open_candidate_start is not None:
+                        self._append_text(out, remainder[:open_candidate_start])
+                        self._buffer = remainder[open_candidate_start:]
+                        break
+
+                    keep = self._partial_suffix_len(remainder)
+                    if keep:
+                        self._append_text(out, remainder[:-keep])
+                        self._buffer = remainder[-keep:]
+                    else:
+                        self._append_text(out, remainder)
+                else:
+                    open_candidate_start = _find_open_candidate_start(remainder)
+                    if open_candidate_start is not None:
+                        self._append_text(out, remainder[:open_candidate_start])
+                    else:
+                        keep = self._partial_suffix_len(remainder)
+                        self._append_text(out, remainder[:-keep] if keep else remainder)
+                break
+
+            if start > pos:
+                self._append_text(out, source[pos:start])
+
+            if kind == "open":
+                if not self._in_thought:
+                    out.append(_THINK_OPEN)
+                    self._in_thought = True
+                    self._suppress_next_leading_newline = not source[start:end].endswith("\n")
+            elif kind == "close":
+                if self._in_thought:
+                    out.append(_THINK_CLOSE)
+                    self._in_thought = False
+                self._suppress_next_leading_newline = False
+
+            pos = end
+
+        return "".join(out)
+
+    def feed(self, text: str) -> str:
+        """Feed a text chunk and return normalized text safe to emit."""
+        if not text:
+            return ""
+        return self._consume_text(text)
+
+    def finish(self) -> str:
+        """Flush any buffered marker fragments at end-of-stream."""
+        out = self._consume_text("", final=True)
+        if self._buffer:
+            out += self._buffer
+            self._buffer = ""
+        if self._in_thought:
+            out += _THINK_CLOSE
+            self._in_thought = False
+        return out
+
+
+def normalize_gemma4_reasoning_text(text: str) -> str:
+    """Normalize Gemma 4 reasoning-channel protocol markers in complete text."""
+    normalizer = Gemma4ReasoningTextNormalizer()
+    return normalizer.feed(text) + normalizer.finish()
+
+
 class Gemma4OutputParserSession:
     """Suppress Gemma 4 protocol markers and re-emit thought blocks as ``<think>`` tags."""
 
     def __init__(self, tokenizer: Any):
         self._tokenizer = tokenizer
-        self._buffer = ""
-        self._in_thought = False
+        self._normalizer = Gemma4ReasoningTextNormalizer()
 
         if hasattr(tokenizer, "detokenizer"):
             self._detokenizer = tokenizer.detokenizer
@@ -270,96 +427,17 @@ class Gemma4OutputParserSession:
         if self._detokenizer is not None:
             self._detokenizer.reset()
 
-    def _append_text(
-        self,
-        stream_parts: list[str],
-        visible_parts: list[str],
-        text: str,
-    ) -> None:
-        if not text:
-            return
-        stream_parts.append(text)
-        visible_parts.append(text)
-
-    def _active_markers(self) -> list[str]:
-        markers = [_TURN_END_MARKER, _TOOL_RESPONSE_OPEN, _TOOL_RESPONSE_CLOSE]
-        markers.append(_CLOSE_MARKER if self._in_thought else _OPEN_MARKER)
-        return markers
-
-    @staticmethod
-    def _find_next_marker(
-        source: str, pos: int, markers: list[str]
-    ) -> tuple[int, str] | tuple[None, None]:
-        next_idx: int | None = None
-        next_marker: str | None = None
-        for marker in markers:
-            idx = source.find(marker, pos)
-            if idx == -1:
-                continue
-            if next_idx is None or idx < next_idx:
-                next_idx = idx
-                next_marker = marker
-        return next_idx, next_marker
-
-    def _consume_text(
-        self, text: str, *, final: bool = False
-    ) -> OutputParserTokenResult:
-        source = self._buffer + text
-        self._buffer = ""
-
-        stream_parts: list[str] = []
-        visible_parts: list[str] = []
-        pos = 0
-
-        while pos < len(source):
-            markers = self._active_markers()
-            idx, marker = self._find_next_marker(source, pos, markers)
-
-            if idx is None or marker is None:
-                remainder = source[pos:]
-                if not final:
-                    keep = max(
-                        _matching_prefix_len(remainder, marker_text)
-                        for marker_text in markers
-                    )
-                    if keep:
-                        emit = remainder[:-keep]
-                        self._buffer = remainder[-keep:]
-                    else:
-                        emit = remainder
-                else:
-                    emit = remainder
-
-                self._append_text(stream_parts, visible_parts, emit)
-                break
-
-            self._append_text(stream_parts, visible_parts, source[pos:idx])
-
-            if marker == _OPEN_MARKER:
-                stream_parts.append(_THINK_OPEN)
-                visible_parts.append(_THINK_OPEN)
-                self._in_thought = True
-            elif marker == _CLOSE_MARKER:
-                stream_parts.append(_THINK_CLOSE)
-                visible_parts.append(_THINK_CLOSE)
-                self._in_thought = False
-            elif marker == _TURN_END_MARKER:
-                pass
-
-            pos = idx + len(marker)
-
-        return OutputParserTokenResult(
-            stream_text="".join(stream_parts),
-            visible_text="".join(visible_parts),
-        )
-
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         if self._detokenizer is not None:
             self._detokenizer.add_token(token_id)
             text = self._detokenizer.last_segment
         else:
             text = self._tokenizer.decode([token_id])
-        return self._consume_text(text)
+        normalized = self._normalizer.feed(text)
+        return OutputParserTokenResult(
+            stream_text=normalized,
+            visible_text=normalized,
+        )
 
     def finalize(self) -> OutputParserFinalizeResult:
         text = ""
@@ -367,22 +445,10 @@ class Gemma4OutputParserSession:
             self._detokenizer.finalize()
             text = self._detokenizer.last_segment
 
-        token_result = self._consume_text(text, final=True)
-
-        stream_text = token_result.stream_text
-        visible_text = token_result.visible_text
-
-        if self._buffer:
-            stream_text += self._buffer
-            visible_text += self._buffer
-            self._buffer = ""
-
-        if self._in_thought:
-            stream_text += _THINK_CLOSE
-            visible_text += _THINK_CLOSE
-            self._in_thought = False
+        stream_text = self._normalizer.feed(text)
+        stream_text += self._normalizer.finish()
 
         return OutputParserFinalizeResult(
             stream_text=stream_text,
-            visible_text=visible_text,
+            visible_text=stream_text,
         )

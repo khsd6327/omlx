@@ -5,7 +5,10 @@ from __future__ import annotations
 
 from openai_harmony import load_harmony_encoding
 
-from omlx.adapter.gemma4 import Gemma4OutputParserSession
+from omlx.adapter.gemma4 import (
+    Gemma4OutputParserSession,
+    normalize_gemma4_reasoning_text,
+)
 from omlx.adapter.output_parser import detect_output_parser
 
 
@@ -141,6 +144,61 @@ class TestGemma4OutputParserSession:
         text = "".join(parts)
         assert text == "<think>\nreasoning</think>\nanswer"
         assert "<turn|>" not in text
+
+    def test_tolerates_repeated_channel_prefix_with_numeric_noise(self):
+        token_map = {
+            1: "<|channel>",
+            2: "<|channel>42thought",
+            3: "\nI have identified the files.",
+            4: "<channel|>",
+            5: "Step 1",
+        }
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+
+        parts = []
+        for token_id in [1, 2, 3, 4, 5]:
+            parts.append(session.process_token(token_id).stream_text)
+        parts.append(session.finalize().stream_text)
+
+        text = "".join(parts)
+        assert text == "<think>\nI have identified the files.</think>\nStep 1"
+        assert "<|channel>" not in text
+        assert "42thought" not in text
+
+    def test_tolerates_channel_marker_variant_without_newline(self):
+        token_map = {
+            1: "<|channel>|thought",
+            2: "I should inspect first.",
+            3: "<channel|>",
+            4: "Done",
+        }
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+
+        parts = []
+        for token_id in [1, 2, 3, 4]:
+            parts.append(session.process_token(token_id).stream_text)
+        parts.append(session.finalize().stream_text)
+
+        text = "".join(parts)
+        assert text == "<think>\nI should inspect first.</think>\nDone"
+        assert "<|channel>" not in text
+        assert "|thought" not in text
+
+    def test_normalize_complete_text_with_repeated_channel_markers(self):
+        text = (
+            "<|channel><|channel>42thought\n"
+            "I have identified the files."
+            "<channel|>"
+            "Next step"
+        )
+
+        normalized = normalize_gemma4_reasoning_text(text)
+
+        assert normalized == "<think>\nI have identified the files.</think>\nNext step"
+        assert "<|channel>" not in normalized
+        assert "<channel|>" not in normalized
 
 
 class TestOutputParserFactory:

@@ -153,6 +153,10 @@ from .api.tool_calling import (
 )
 from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
+from .adapter.gemma4 import (
+    Gemma4ReasoningTextNormalizer,
+    normalize_gemma4_reasoning_text,
+)
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -170,6 +174,25 @@ from .utils.tokenizer import is_gemma4_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _make_gemma4_reasoning_normalizer(
+    model_name: Optional[str],
+) -> Gemma4ReasoningTextNormalizer | None:
+    """Return a streaming normalizer for Gemma 4 family models."""
+    if model_name and is_gemma4_model(model_name):
+        return Gemma4ReasoningTextNormalizer()
+    return None
+
+
+def _normalize_gemma4_reasoning_text(
+    text: str,
+    model_name: Optional[str],
+) -> str:
+    """Normalize raw Gemma 4 protocol markers in complete text output."""
+    if text and model_name and is_gemma4_model(model_name):
+        return normalize_gemma4_reasoning_text(text)
+    return text
 
 
 # Security bearer for API key authentication
@@ -2120,6 +2143,7 @@ async def create_chat_completion(
 
         # Separate thinking from content
         raw_text = clean_special_tokens(output.text) if output.text else ""
+        raw_text = _normalize_gemma4_reasoning_text(raw_text, resolved_model or request.model)
         thinking_content, regular_content = extract_thinking(raw_text)
         cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
@@ -2551,6 +2575,9 @@ async def stream_chat_completion(
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
+    gemma_reasoning_filter = _make_gemma4_reasoning_normalizer(
+        resolved_model or request.model or ""
+    )
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
@@ -2580,14 +2607,18 @@ async def stream_chat_completion(
             stream_content = False
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
-            if first_token_time is None and output.new_text:
+            new_text = output.new_text or ""
+            if gemma_reasoning_filter and new_text:
+                new_text = gemma_reasoning_filter.feed(new_text)
+
+            if first_token_time is None and new_text:
                 first_token_time = time.perf_counter()
             last_output = output
-            if output.new_text:
-                accumulated_text += output.new_text
+            if new_text:
+                accumulated_text += new_text
 
-            if stream_content and output.new_text:
-                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+            if stream_content and new_text:
+                thinking_delta, content_delta = thinking_parser.feed(new_text)
 
                 # Emit reasoning_content delta
                 if thinking_delta:
@@ -2630,7 +2661,20 @@ async def stream_chat_completion(
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
+        gemma_tail = ""
+        if gemma_reasoning_filter:
+            gemma_tail = gemma_reasoning_filter.finish()
+            if gemma_tail:
+                accumulated_text += gemma_tail
+                pending_thinking, pending_content = thinking_parser.feed(gemma_tail)
+            else:
+                pending_thinking, pending_content = ("", "")
+        else:
+            pending_thinking, pending_content = ("", "")
+
         thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta = pending_thinking + thinking_delta
+        content_delta = pending_content + content_delta
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -2876,6 +2920,9 @@ async def stream_anthropic_messages(
 
     # Track content blocks with thinking separation
     thinking_parser = ThinkingParser()
+    gemma_reasoning_filter = _make_gemma4_reasoning_normalizer(
+        resolved_model or request.model or ""
+    )
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -2922,12 +2969,16 @@ async def stream_anthropic_messages(
         async for output in engine.stream_chat(messages=messages, **kwargs):
             last_output = output  # Keep reference for tool_calls and token counts
 
-            if first_token_time is None and output.new_text:
+            new_text = output.new_text or ""
+            if gemma_reasoning_filter and new_text:
+                new_text = gemma_reasoning_filter.feed(new_text)
+
+            if first_token_time is None and new_text:
                 first_token_time = time.perf_counter()
 
-            if output.new_text:
-                accumulated_text += output.new_text
-                thinking_delta, content_delta = thinking_parser.feed(output.new_text)
+            if new_text:
+                accumulated_text += new_text
+                thinking_delta, content_delta = thinking_parser.feed(new_text)
 
                 # Emit thinking content as thinking block
                 if thinking_delta:
@@ -2971,7 +3022,19 @@ async def stream_anthropic_messages(
         return
 
     # Flush remaining buffered content from thinking parser
+    if gemma_reasoning_filter:
+        gemma_tail = gemma_reasoning_filter.finish()
+        if gemma_tail:
+            accumulated_text += gemma_tail
+            pending_thinking, pending_content = thinking_parser.feed(gemma_tail)
+        else:
+            pending_thinking, pending_content = ("", "")
+    else:
+        pending_thinking, pending_content = ("", "")
+
     thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta = pending_thinking + thinking_delta
+    content_delta = pending_content + content_delta
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -3335,6 +3398,7 @@ async def create_anthropic_message(
 
         # Separate thinking from content
         raw_text = clean_special_tokens(output.text) if output.text else ""
+        raw_text = _normalize_gemma4_reasoning_text(raw_text, resolved_model or request.model)
         thinking_content, regular_content = extract_thinking(raw_text)
         cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
@@ -3726,6 +3790,7 @@ async def create_response(
 
         # Process output text
         raw_text = clean_special_tokens(output.text) if output.text else ""
+        raw_text = _normalize_gemma4_reasoning_text(raw_text, resolved_model or request.model)
         thinking_content, regular_content = extract_thinking(raw_text)
 
         # Parse tool calls
@@ -3841,6 +3906,9 @@ async def stream_responses_api(
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
+    gemma_reasoning_filter = _make_gemma4_reasoning_normalizer(
+        resolved_model or request.model or ""
+    )
     seq = 0
 
     response_id = generate_id(IDPrefix.RESPONSE)
@@ -3917,14 +3985,18 @@ async def stream_responses_api(
 
     try:
         async for output in engine.stream_chat(messages=messages, **kwargs):
-            if first_token_time is None and output.new_text:
+            new_text = output.new_text or ""
+            if gemma_reasoning_filter and new_text:
+                new_text = gemma_reasoning_filter.feed(new_text)
+
+            if first_token_time is None and new_text:
                 first_token_time = time.perf_counter()
             last_output = output
-            if output.new_text:
-                accumulated_text += output.new_text
+            if new_text:
+                accumulated_text += new_text
 
-            if stream_content and output.new_text:
-                _thinking, content_delta = thinking_parser.feed(output.new_text)
+            if stream_content and new_text:
+                _thinking, content_delta = thinking_parser.feed(new_text)
                 if content_delta:
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
@@ -3950,7 +4022,17 @@ async def stream_responses_api(
 
     # Flush remaining content from parsers
     if stream_content:
+        if gemma_reasoning_filter:
+            gemma_tail = gemma_reasoning_filter.finish()
+            if gemma_tail:
+                accumulated_text += gemma_tail
+                _pending_thinking, pending_content = thinking_parser.feed(gemma_tail)
+            else:
+                pending_content = ""
+
         _thinking, content_delta = thinking_parser.finish()
+        if gemma_reasoning_filter and pending_content:
+            content_delta = pending_content + content_delta
         if content_delta:
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
