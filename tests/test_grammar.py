@@ -11,7 +11,7 @@ Covers:
 """
 
 import json
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -48,6 +48,13 @@ def _make_tokenizer(*, think_start_id=None, think_end_id=None,
     else:
         tok.convert_tokens_to_ids = MagicMock(side_effect=KeyError)
     return tok
+
+
+def _install_fake_xgrammar(mock_get_tag: MagicMock) -> ModuleType:
+    """Provide a minimal xgrammar module for tests that patch optional imports."""
+    fake = ModuleType("xgrammar")
+    fake.get_builtin_structural_tag = mock_get_tag
+    return fake
 
 
 # =========================================================================
@@ -222,11 +229,9 @@ class TestCompileWithStructuralTag:
         from omlx.server import _compile_with_structural_tag
         return _compile_with_structural_tag(compiler, fmt, reasoning_parser, chat_template_kwargs)
 
-    @patch("omlx.server.xgr" if False else "xgrammar.get_builtin_structural_tag")
-    def test_calls_get_builtin_structural_tag(self, mock_get_tag):
+    def test_calls_get_builtin_structural_tag(self):
         """Verifies xgrammar.get_builtin_structural_tag is called with correct args."""
-        xgr = pytest.importorskip("xgrammar")
-
+        mock_get_tag = MagicMock()
         mock_tag = MagicMock()
         mock_tag.model_dump.return_value = {
             "type": "structural_tag",
@@ -238,16 +243,15 @@ class TestCompileWithStructuralTag:
         compiler.compile_structural_tag.return_value = "compiled"
 
         fmt = {"type": "json_schema", "json_schema": {"type": "object"}}
-        result = self._call(compiler, fmt, "qwen", None)
+        with patch.dict("sys.modules", {"xgrammar": _install_fake_xgrammar(mock_get_tag)}):
+            result = self._call(compiler, fmt, "qwen", None)
 
         mock_get_tag.assert_called_once_with("qwen", reasoning=True)
         compiler.compile_structural_tag.assert_called_once()
         assert result == "compiled"
 
-    @patch("xgrammar.get_builtin_structural_tag")
-    def test_reasoning_false_when_thinking_disabled(self, mock_get_tag):
-        xgr = pytest.importorskip("xgrammar")
-
+    def test_reasoning_false_when_thinking_disabled(self):
+        mock_get_tag = MagicMock()
         mock_tag = MagicMock()
         mock_tag.model_dump.return_value = {
             "type": "structural_tag",
@@ -259,15 +263,14 @@ class TestCompileWithStructuralTag:
         compiler.compile_structural_tag.return_value = "compiled"
 
         fmt = {"type": "json_schema", "json_schema": {"type": "object"}}
-        self._call(compiler, fmt, "qwen", {"enable_thinking": False})
+        with patch.dict("sys.modules", {"xgrammar": _install_fake_xgrammar(mock_get_tag)}):
+            self._call(compiler, fmt, "qwen", {"enable_thinking": False})
 
         mock_get_tag.assert_called_once_with("qwen", reasoning=False)
 
-    @patch("xgrammar.get_builtin_structural_tag")
-    def test_patches_user_grammar_into_tag(self, mock_get_tag):
+    def test_patches_user_grammar_into_tag(self):
         """The user's grammar should replace the any_text in the tag."""
-        xgr = pytest.importorskip("xgrammar")
-
+        mock_get_tag = MagicMock()
         mock_tag = MagicMock()
         mock_tag.model_dump.return_value = {
             "type": "structural_tag",
@@ -285,7 +288,8 @@ class TestCompileWithStructuralTag:
         compiler.compile_structural_tag.return_value = "compiled"
 
         user_fmt = {"type": "regex", "pattern": r"\d+"}
-        self._call(compiler, user_fmt, "qwen", None)
+        with patch.dict("sys.modules", {"xgrammar": _install_fake_xgrammar(mock_get_tag)}):
+            self._call(compiler, user_fmt, "qwen", None)
 
         tag_arg = compiler.compile_structural_tag.call_args[0][0]
         assert tag_arg["format"]["elements"][1] == user_fmt
@@ -399,10 +403,9 @@ class TestCompileGrammarForRequest:
         assert result == "compiled_builtin"
         compiler.compile_builtin_json_grammar.assert_called_once()
 
-    @patch("xgrammar.get_builtin_structural_tag")
-    def test_reasoning_parser_uses_structural_tag(self, mock_get_tag):
+    def test_reasoning_parser_uses_structural_tag(self):
         """When reasoning_parser is set, compile_structural_tag is used."""
-        pytest.importorskip("xgrammar")
+        mock_get_tag = MagicMock()
         mock_tag = MagicMock()
         mock_tag.model_dump.return_value = {
             "type": "structural_tag",
@@ -414,19 +417,19 @@ class TestCompileGrammarForRequest:
         compiler.compile_structural_tag.return_value = "compiled_structural"
         engine = _make_engine(grammar_compiler=compiler)
 
-        result = self._call(
-            engine,
-            structured_outputs={"json": {"type": "object"}},
-            reasoning_parser="qwen",
-        )
+        with patch.dict("sys.modules", {"xgrammar": _install_fake_xgrammar(mock_get_tag)}):
+            result = self._call(
+                engine,
+                structured_outputs={"json": {"type": "object"}},
+                reasoning_parser="qwen",
+            )
         assert result == "compiled_structural"
         compiler.compile_structural_tag.assert_called_once()
         mock_get_tag.assert_called_once_with("qwen", reasoning=True)
 
-    @patch("xgrammar.get_builtin_structural_tag")
-    def test_reasoning_parser_with_thinking_disabled(self, mock_get_tag):
+    def test_reasoning_parser_with_thinking_disabled(self):
         """enable_thinking=False → reasoning=False passed to get_builtin_structural_tag."""
-        pytest.importorskip("xgrammar")
+        mock_get_tag = MagicMock()
         mock_tag = MagicMock()
         mock_tag.model_dump.return_value = {
             "type": "structural_tag",
@@ -438,12 +441,13 @@ class TestCompileGrammarForRequest:
         compiler.compile_structural_tag.return_value = "compiled"
         engine = _make_engine(grammar_compiler=compiler)
 
-        self._call(
-            engine,
-            structured_outputs={"json": {"type": "object"}},
-            chat_template_kwargs={"enable_thinking": False},
-            reasoning_parser="qwen",
-        )
+        with patch.dict("sys.modules", {"xgrammar": _install_fake_xgrammar(mock_get_tag)}):
+            self._call(
+                engine,
+                structured_outputs={"json": {"type": "object"}},
+                chat_template_kwargs={"enable_thinking": False},
+                reasoning_parser="qwen",
+            )
         mock_get_tag.assert_called_once_with("qwen", reasoning=False)
 
     def test_no_reasoning_parser_uses_bare_grammar(self):
@@ -786,3 +790,39 @@ class TestGetModelVocabSize:
     def test_returns_none_when_unavailable(self):
         model = MagicMock(spec=[])
         assert self._call(model) is None
+
+
+class TestListGrammarParsers:
+    """Tests for GET /admin/api/grammar/parsers endpoint."""
+
+    @pytest.fixture()
+    def client(self):
+        from fastapi import FastAPI
+        from starlette.testclient import TestClient
+        from omlx.admin.auth import require_admin
+        from omlx.admin.routes import router
+
+        app = FastAPI()
+        app.include_router(router)
+        app.dependency_overrides[require_admin] = lambda: True
+        yield TestClient(app)
+        app.dependency_overrides.clear()
+
+    def test_returns_list_from_xgrammar(self, client):
+        pytest.importorskip("xgrammar")
+        resp = client.get("/admin/api/grammar/parsers")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list)
+        assert len(data) > 0
+        for item in data:
+            assert "value" in item
+            assert "label" in item
+            assert "models" in item
+            assert isinstance(item["models"], list)
+
+    def test_returns_empty_when_xgrammar_unavailable(self, client):
+        with patch.dict("sys.modules", {"xgrammar": None}):
+            resp = client.get("/admin/api/grammar/parsers")
+        assert resp.status_code == 200
+        assert resp.json() == []
