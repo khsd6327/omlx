@@ -91,6 +91,44 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._unload_engine.assert_called_once_with("model-a")
 
     @pytest.mark.asyncio
+    async def test_evicts_when_rss_over_limit_even_if_metal_is_not(self, enforcer):
+        """RSS pressure should trigger eviction even when Metal memory is below the limit."""
+        engine_a = MagicMock()
+        engine_a.abort_all_requests = AsyncMock(return_value=0)
+        engine_b = MagicMock()
+        engine_b.abort_all_requests = AsyncMock(return_value=0)
+        entry_a = _make_entry("model-a", engine=engine_a)
+        entry_b = _make_entry("model-b", engine=engine_b)
+        enforcer._engine_pool._entries = {
+            "model-a": entry_a,
+            "model-b": entry_b,
+        }
+        enforcer._engine_pool._find_lru_victim.return_value = "model-a"
+
+        async def fake_unload(model_id):
+            enforcer._engine_pool._entries[model_id].engine = None
+
+        enforcer._engine_pool._unload_engine.side_effect = fake_unload
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch.object(
+            enforcer,
+            "_get_process_rss_bytes",
+            side_effect=[15 * 1024**3, 15 * 1024**3, 8 * 1024**3],
+        ), patch.object(
+            enforcer,
+            "_get_cache_pressure_bytes",
+            return_value=2 * 1024**3,
+        ):
+            mock_mx.get_active_memory.side_effect = [
+                5 * 1024**3,
+                5 * 1024**3,
+                5 * 1024**3,
+            ]
+            await enforcer._check_and_enforce()
+
+        enforcer._engine_pool._unload_engine.assert_called_once_with("model-a")
+
+    @pytest.mark.asyncio
     async def test_stops_when_all_pinned(self, enforcer):
         """Stops eviction when all models are pinned (no victim)."""
         enforcer._engine_pool._find_lru_victim.return_value = None

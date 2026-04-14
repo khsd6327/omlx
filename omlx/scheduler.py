@@ -1527,6 +1527,18 @@ class Scheduler:
             for layer_cache in cache_list
         )
 
+    @staticmethod
+    def _interpret_boundary_snapshot_save_result(save_result: Any) -> Tuple[bool, bool]:
+        """Normalize BoundarySnapshotSSDStore.save() results."""
+        if isinstance(save_result, bool):
+            return save_result, not save_result
+
+        saved = bool(getattr(save_result, "saved", save_result))
+        retain_in_memory = bool(
+            getattr(save_result, "retain_in_memory", not saved)
+        )
+        return saved, retain_in_memory
+
     def _on_prefill_boundary_snapshot(
         self,
         uid: int,
@@ -1559,13 +1571,16 @@ class Scheduler:
         # None marker in the dict.  Falls back to in-memory storage when
         # the SSD store is unavailable or the write fails.
         if self._boundary_snapshot_store is not None:
-            saved = self._boundary_snapshot_store.save(
+            save_result = self._boundary_snapshot_store.save(
                 request_id, token_count, snapshot_cache,
                 self._extract_cache_states,
             )
+            saved, retain_in_memory = self._interpret_boundary_snapshot_save_result(
+                save_result
+            )
             if saved:
                 self._boundary_cache_snapshots[request_id][token_count] = None
-            else:
+            elif retain_in_memory:
                 self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
         else:
             self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
@@ -1673,13 +1688,16 @@ class Scheduler:
 
         # Offload to SSD with in-memory fallback.
         if self._boundary_snapshot_store is not None:
-            saved = self._boundary_snapshot_store.save(
+            save_result = self._boundary_snapshot_store.save(
                 request.request_id, total_tokens, snapshot_cache,
                 self._extract_cache_states,
             )
+            saved, retain_in_memory = self._interpret_boundary_snapshot_save_result(
+                save_result
+            )
             if saved:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = None
-            else:
+            elif retain_in_memory:
                 self._boundary_cache_snapshots[request.request_id][total_tokens] = snapshot_cache
         else:
             self._boundary_cache_snapshots[request.request_id][total_tokens] = snapshot_cache

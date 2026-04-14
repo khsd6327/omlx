@@ -695,6 +695,52 @@ class TestHotCacheWriteBack:
             mgr._write_queue = queue.Queue(maxsize=4)
             mgr.close()
 
+    def test_pending_write_budget_rejects_new_block_without_dropping_hot_set(self, tmp_path):
+        """A full pending-byte budget should reject the new block and preserve the hot set."""
+        entry_size = 2 * 2 * 1 * 2 * 16 * 16 * 4
+        max_bytes = entry_size * 2 + 100
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "wb_full_budget_test",
+            max_size_bytes=100 * 1024**2,
+            hot_cache_max_bytes=max_bytes,
+            max_pending_write_bytes=entry_size + 1024,
+        )
+
+        try:
+            for i in range(2):
+                block_hash = f"wb_budget_blk_{i}".encode()
+                cache_data = self._make_cache_data()
+                assert mgr.save_block(
+                    block_hash=block_hash,
+                    cache_data=cache_data,
+                    token_count=16,
+                    model_name="test",
+                    layer_cache_types=["KVCache"] * 2,
+                )
+
+            assert mgr._reserve_pending_write_bytes(
+                b"busy-budget",
+                mgr._max_pending_write_bytes,
+            )
+
+            cache_data = self._make_cache_data()
+            assert not mgr.save_block(
+                block_hash=b"wb_budget_blk_2",
+                cache_data=cache_data,
+                token_count=16,
+                model_name="test",
+                layer_cache_types=["KVCache"] * 2,
+            )
+
+            assert mgr._hot_cache_get(b"wb_budget_blk_0") is not None
+            assert mgr._hot_cache_get(b"wb_budget_blk_1") is not None
+            assert mgr._hot_cache_get(b"wb_budget_blk_2") is None
+            assert mgr.get_stats().pressure_rejections >= 1
+        finally:
+            mgr._release_pending_write_bytes(b"busy-budget")
+            mgr.close()
+
     def test_close_flushes_hot_cache_to_ssd(self, tmp_path):
         """close() should flush all hot cache entries to SSD."""
         mgr = PagedSSDCacheManager(

@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import mlx.core as mx
 import pytest
 
+from omlx.cache.boundary_snapshot_store import BoundarySnapshotSaveResult
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput, SchedulingPolicy
 
@@ -1062,6 +1063,40 @@ class TestSchedulerBoundarySnapshots:
         scheduler._on_prefill_boundary_snapshot(uid, [RotatingStub()], 3)
 
         assert request.request_id not in scheduler._boundary_cache_snapshots
+
+    def test_prefill_boundary_snapshot_drops_on_store_pressure_without_memory_fallback(
+        self, mock_model, mock_tokenizer
+    ):
+        """Pressure drops from the snapshot store should not keep snapshots in RAM."""
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_store = MagicMock()
+        scheduler._boundary_snapshot_store.save.return_value = BoundarySnapshotSaveResult(
+            saved=False,
+            retain_in_memory=False,
+            reason="pressure_drop",
+        )
+
+        request = Request(
+            request_id="req-prefill-drop",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        uid = 79
+        scheduler.requests[request.request_id] = request
+        scheduler.running[request.request_id] = request
+        scheduler.request_id_to_uid[request.request_id] = uid
+        scheduler.uid_to_request_id[uid] = request.request_id
+
+        RotatingStub = type("RotatingKVCache", (), {})
+        scheduler._on_prefill_boundary_snapshot(uid, [RotatingStub()], 4)
+
+        assert request.request_id in scheduler._boundary_cache_snapshots
+        assert 4 not in scheduler._boundary_cache_snapshots[request.request_id]
 
     def test_deep_reset_shuts_down_boundary_snapshot_store(
         self, mock_model, mock_tokenizer

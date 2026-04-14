@@ -199,6 +199,12 @@ class PagedSSDCacheStats(BaseCacheStats):
     hot_cache_evictions: int = 0
     hot_cache_promotions: int = 0
 
+    # Pending write / pressure metrics
+    pending_write_queue_size: int = 0
+    pending_write_bytes: int = 0
+    pending_write_max_bytes: int = 0
+    pressure_rejections: int = 0
+
     @property
     def save_rate(self) -> float:
         """Calculate successful save rate."""

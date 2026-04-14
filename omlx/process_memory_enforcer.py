@@ -102,6 +102,56 @@ class ProcessMemoryEnforcer:
             f"interval: {self._poll_interval}s)"
         )
 
+    def _get_process_rss_bytes(self) -> int:
+        """Return process RSS, or 0 when unavailable."""
+        try:
+            import psutil
+
+            return int(psutil.Process().memory_info().rss)
+        except Exception:
+            return 0
+
+    def _get_cache_pressure_bytes(self) -> int:
+        """Estimate non-Metal cache pressure from active schedulers."""
+        total = 0
+        for entry in self._engine_pool._entries.values():
+            engine = getattr(entry, "engine", None)
+            scheduler = getattr(engine, "scheduler", None)
+            if scheduler is None:
+                continue
+
+            ssd_cache = getattr(scheduler, "paged_ssd_cache_manager", None)
+            if ssd_cache is not None and hasattr(ssd_cache, "get_pressure_stats"):
+                try:
+                    total += int(
+                        ssd_cache.get_pressure_stats().get("pending_write_bytes", 0)
+                    )
+                except Exception:
+                    pass
+
+            snapshot_store = getattr(scheduler, "_boundary_snapshot_store", None)
+            if snapshot_store is not None and hasattr(snapshot_store, "get_pressure_stats"):
+                try:
+                    total += int(
+                        snapshot_store.get_pressure_stats().get("pending_write_bytes", 0)
+                    )
+                except Exception:
+                    pass
+        return total
+
+    def _get_memory_snapshot(self) -> dict:
+        """Collect current observed memory metrics."""
+        metal = mx.get_active_memory()
+        rss = self._get_process_rss_bytes()
+        cache_pressure = self._get_cache_pressure_bytes()
+        observed = max(metal, rss)
+        return {
+            "metal_bytes": metal,
+            "rss_bytes": rss,
+            "cache_pressure_bytes": cache_pressure,
+            "observed_bytes": observed,
+        }
+
     def _get_hard_limit_bytes(self) -> int:
         """Hard limit for inline prefill check: system_ram - 4GB.
 
@@ -204,7 +254,8 @@ class ProcessMemoryEnforcer:
         if self._max_bytes <= 0:
             return
 
-        current = mx.get_active_memory()
+        snapshot = self._get_memory_snapshot()
+        current = snapshot["observed_bytes"]
         if current <= self._max_bytes:
             return
 
@@ -212,14 +263,17 @@ class ProcessMemoryEnforcer:
         logger.warning(
             f"Process memory limit exceeded: "
             f"{_format_gb(current)} / {_format_gb(self._max_bytes)} "
-            f"(over by {_format_gb(overage)})"
+            f"(over by {_format_gb(overage)}, "
+            f"metal={_format_gb(snapshot['metal_bytes'])}, "
+            f"rss={_format_gb(snapshot['rss_bytes'])}, "
+            f"cache_pending={_format_gb(snapshot['cache_pressure_bytes'])})"
         )
 
         # Acquire EnginePool lock and unload LRU models until under limit.
         # Note: prefill loops self-check via _memory_limit_bytes (same thread,
         # no GIL issue), so they will abort independently of this enforcer.
         async with self._engine_pool._lock:
-            while mx.get_active_memory() > self._max_bytes:
+            while self._get_memory_snapshot()["observed_bytes"] > self._max_bytes:
                 victim = self._engine_pool._find_lru_victim()
                 if victim is not None:
                     # Count loaded non-pinned models
@@ -299,13 +353,22 @@ class ProcessMemoryEnforcer:
 
     def get_status(self) -> dict:
         """Get enforcer status for monitoring endpoints."""
-        current = mx.get_active_memory() if self._running else 0
+        snapshot = self._get_memory_snapshot() if self._running else {
+            "observed_bytes": 0,
+            "metal_bytes": 0,
+            "rss_bytes": 0,
+            "cache_pressure_bytes": 0,
+        }
+        current = snapshot["observed_bytes"]
         return {
             "enabled": self._running,
             "max_bytes": self._max_bytes,
             "max_formatted": _format_gb(self._max_bytes),
             "current_bytes": current,
             "current_formatted": _format_gb(current),
+            "metal_bytes": snapshot["metal_bytes"],
+            "rss_bytes": snapshot["rss_bytes"],
+            "cache_pressure_bytes": snapshot["cache_pressure_bytes"],
             "utilization": (
                 current / self._max_bytes if self._max_bytes > 0 else 0.0
             ),

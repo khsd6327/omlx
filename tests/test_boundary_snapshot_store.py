@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -238,6 +238,46 @@ class TestBoundarySnapshotSSDStore:
         assert snapshot_dir.exists()
         children = list(snapshot_dir.iterdir())
         assert len(children) == 0
+
+    def test_pressure_drop_does_not_leave_memory_fallback(self):
+        """Pressure drops should not retain raw snapshot bytes in memory."""
+        store = BoundarySnapshotSSDStore(
+            base_dir=self.base_dir,
+            max_pending_write_bytes=1,
+        )
+        try:
+            result = store.save(
+                "req-pressure", 1024, [MagicMock()], _mock_extract_cache_states
+            )
+            assert result.saved is False
+            assert result.retain_in_memory is False
+            assert store.has("req-pressure", 1024) is False
+
+            pressure = store.get_pressure_stats()
+            assert pressure["pending_write_bytes"] == 0
+            assert pressure["pressure_drops"] >= 1
+        finally:
+            store.shutdown()
+
+    def test_background_write_failure_releases_pending_budget(self):
+        """Failed background writes should not leave pending bytes behind."""
+        import time
+
+        with patch(
+            "omlx.cache.boundary_snapshot_store._write_safetensors_no_mx",
+            side_effect=OSError("disk fail"),
+        ):
+            result = self.store.save(
+                "req-fail", 1024, [MagicMock()], _mock_extract_cache_states
+            )
+            assert result.saved is True
+
+            time.sleep(0.5)
+
+            pressure = self.store.get_pressure_stats()
+            assert pressure["pending_write_bytes"] == 0
+            assert pressure["write_failures"] >= 1
+            assert self.store.has("req-fail", 1024) is False
 
 
 # ---------------------------------------------------------------------------

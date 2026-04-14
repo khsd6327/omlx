@@ -21,6 +21,7 @@ import queue
 import shutil
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -44,6 +45,30 @@ logger = logging.getLogger(__name__)
 _MAX_PENDING_WRITES = 128
 
 
+def _compute_max_pending_write_bytes() -> int:
+    """Compute a bounded raw-byte budget for pending snapshot writes."""
+    floor = 64 * 1024**2
+    ceiling = 512 * 1024**2
+    try:
+        total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        derived = total_bytes // 64
+    except (ValueError, OSError):
+        derived = floor
+    return max(floor, min(ceiling, derived))
+
+
+@dataclass(frozen=True)
+class BoundarySnapshotSaveResult:
+    """Result of attempting to offload a boundary snapshot."""
+
+    saved: bool
+    retain_in_memory: bool
+    reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.saved
+
+
 class BoundarySnapshotSSDStore:
     """Temporary SSD storage for boundary cache snapshots.
 
@@ -58,7 +83,11 @@ class BoundarySnapshotSSDStore:
         Snapshots are stored under ``base_dir/_boundary_snapshots/``.
     """
 
-    def __init__(self, base_dir: Path) -> None:
+    def __init__(
+        self,
+        base_dir: Path,
+        max_pending_write_bytes: Optional[int] = None,
+    ) -> None:
         self._snapshot_dir = base_dir / "_boundary_snapshots"
         # Clean up orphaned files from previous crashes.
         if self._snapshot_dir.exists():
@@ -78,6 +107,20 @@ class BoundarySnapshotSSDStore:
         # key: (request_id, token_count)
         self._pending_writes: Dict[Tuple[str, int], Dict] = {}
         self._pending_lock = threading.Lock()
+        self._max_pending_write_bytes = (
+            max_pending_write_bytes
+            if max_pending_write_bytes is not None
+            else _compute_max_pending_write_bytes()
+        )
+        self._pending_write_bytes: int = 0
+        self._pending_write_sizes: Dict[Tuple[str, int], int] = {}
+        self._last_pressure_warning_at: float = 0.0
+        self._generation: int = 0
+        self._stats = {
+            "saved_snapshots": 0,
+            "pressure_drops": 0,
+            "write_failures": 0,
+        }
 
         # Requests whose snapshots have been cleaned up — writer thread
         # skips queued items for these request IDs.
@@ -93,6 +136,46 @@ class BoundarySnapshotSSDStore:
         )
         self._writer_thread.start()
 
+    def _should_log_pressure_warning(self, interval_s: float = 5.0) -> bool:
+        """Rate-limit repetitive queue-pressure warnings."""
+        now = time.monotonic()
+        if now - self._last_pressure_warning_at < interval_s:
+            return False
+        self._last_pressure_warning_at = now
+        return True
+
+    def _reserve_pending_write_locked(
+        self,
+        pw_key: Tuple[str, int],
+        estimated_size: int,
+    ) -> bool:
+        """Reserve pending-write memory budget.
+
+        Caller must hold ``_pending_lock``.
+        """
+        if (
+            self._max_pending_write_bytes > 0
+            and self._pending_write_bytes + estimated_size
+            > self._max_pending_write_bytes
+        ):
+            self._stats["pressure_drops"] += 1
+            return False
+        self._pending_write_bytes += estimated_size
+        self._pending_write_sizes[pw_key] = estimated_size
+        return True
+
+    def _release_pending_write_locked(self, pw_key: Tuple[str, int]) -> None:
+        """Release pending-write memory budget.
+
+        Caller must hold ``_pending_lock``.
+        """
+        estimated_size = self._pending_write_sizes.pop(pw_key, None)
+        if estimated_size is not None:
+            self._pending_write_bytes = max(
+                0,
+                self._pending_write_bytes - estimated_size,
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -103,7 +186,7 @@ class BoundarySnapshotSSDStore:
         token_count: int,
         snapshot_cache: List[Any],
         extract_cache_states_fn: Callable,
-    ) -> bool:
+    ) -> BoundarySnapshotSaveResult:
         """Serialize snapshot to SSD (non-blocking).
 
         Must be called from the inference thread (Metal-safe for mx.eval).
@@ -122,26 +205,54 @@ class BoundarySnapshotSSDStore:
 
         Returns
         -------
-        bool
-            True if successfully enqueued for writing.
+        BoundarySnapshotSaveResult
+            Outcome of the offload attempt. Under queue pressure, the store can
+            choose to drop the snapshot instead of retaining it in memory.
         """
         if not HAS_MLX:
-            return False
+            return BoundarySnapshotSaveResult(
+                saved=False,
+                retain_in_memory=True,
+                reason="mlx_unavailable",
+            )
 
         try:
             # 1. Extract dict-format states on inference thread.
-            extracted, model_cache_config = extract_cache_states_fn(snapshot_cache)
+            extracted, _model_cache_config = extract_cache_states_fn(snapshot_cache)
             if not extracted:
-                return False
+                return BoundarySnapshotSaveResult(
+                    saved=False,
+                    retain_in_memory=True,
+                    reason="empty_extract",
+                )
 
             # 2. Flatten tensors + metadata for safetensors serialization.
             tensors_raw, metadata = self._serialize_extracted(
                 extracted, request_id, token_count
             )
+            estimated_size = sum(
+                len(raw) for raw, _, _ in tensors_raw.values()
+            ) + 1024
 
             # 3. Buffer in pending writes for instant read-back.
             pw_key = (request_id, token_count)
+            generation = self._generation
             with self._pending_lock:
+                if not self._reserve_pending_write_locked(pw_key, estimated_size):
+                    if self._should_log_pressure_warning():
+                        logger.warning(
+                            "Boundary snapshot backlog saturated, dropping snapshot "
+                            "%s/%d (pending=%d/%d bytes)",
+                            request_id,
+                            token_count,
+                            self._pending_write_bytes,
+                            self._max_pending_write_bytes,
+                        )
+                    return BoundarySnapshotSaveResult(
+                        saved=False,
+                        retain_in_memory=False,
+                        reason="pressure_drop",
+                    )
                 self._pending_writes[pw_key] = {
                     "tensors_raw": tensors_raw,
                     "metadata": metadata,
@@ -156,22 +267,45 @@ class BoundarySnapshotSSDStore:
             # 5. Enqueue for background write.
             try:
                 self._write_queue.put_nowait(
-                    (pw_key, tensors_raw, metadata, file_path)
+                    (pw_key, tensors_raw, metadata, file_path, generation)
                 )
             except queue.Full:
-                logger.warning(
-                    "Boundary snapshot write queue full, snapshot %s/%d "
-                    "stays in memory only",
-                    request_id,
-                    token_count,
+                with self._pending_lock:
+                    self._pending_writes.pop(pw_key, None)
+                    self._release_pending_write_locked(pw_key)
+                with self._registry_lock:
+                    req_files = self._file_registry.get(request_id)
+                    if req_files is not None:
+                        req_files.pop(token_count, None)
+                        if not req_files:
+                            self._file_registry.pop(request_id, None)
+                self._stats["pressure_drops"] += 1
+                if self._should_log_pressure_warning():
+                    logger.warning(
+                        "Boundary snapshot write queue full, dropping snapshot "
+                        "%s/%d",
+                        request_id,
+                        token_count,
+                    )
+                return BoundarySnapshotSaveResult(
+                    saved=False,
+                    retain_in_memory=False,
+                    reason="queue_full",
                 )
-                # Still returns True — data is in pending_writes for read-back.
 
-            return True
+            self._stats["saved_snapshots"] += 1
+            return BoundarySnapshotSaveResult(
+                saved=True,
+                retain_in_memory=False,
+            )
 
         except Exception as e:
             logger.debug("Failed to save boundary snapshot: %s", e)
-            return False
+            return BoundarySnapshotSaveResult(
+                saved=False,
+                retain_in_memory=True,
+                reason="serialization_failed",
+            )
 
     def load(
         self,
@@ -249,6 +383,7 @@ class BoundarySnapshotSSDStore:
                     keys_to_remove.append(key)
             for key in keys_to_remove:
                 del self._pending_writes[key]
+                self._release_pending_write_locked(key)
 
         # Remove from registry.
         with self._registry_lock:
@@ -264,6 +399,7 @@ class BoundarySnapshotSSDStore:
 
     def cleanup_all(self) -> None:
         """Delete all snapshot files (for reset/startup)."""
+        self._generation += 1
         # Drain write queue so the writer thread doesn't process stale
         # items after the directory is deleted.
         while True:
@@ -277,6 +413,8 @@ class BoundarySnapshotSSDStore:
 
         with self._pending_lock:
             self._pending_writes.clear()
+            self._pending_write_sizes.clear()
+            self._pending_write_bytes = 0
         with self._registry_lock:
             self._file_registry.clear()
         self._cancelled_requests.clear()
@@ -297,6 +435,20 @@ class BoundarySnapshotSSDStore:
             pass
         self._writer_thread.join(timeout=5.0)
 
+    def get_pressure_stats(self) -> Dict[str, int]:
+        """Expose pending-write pressure metrics for process monitoring."""
+        with self._pending_lock:
+            pending_bytes = self._pending_write_bytes
+            pending_entries = len(self._pending_writes)
+        return {
+            "pending_write_queue_size": self._write_queue.qsize(),
+            "pending_write_bytes": pending_bytes,
+            "pending_write_max_bytes": self._max_pending_write_bytes,
+            "pending_entries": pending_entries,
+            "pressure_drops": self._stats["pressure_drops"],
+            "write_failures": self._stats["write_failures"],
+        }
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -315,12 +467,13 @@ class BoundarySnapshotSSDStore:
             if item is None:  # Sentinel
                 break
 
-            pw_key, tensors_raw, metadata, file_path = item
+            pw_key, tensors_raw, metadata, file_path, generation = item
 
             # Skip writes for cancelled/cleaned-up requests.
-            if pw_key[0] in self._cancelled_requests:
+            if pw_key[0] in self._cancelled_requests or generation != self._generation:
                 with self._pending_lock:
                     self._pending_writes.pop(pw_key, None)
+                    self._release_pending_write_locked(pw_key)
                 continue
 
             try:
@@ -329,9 +482,12 @@ class BoundarySnapshotSSDStore:
                     file_path.stem + "_tmp.safetensors"
                 )
                 _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
+                if pw_key[0] in self._cancelled_requests or generation != self._generation:
+                    raise RuntimeError("stale boundary snapshot write")
                 os.rename(str(temp_path), str(file_path))
             except Exception as e:
                 logger.debug("Background snapshot write failed: %s", e)
+                self._stats["write_failures"] += 1
                 for p in (temp_path, file_path):
                     try:
                         if p is not None and p.exists():
@@ -339,16 +495,19 @@ class BoundarySnapshotSSDStore:
                     except Exception:
                         pass
             finally:
-                # Remove extracted cache objects from pending writes to free
-                # memory, but keep tensors_raw for read-back until file is on
-                # disk.
                 with self._pending_lock:
-                    pending = self._pending_writes.get(pw_key)
-                    if pending is not None:
-                        pending.pop("extracted", None)
-                    # If file was written successfully, remove entirely.
-                    if file_path.exists():
-                        self._pending_writes.pop(pw_key, None)
+                    # Release pending memory regardless of write outcome. Under
+                    # pressure we prefer dropping snapshot completeness over
+                    # retaining raw bytes indefinitely in process RSS.
+                    self._pending_writes.pop(pw_key, None)
+                    self._release_pending_write_locked(pw_key)
+                if not file_path.exists():
+                    with self._registry_lock:
+                        req_files = self._file_registry.get(pw_key[0])
+                        if req_files is not None:
+                            req_files.pop(pw_key[1], None)
+                            if not req_files:
+                                self._file_registry.pop(pw_key[0], None)
 
     def _serialize_extracted(
         self,
