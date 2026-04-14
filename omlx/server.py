@@ -166,6 +166,7 @@ from .exceptions import (
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .utils.tokenizer import is_gemma4_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1993,7 +1994,7 @@ async def create_chat_completion(
     # Validate context window before sending to model
     tools_for_template = convert_tools_for_template(effective_tools) if effective_tools else None
     # Gemma 4 drops required params that lack descriptions — enrich them
-    if tools_for_template and "gemma" in (resolved_model or "").lower():
+    if tools_for_template and is_gemma4_model(resolved_model or ""):
         tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
     try:
         num_prompt_tokens = engine.count_chat_tokens(
@@ -2161,7 +2162,7 @@ async def create_chat_completion(
                 logger.warning(f"JSON validation failed: {error}")
 
         # Reverse Gemma 4 parameter renaming (param_description -> description)
-        if tool_calls and "gemma" in (resolved_model or "").lower():
+        if tool_calls and is_gemma4_model(resolved_model or ""):
             for tc in tool_calls:
                 if tc.function and tc.function.arguments:
                     try:
@@ -2748,7 +2749,7 @@ async def stream_chat_completion(
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     # Reverse Gemma 4 parameter renaming for streaming path
-    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
+    if tool_calls and is_gemma4_model(resolved_model or request.model or ""):
         for tc in tool_calls:
             if tc.function and tc.function.arguments:
                 try:
@@ -3066,7 +3067,7 @@ async def stream_anthropic_messages(
         tool_calls = extraction.tool_calls
 
     # Reverse Gemma 4 parameter renaming
-    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
+    if tool_calls and is_gemma4_model(resolved_model or request.model or ""):
         for tc in tool_calls:
             if tc.function and tc.function.arguments:
                 try:
@@ -3268,7 +3269,7 @@ async def create_anthropic_message(
     else:
         internal_tools = user_internal
     # Gemma 4 drops required params that lack descriptions — enrich them
-    if internal_tools and "gemma" in (resolved_model or "").lower():
+    if internal_tools and is_gemma4_model(resolved_model or ""):
         internal_tools = enrich_tool_params_for_gemma4(internal_tools)
     if internal_tools:
         chat_kwargs["tools"] = internal_tools
@@ -3365,7 +3366,7 @@ async def create_anthropic_message(
             cleaned_thinking = extraction.cleaned_thinking
 
         # Reverse Gemma 4 parameter renaming
-        if tool_calls and "gemma" in (resolved_model or "").lower():
+        if tool_calls and is_gemma4_model(resolved_model or ""):
             for tc in tool_calls:
                 if tc.function and tc.function.arguments:
                     try:
@@ -3613,7 +3614,7 @@ async def create_response(
         convert_tools_for_template(effective_tools) if effective_tools else None
     )
     # Gemma 4 drops required params that lack descriptions — enrich them
-    if tools_for_template and "gemma" in (resolved_model or "").lower():
+    if tools_for_template and is_gemma4_model(resolved_model or ""):
         tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
 
     # Validate context window
@@ -3742,7 +3743,7 @@ async def create_response(
             tool_calls = extraction.tool_calls
 
         # Reverse Gemma 4 parameter renaming
-        if tool_calls and "gemma" in (resolved_model or "").lower():
+        if tool_calls and is_gemma4_model(resolved_model or ""):
             for tc in tool_calls:
                 fn = getattr(tc, "function", None)
                 if fn and fn.arguments:
@@ -4008,7 +4009,7 @@ async def stream_responses_api(
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     # Reverse Gemma 4 parameter renaming
-    if tool_calls and "gemma" in (resolved_model or request.model or "").lower():
+    if tool_calls and is_gemma4_model(resolved_model or request.model or ""):
         for tc in tool_calls:
             fn = getattr(tc, "function", None)
             if fn and fn.arguments:

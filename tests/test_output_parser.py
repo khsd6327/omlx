@@ -155,6 +155,17 @@ class TestOutputParserFactory:
         assert factory is not None
         assert factory.kind == "gemma4"
 
+    def test_detects_supergemma4_as_gemma4(self):
+        tokenizer = GemmaTokenizer({1: "x"})
+        factory = detect_output_parser(
+            "TedKim/supergemma4-27b",
+            tokenizer,
+            {"model_type": "supergemma4"},
+        )
+
+        assert factory is not None
+        assert factory.kind == "gemma4"
+
     def test_harmony_wrapper_regression(self):
         encoding = load_harmony_encoding("HarmonyGptOss")
         tokenizer = HarmonyTokenizer(encoding)

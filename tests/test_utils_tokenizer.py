@@ -69,6 +69,12 @@ class TestIsGemma4Model:
         assert is_gemma4_model("google/gemma-4b", None) is True
         assert is_gemma4_model("GEMMA-4-27B", None) is True
         assert is_gemma4_model("my-gemma4-model", None) is True
+        assert is_gemma4_model("supergemma4-27b", None) is True
+        assert is_gemma4_model("supergemma-4-27b", None) is True
+
+    def test_gemma4_derivative_via_config_model_type(self):
+        config = {"model_type": "supergemma4"}
+        assert is_gemma4_model("some-model", config) is True
 
     def test_not_gemma4_model(self):
         assert is_gemma4_model("gemma-3-27b", None) is False

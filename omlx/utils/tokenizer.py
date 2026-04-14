@@ -109,18 +109,24 @@ def is_gemma4_model(model_name: str, config: dict[str, Any] | None = None) -> bo
     Check if the model is a Gemma 4 model.
 
     Detection priority:
-    1. model_type == "gemma4" in config.json
-    2. Fallback: model_name contains "gemma-4" or "gemma4" (case-insensitive)
+    1. model_type contains a Gemma 4 family identifier
+    2. Fallback: model_name contains a Gemma 4 family identifier
+
+    This includes Gemma 4 derivatives such as ``supergemma4*`` so they reuse
+    the same parser and message-extraction paths.
     """
+    def _matches_gemma4_family(value: str) -> bool:
+        value = value.lower()
+        return "gemma-4" in value or "gemma4" in value
+
     if config is not None:
-        model_type = config.get("model_type", "")
-        if model_type == "gemma4":
+        model_type = str(config.get("model_type", ""))
+        if _matches_gemma4_family(model_type):
             logger.debug(f"Gemma 4 model detected via config.model_type: {model_name}")
             return True
 
     if model_name:
-        name_lower = model_name.lower()
-        if "gemma-4" in name_lower or "gemma4" in name_lower:
+        if _matches_gemma4_family(model_name):
             logger.debug(f"Gemma 4 model detected via model name pattern: {model_name}")
             return True
 
