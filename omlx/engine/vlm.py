@@ -404,6 +404,9 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 self._engine.engine.scheduler._turboquant_kv_bits = tq_bits
+                self._engine.engine.scheduler._turboquant_skip_last = getattr(
+                    self._model_settings, "turboquant_skip_last", True
+                )
                 logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -435,7 +438,11 @@ class VLMBatchedEngine(BaseEngine):
         """Stop the engine and cleanup resources."""
         if self._engine:
             await self._engine.stop()
-            self._engine.engine.close()
+            if hasattr(self._engine, 'engine') and self._engine.engine is not None:
+                try:
+                    self._engine.engine.close()
+                except Exception as e:
+                    logger.warning(f"Error closing engine: {e}")
         if self._vision_cache is not None:
             self._vision_cache.close()
             self._vision_cache = None

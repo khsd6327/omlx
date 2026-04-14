@@ -14,6 +14,7 @@ Supports:
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
 """
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass
@@ -255,6 +256,7 @@ class DiscoveredModel:
     engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
     estimated_size: int  # Estimated memory usage in bytes
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -314,15 +316,54 @@ def _is_causal_lm_embedding(model_path: Path) -> bool:
     return "embedding" in name_lower or "embed" in name_lower
 
 
+def _has_sentence_transformers_embedding_pipeline(model_path: Path) -> bool:
+    """
+    Detect sentence-transformers style embedding exports via modules.json.
+
+    This allows oMLX to recognize embedding exports whose base transformer
+    architecture is ambiguous (for example gemma3_text) but which include
+    sentence-transformers pooling/normalization modules.
+    """
+    modules_path = model_path / "modules.json"
+    if not modules_path.exists():
+        return False
+
+    try:
+        with open(modules_path) as f:
+            modules = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return False
+
+    if not isinstance(modules, list):
+        return False
+
+    module_types = {
+        module.get("type", "")
+        for module in modules
+        if isinstance(module, dict)
+    }
+    if "sentence_transformers.models.Transformer" not in module_types:
+        return False
+
+    return any(
+        module_type.startswith("sentence_transformers.models.")
+        and module_type != "sentence_transformers.models.Transformer"
+        for module_type in module_types
+    )
+
+
 def detect_model_type(model_path: Path) -> ModelType:
     """
     Detect model type from config.json.
 
     Checks:
     1. architectures field for reranker-specific classes (SequenceClassification)
-    2. architectures field for embedding-specific classes
-    3. model_type field against known embedding types (unambiguous only)
-    4. VLM detection via architectures, model_type, or vision_config presence
+    2. CausalLM-based reranker/embedding detection (architecture + directory name)
+    3. sentence-transformers pipeline detection via modules.json
+    4. architectures field for embedding-specific classes
+    5. model_type field against known embedding types (unambiguous only)
+    6. VLM detection via architectures, model_type, or vision_config presence
+    7. Audio model detection (STT/TTS/STS)
 
     Args:
         model_path: Path to model directory
@@ -361,6 +402,9 @@ def detect_model_type(model_path: Path) -> ModelType:
         if arch in CAUSAL_LM_EMBEDDING_ARCHITECTURES:
             if _is_causal_lm_embedding(model_path):
                 return "embedding"
+
+    if _has_sentence_transformers_embedding_pipeline(model_path):
+        return "embedding"
 
     # Check architectures field for embedding (before model_type to avoid
     # false positives from ambiguous model types like qwen3, gemma3-text)
@@ -447,6 +491,52 @@ def detect_model_type(model_path: Path) -> ModelType:
         return "audio_sts"
 
     return "llm"
+
+
+def detect_thinking_default(model_path: Path) -> bool | None:
+    """Detect whether a model's chat template enables thinking by default.
+
+    Inspects the Jinja chat template for ``enable_thinking`` references and
+    determines the default behaviour:
+
+    * **True** — model thinks by default (e.g. Qwen 3.x: only suppresses
+      thinking when ``enable_thinking is false``).
+    * **False** — model suppresses thinking by default (e.g. Gemma 4: only
+      enables thinking when ``enable_thinking`` is truthy,
+      ``default(false)``).
+    * **None** — template does not reference ``enable_thinking`` (model has
+      no thinking toggle).
+    """
+    # Try standalone Jinja file first, then tokenizer_config.json
+    template_text = None
+    jinja_path = model_path / "chat_template.jinja"
+    if jinja_path.exists():
+        with contextlib.suppress(OSError):
+            template_text = jinja_path.read_text(encoding="utf-8")
+
+    if template_text is None:
+        tc_path = model_path / "tokenizer_config.json"
+        if tc_path.exists():
+            try:
+                with open(tc_path) as f:
+                    tc = json.load(f)
+                template_text = tc.get("chat_template")
+            except Exception:
+                pass
+
+    if not template_text or "enable_thinking" not in template_text:
+        return None
+
+    # Heuristic: if the template only disables thinking when explicitly
+    # ``enable_thinking is false``, then thinking is ON by default.
+    # If the template requires ``enable_thinking`` to be truthy or uses
+    # ``default(false)``, then thinking is OFF by default.
+    if "enable_thinking is false" in template_text:
+        return True  # ON by default (Qwen pattern)
+    if "default(false)" in template_text or "enable_thinking)" in template_text:
+        return False  # OFF by default (Gemma pattern)
+
+    return None
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -562,6 +652,8 @@ def _register_model(
         except Exception:
             pass
 
+        thinking_default = detect_thinking_default(model_dir)
+
         models[model_id] = DiscoveredModel(
             model_id=model_id,
             model_path=str(model_dir),
@@ -569,6 +661,7 @@ def _register_model(
             engine_type=engine_type,
             estimated_size=estimated_size,
             config_model_type=config_model_type,
+            thinking_default=thinking_default,
         )
 
         size_gb = estimated_size / (1024**3)
