@@ -835,15 +835,18 @@ class PagedSSDCacheManager(CacheManager):
                 )
             return False
 
+        index_added = False
+        if not self._index.contains(block_hash):
+            self._enforce_size_limit_for_new_block()
+            self._index.add(blk_meta)
+            index_added = True
+
         try:
             self._write_queue.put_nowait(
                 (block_hash, tensors_raw, metadata, file_path)
             )
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.add(block_hash)
-            if not self._index.contains(block_hash):
-                self._enforce_size_limit_for_new_block()
-                self._index.add(blk_meta)
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
                 f"{block_hash.hex()[:16]}..."
@@ -852,6 +855,8 @@ class PagedSSDCacheManager(CacheManager):
         except queue.Full:
             self._release_pending_write_bytes(block_hash)
             self._stats["pressure_rejections"] += 1
+            if index_added:
+                self._index.remove(block_hash)
             if self._should_log_pressure_warning():
                 logger.warning(
                     f"SSD write queue full, dropping evicted block "
@@ -1081,6 +1086,9 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["errors"] += 1
                 # Remove from index since file wasn't written
                 self._index.remove(block_hash)
+                # Remove any temporary read-back buffer immediately so failed
+                # writes stop being reported as present before final cleanup.
+                self._hot_cache_remove(block_hash)
                 # Clean up temp and final files
                 for p in (temp_path, file_path):
                     try:
@@ -1307,6 +1315,9 @@ class PagedSSDCacheManager(CacheManager):
                     )
                 return False
 
+            self._enforce_size_limit_for_new_block()
+            self._index.add(block_metadata)
+
             # Enqueue full file write for background thread
             try:
                 self._write_queue.put_nowait(
@@ -1315,6 +1326,7 @@ class PagedSSDCacheManager(CacheManager):
             except queue.Full:
                 self._release_pending_write_bytes(block_hash)
                 self._stats["pressure_rejections"] += 1
+                self._index.remove(block_hash)
                 if self._should_log_pressure_warning():
                     logger.warning(
                         f"SSD cache write queue full, dropping write for "
@@ -1325,8 +1337,6 @@ class PagedSSDCacheManager(CacheManager):
 
             with self._pending_write_hashes_lock:
                 self._pending_write_hashes.add(block_hash)
-            self._enforce_size_limit_for_new_block()
-            self._index.add(block_metadata)
 
             self._stats["saves"] += 1
             logger.debug(
