@@ -1085,6 +1085,123 @@ class TestParseToolCallsEmptyEndMarker:
         assert tool_calls is None or len(tool_calls) == 0
 
 
+class TestParseToolCallsSyntaxError:
+    """Regression tests for issue #882.
+
+    mlx-lm's qwen3_coder parser calls ast.literal_eval on parameter
+    values, which raises SyntaxError on non-Python-literal strings
+    (e.g. "python3 test.py" for an array-typed parameter). The
+    exception used to escape parse_tool_calls and turned into a
+    server_error SSE chunk, silently dropping the tool call.
+    """
+
+    def _qwen_tok(self, failing_parser):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        tok.tool_parser = failing_parser
+        return tok
+
+    def test_syntax_error_does_not_escape(self):
+        """SyntaxError from native parser must not crash parse_tool_calls."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "pre\n<tool_call>\n<function=shell>\n"
+            "<parameter=command>python3 test.py</parameter>\n"
+            "</function>\n</tool_call>\npost"
+        )
+        # Must not raise.
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        # XML fallback should have recovered the call.
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "shell"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args == {"command": "python3 test.py"}
+
+    def test_qwen_xml_fallback_recovers_call(self):
+        """Qwen-style XML body recovers via _parse_xml_tool_calls on native failure."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "<tool_call>\n<function=read>\n"
+            "<parameter=path>/etc/hosts</parameter>\n"
+            "<parameter=lines>10</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read"
+        args = json.loads(tool_calls[0].function.arguments)
+        assert args["path"] == "/etc/hosts"
+        assert args["lines"] == 10  # json.loads converts numeric string
+
+    def test_unparseable_body_logs_and_drops(self, caplog):
+        """Fully unparseable body drops gracefully and logs a warning."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = self._qwen_tok(failing_parser)
+        text = "<tool_call>not a function at all, just text</tool_call>"
+
+        with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
+            cleaned, tool_calls = parse_tool_calls(text, tok)
+
+        assert tool_calls is None or len(tool_calls) == 0
+        # Warning emitted so failures are visible rather than silent.
+        assert any(
+            "Native tool parser failed" in r.message
+            and "SyntaxError" in r.message
+            for r in caplog.records
+        )
+
+    def test_type_error_also_caught(self):
+        """TypeError from native parser also must not escape."""
+
+        def failing_parser(text, tools):
+            raise TypeError("unexpected type during parse")
+
+        tok = self._qwen_tok(failing_parser)
+        text = (
+            "<tool_call>\n<function=patch>\n"
+            "<parameter=path>src/a.py</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        # Must not raise.
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "patch"
+
+    def test_gemma4_path_syntax_error_does_not_escape(self):
+        """Gemma 4 fallback branch also must not propagate SyntaxError."""
+
+        def failing_parser(text, tools):
+            raise SyntaxError("invalid syntax (<unknown>, line 1)")
+
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<|tool_call>"
+        tok.tool_call_end = "<tool_call|>"
+        tok.tool_parser = failing_parser
+
+        text = "<|tool_call>garbage body<tool_call|>"
+        # Must not raise. Gemma 4 fallback will also fail on this body,
+        # but the outer code must still complete gracefully.
+        _, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is None or len(tool_calls) == 0
+
+
 class TestParseBracketToolCalls:
     """Tests for bracket-style tool call parsing (issue #159)."""
 
@@ -1675,3 +1792,86 @@ class TestRestoreGemma4ParamNames:
         model_args = {k: "test" for k in enriched_props}
         restored = restore_gemma4_param_names(model_args)
         assert set(restored.keys()) == {"description", "prompt"}
+
+
+class TestParseToolCallsNativeParserListReturn:
+    """MiniMax M2 parser returns a list when a single <minimax:tool_call>
+    block contains multiple <invoke>s. parse_tool_calls() must flatten that
+    into one ToolCall per invoke, not drop the whole block.
+    """
+
+    def test_single_block_multiple_invokes(self):
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+        tok.tool_parser = lambda text, tools: [
+            {"name": "list_files", "arguments": {"path": "."}},
+            {"name": "read_file", "arguments": {"path": "README.md"}},
+        ]
+
+        text = (
+            "<minimax:tool_call>"
+            "<invoke name=\"list_files\"><parameter name=\"path\">.</parameter></invoke>"
+            "<invoke name=\"read_file\"><parameter name=\"path\">README.md</parameter></invoke>"
+            "</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 2
+        assert tool_calls[0].function.name == "list_files"
+        assert tool_calls[1].function.name == "read_file"
+        assert json.loads(tool_calls[1].function.arguments) == {"path": "README.md"}
+
+    def test_single_block_single_invoke_returns_dict(self):
+        """Regression guard: single-invoke case still returns a dict."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+        tok.tool_parser = lambda text, tools: {
+            "name": "list_files",
+            "arguments": {"path": "."},
+        }
+
+        text = (
+            "<minimax:tool_call>"
+            "<invoke name=\"list_files\"><parameter name=\"path\">.</parameter></invoke>"
+            "</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "list_files"
+
+    def test_multiple_blocks_each_with_multiple_invokes(self):
+        """Two blocks, each returning a list — total 4 tool calls."""
+        tok = MagicMock(spec=[])
+        tok.has_tool_calling = True
+        tok.tool_call_start = "<minimax:tool_call>"
+        tok.tool_call_end = "</minimax:tool_call>"
+
+        def parser(text, tools):
+            if "first" in text:
+                return [
+                    {"name": "first_a", "arguments": {}},
+                    {"name": "first_b", "arguments": {}},
+                ]
+            return [
+                {"name": "second_a", "arguments": {}},
+                {"name": "second_b", "arguments": {}},
+            ]
+
+        tok.tool_parser = parser
+        text = (
+            "<minimax:tool_call>first</minimax:tool_call>"
+            "<minimax:tool_call>second</minimax:tool_call>"
+        )
+        cleaned, tool_calls = parse_tool_calls(text, tok)
+        assert tool_calls is not None
+        assert [tc.function.name for tc in tool_calls] == [
+            "first_a",
+            "first_b",
+            "second_a",
+            "second_b",
+        ]

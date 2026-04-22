@@ -126,6 +126,7 @@ def convert_anthropic_to_internal(
     max_tool_result_tokens: int | None = None,
     tokenizer: Any | None = None,
     preserve_images: bool = False,
+    native_reasoning_content: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Convert Anthropic Messages API format to internal format.
@@ -142,6 +143,10 @@ def convert_anthropic_to_internal(
         tokenizer: Tokenizer instance for token counting and truncation.
         preserve_images: If True, preserve image blocks as OpenAI image_url
             format for VLM processing.
+        native_reasoning_content: If True, attach Anthropic ``thinking`` blocks
+            as a ``reasoning_content`` field on assistant messages (Qwen 3.6+
+            templates).  If False, inline each block as ``<think>...</think>``
+            in the message content as a fallback.
 
     Returns:
         List of {"role": str, "content": str or list}
@@ -169,6 +174,7 @@ def convert_anthropic_to_internal(
                     text_parts: list[str] = []
                     image_parts: list[dict] = []
                     tool_calls: list[dict] = []
+                    thinking_parts: list[str] = []
                     for block in content:
                         block_dict = _content_block_to_dict(block)
                         if block_dict is None:
@@ -192,12 +198,25 @@ def convert_anthropic_to_internal(
                                     "arguments": tool_input,
                                 },
                             })
+                        elif block_type == "thinking":
+                            # Native mode: collect for reasoning_content field.
+                            # Fallback: inline as <think>...</think> in source
+                            # order (Anthropic emits thinking first, so appending
+                            # preserves the natural ordering).
+                            thinking_text = block_dict.get("thinking", "")
+                            if thinking_text:
+                                if native_reasoning_content:
+                                    thinking_parts.append(thinking_text)
+                                else:
+                                    text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts) or {
                         "role": role,
                         "content": "",
                     }
+                    if thinking_parts:
+                        msg_dict["reasoning_content"] = "\n".join(thinking_parts)
                     if tool_calls:
                         msg_dict["tool_calls"] = tool_calls
                         msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
@@ -238,7 +257,13 @@ def convert_anthropic_to_internal(
                                     block_dict.get("content", ""), image_parts
                                 )
                         elif block_type == "thinking":
-                            continue
+                            # User messages don't carry reasoning_content in the
+                            # Qwen 3.6 template, so native mode simply drops these
+                            # blocks.  Fallback keeps the legacy <think> inline
+                            # behaviour in source order.
+                            thinking_text = block_dict.get("thinking", "")
+                            if thinking_text and not native_reasoning_content:
+                                text_parts.append(f"<think>\n{thinking_text}\n</think>")
                         elif block_type == "document":
                             text_parts.append(_decode_document_block(block_dict))
                     msg_dict = _build_message_from_parts(role, text_parts, image_parts)
@@ -251,6 +276,7 @@ def convert_anthropic_to_internal(
             # Content blocks list
             text_parts: list[str] = []
             image_parts: list[dict] = []
+            thinking_parts: list[str] = []
             saw_tool_markup = False
             for block in content:
                 block_dict = _content_block_to_dict(block)
@@ -292,8 +318,14 @@ def convert_anthropic_to_internal(
                         )
 
                 elif block_type == "thinking":
-                    # Thinking blocks are ignored (reasoning content is not passed to model)
-                    continue
+                    # Native mode: collect for reasoning_content (assistant only).
+                    # Fallback: inline as <think>...</think> in source order.
+                    thinking_text = block_dict.get("thinking", "")
+                    if thinking_text:
+                        if native_reasoning_content and role == "assistant":
+                            thinking_parts.append(thinking_text)
+                        elif not native_reasoning_content:
+                            text_parts.append(f"<think>\n{thinking_text}\n</think>")
 
                 elif block_type == "document":
                     text_parts.append(_decode_document_block(block_dict))
@@ -302,6 +334,8 @@ def convert_anthropic_to_internal(
                 "role": role,
                 "content": "",
             }
+            if thinking_parts:
+                msg_dict["reasoning_content"] = "\n".join(thinking_parts)
             if saw_tool_markup:
                 msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
             processed_messages.append(msg_dict)
