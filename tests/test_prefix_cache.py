@@ -369,6 +369,22 @@ class TestBlockAwarePrefixCache:
 
         assert prefix_cache.paged_ssd_cache is mock_ssd_cache
 
+    def test_block_table_has_cold_blocks(self, prefix_cache):
+        """Detect whether a table would require SSD reads to reconstruct."""
+        mock_ssd_cache = MagicMock()
+        mock_ssd_cache.is_block_hot.side_effect = [True, False]
+        prefix_cache.set_paged_ssd_cache_manager(mock_ssd_cache)
+
+        block_table = prefix_cache.paged_cache.create_block_table("req-cold")
+        for block_hash in (b"hot-block", b"cold-block"):
+            block = prefix_cache.paged_cache.allocate_block()
+            block.block_hash = block_hash
+            block_table.block_ids.append(block.block_id)
+            block_table.num_tokens += prefix_cache.block_size
+
+        assert prefix_cache.block_table_has_cold_blocks(block_table) is True
+        assert mock_ssd_cache.is_block_hot.call_count == 2
+
     def test_set_cold_restore_callback(self, prefix_cache):
         """Test setting cold restore callback."""
 

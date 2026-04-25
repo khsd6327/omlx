@@ -279,14 +279,19 @@ class MLXRerankerModel:
             messages, tokenize=False, add_generation_prompt=True
         )
         parts = template_str.split(_SENTINEL)
-        if len(parts) != 2:
-            raise ValueError(
-                f"Chat template produced unexpected format; "
-                f"could not split on sentinel. Template: {template_str!r}"
+        if len(parts) == 2:
+            prefix = parts[0]
+            # Append <think> block for models that use thinking-then-answering format
+            suffix = parts[1] + "<think>\n\n</think>\n\n"
+        else:
+            # Qwen3 reranker tokenizers ship a task-specific chat template that
+            # ignores arbitrary user content and renders an empty Query/Document
+            # scaffold. Use the official fixed prefix/suffix format instead.
+            prefix = (
+                f"<|im_start|>system\n{self._CAUSAL_LM_SYSTEM_PROMPT}<|im_end|>\n"
+                "<|im_start|>user\n"
             )
-        prefix = parts[0]
-        # Append <think> block for models that use thinking-then-answering format
-        suffix = parts[1] + "<think>\n\n</think>\n\n"
+            suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
         self._prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
         self._suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)

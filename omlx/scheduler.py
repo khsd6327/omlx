@@ -814,6 +814,12 @@ class Scheduler:
         self._cache_store_deferred = 0
         self._cache_store_dropped = 0
         self._cache_store_processed = 0
+        self._phase_timings: Dict[str, Dict[str, float]] = {}
+        self._prefill_budget_exhaustions = 0
+        self._prefill_tokens_budgeted = 0
+        self._cache_restore_skipped_active_decode = 0
+        self._cache_restore_skipped_tokens = 0
+        self._cache_extract_skipped_busy = 0
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -1338,6 +1344,46 @@ class Scheduler:
                 model_id=model_id,
             )
 
+    def _record_phase(
+        self, phase: str, duration_s: float, tokens: int = 0
+    ) -> None:
+        stat = self._phase_timings.setdefault(
+            phase,
+            {
+                "count": 0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "last_ms": 0.0,
+                "tokens": 0,
+            },
+        )
+        ms = max(0.0, duration_s * 1000.0)
+        stat["count"] += 1
+        stat["total_ms"] += ms
+        stat["last_ms"] = ms
+        stat["max_ms"] = max(stat["max_ms"], ms)
+        stat["tokens"] += tokens
+
+    def _phase_stats_snapshot(self) -> Dict[str, Dict[str, float]]:
+        snapshot: Dict[str, Dict[str, float]] = {}
+        for phase, stat in self._phase_timings.items():
+            count = int(stat.get("count", 0))
+            total_ms = float(stat.get("total_ms", 0.0))
+            snapshot[phase] = {
+                "count": count,
+                "total_ms": round(total_ms, 3),
+                "avg_ms": round(total_ms / count, 3) if count else 0.0,
+                "max_ms": round(float(stat.get("max_ms", 0.0)), 3),
+                "last_ms": round(float(stat.get("last_ms", 0.0)), 3),
+                "tokens": int(stat.get("tokens", 0)),
+            }
+        return snapshot
+
+    def _reset_request_prefill_state(self, request: "Request") -> None:
+        request.prefill_cache = None
+        request.prefill_tokens = None
+        request.prefill_processed_tokens = 0
+
     # ------------------------------------------------------------------
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
@@ -1429,7 +1475,8 @@ class Scheduler:
         tokens: List[int],
         existing_cache: Optional[List[Any]],
         vlm_embeds: Optional[Tuple[mx.array, Dict[str, Any], int]] = None,
-    ) -> Tuple[List[Any], List[int]]:
+        token_budget: Optional[int] = None,
+    ) -> Tuple[List[Any], List[int], bool, int]:
         """Run prefill externally (outside BatchGenerator) for a single request.
 
         Processes tokens[0:N-1] through the model. The last token tokens[N-1]
@@ -1442,10 +1489,12 @@ class Scheduler:
             existing_cache: Restored cache from paged SSD (or None).
             vlm_embeds: Optional (inputs_embeds, extra_kwargs, start_offset)
                 tuple for VLM requests.
+            token_budget: Optional cap for tokens to prefill in this call.
 
         Returns:
-            (prefilled_cache, last_token_list) where last_token_list contains
-            the single last token to pass to insert().
+            (prefilled_cache, last_token_list, complete, processed_tokens)
+            where last_token_list contains the single last token to pass to
+            insert() once complete.
 
         Raises:
             _PrefillAbortedError: If prefill is interrupted by a pending abort.
@@ -1455,18 +1504,34 @@ class Scheduler:
         if n_tokens <= 1:
             # Nothing to prefill, return cache + tokens as-is
             cache = existing_cache or make_prompt_cache(self.model)
+            self._reset_request_prefill_state(request)
             # NOTE: Do NOT apply TurboQuant here. TurboQuantKVCache does not
             # support merge(), which is called by _merge_caches() inside
             # BatchGenerator when insert() creates a PromptProcessingBatch.
             # TurboQuant conversion must happen inside BatchGenerator after
             # the batch cache is created, not on individual per-request caches.
-            return cache, tokens
+            return cache, tokens, True, 0
 
-        # Create or reuse cache
-        if existing_cache is not None:
-            prompt_cache = existing_cache
+        # Create or resume incremental prefill state.  This makes
+        # max_num_batched_tokens meaningful for external prefill: a long
+        # prompt can yield back to decode work instead of monopolizing a
+        # scheduler step.
+        if request.prefill_cache is None or request.prefill_tokens != tokens:
+            prompt_cache = existing_cache or make_prompt_cache(self.model)
+            request.prefill_cache = prompt_cache
+            request.prefill_tokens = list(tokens)
+            request.prefill_processed_tokens = 0
         else:
-            prompt_cache = make_prompt_cache(self.model)
+            prompt_cache = request.prefill_cache
+
+        processed_tokens = request.prefill_processed_tokens
+        total_prefill_tokens = n_tokens - 1
+        processed_this_call = 0
+        budget_remaining = (
+            None if token_budget is None else max(0, token_budget)
+        )
+        if budget_remaining == 0 and processed_tokens < total_prefill_tokens:
+            return prompt_cache, tokens[-1:], False, 0
 
         # NOTE: TurboQuant conversion is NOT applied during external prefill.
         # TurboQuantKVCache does not support merge() or maybe_trim_front(),
@@ -1509,11 +1574,10 @@ class Scheduler:
         # Prepare VLM embeddings for prefill
         embeds_array: Optional[mx.array] = None
         extra_kwargs: Optional[Dict[str, Any]] = None
+        start_offset = 0
+        _saved_rope_deltas = None
         if vlm_embeds is not None:
             embeds_array, extra_kwargs, start_offset = vlm_embeds
-            embeds_array = embeds_array[:, start_offset:]  # skip cached portion
-            if start_offset > 0 and extra_kwargs:
-                extra_kwargs = _advance_vlm_extra(extra_kwargs, start_offset)
             # Force _position_ids path in language model for cached VLM
             # prefill. Without this, the delta approach gives sequential
             # positions to image tokens that need 3D mRoPE positions.
@@ -1522,7 +1586,6 @@ class Scheduler:
             # Saved and restored after prefill for decode rope_deltas capture.
             # Only applies to mRoPE VLMs (Qwen2-VL, Qwen2.5-VL, GLM-4V, etc.);
             # non-mRoPE VLMs like Gemma 4 have no _rope_deltas attribute.
-            _saved_rope_deltas = None
             if start_offset > 0:
                 lm = getattr(self.model, "_language_model", None)
                 if lm is not None and hasattr(lm, "_rope_deltas"):
@@ -1533,55 +1596,119 @@ class Scheduler:
         prefill_tokens = tokens[:-1]
         last_token = tokens[-1:]
         total_length = len(tokens)
-
-        input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
-        processed_tokens = 0
         prefill_step_size = self.config.prefill_step_size
         uid = self.request_id_to_uid.get(request.request_id)
 
         emitted_boundaries: Dict[int, int] = {}
 
-        while input_arr.shape[1] > 0:
-            remaining = input_arr.shape[1]
-            n_to_process = min(prefill_step_size, remaining)
+        try:
+            while processed_tokens < total_prefill_tokens:
+                remaining = total_prefill_tokens - processed_tokens
+                n_to_process = min(prefill_step_size, remaining)
 
-            # Boundary-limited step size
-            if boundary_enabled and block_size > 0:
-                current_total = base_size + processed_tokens
-                next_boundary = ((current_total // block_size) + 1) * block_size
-                target_boundary_prefill = next_boundary - base_size
-                delta = target_boundary_prefill - processed_tokens
-                if delta > 0:
-                    n_to_process = min(n_to_process, delta)
-                n_to_process = max(1, n_to_process)
+                if budget_remaining is not None:
+                    if budget_remaining <= 0:
+                        break
+                    n_to_process = min(n_to_process, budget_remaining)
 
-            model_kwargs: Dict[str, Any] = {}
-            if embeds_array is not None and embeds_array.shape[1] > 0:
-                model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
-                if extra_kwargs:
-                    model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
-                        extra_kwargs, n_to_process
+                # Boundary-limited step size
+                if boundary_enabled and block_size > 0:
+                    current_total = base_size + processed_tokens
+                    next_boundary = ((current_total // block_size) + 1) * block_size
+                    target_boundary_prefill = next_boundary - base_size
+                    delta = target_boundary_prefill - processed_tokens
+                    if delta > 0:
+                        n_to_process = min(n_to_process, delta)
+                    n_to_process = max(1, n_to_process)
+
+                chunk_tokens = prefill_tokens[
+                    processed_tokens:processed_tokens + n_to_process
+                ]
+                input_arr = mx.array(chunk_tokens)[None]
+
+                model_kwargs: Dict[str, Any] = {}
+                if embeds_array is not None and embeds_array.shape[1] > 0:
+                    embed_start = start_offset + processed_tokens
+                    embed_end = embed_start + n_to_process
+                    model_kwargs["inputs_embeds"] = embeds_array[:, embed_start:embed_end]
+                    if extra_kwargs:
+                        chunk_extra = _advance_vlm_extra(extra_kwargs, embed_start)
+                        model_kwargs["vlm_extra_kwargs"] = _slice_vlm_extra(
+                            chunk_extra, n_to_process
+                        )
+
+                self.model(input_arr, cache=prompt_cache, **model_kwargs)
+                mx.eval([c.state for c in prompt_cache])
+
+                processed_tokens += n_to_process
+                processed_this_call += n_to_process
+                request.prefill_processed_tokens = processed_tokens
+                if budget_remaining is not None:
+                    budget_remaining -= n_to_process
+
+                # Progress callback
+                if uid is not None:
+                    self._on_prompt_progress(
+                        [(uid, processed_tokens, total_length)]
                     )
 
-            self.model(
-                input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs
-            )
-            mx.eval([c.state for c in prompt_cache])
+                # Boundary snapshot emission
+                if boundary_enabled:
+                    total_tokens = base_size + processed_tokens
+                    if (
+                        total_tokens > 0
+                        and total_tokens % block_size == 0
+                        and emitted_boundaries.get(request.request_id, -1) < total_tokens
+                    ):
+                        self._emit_prefill_boundary_snapshot(
+                            request, prompt_cache, total_tokens
+                        )
+                        emitted_boundaries[request.request_id] = total_tokens
 
-            input_arr = input_arr[:, n_to_process:]
-            if embeds_array is not None:
-                embeds_array = embeds_array[:, n_to_process:]
-                if extra_kwargs:
-                    extra_kwargs = _advance_vlm_extra(extra_kwargs, n_to_process)
-            processed_tokens += n_to_process
+                # Memory monitoring
+                if self._memory_limit_bytes > 0:
+                    active = mx.get_active_memory()
+                    if (
+                        self._memory_hard_limit_bytes > 0
+                        and active > self._memory_hard_limit_bytes
+                    ):
+                        logger.warning(
+                            f"Prefill force-stopped at {processed_tokens} "
+                            f"tokens: memory {active / 1024**3:.1f}GB "
+                            f"exceeds hard limit "
+                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
+                        )
+                        raise RuntimeError("Memory limit exceeded during prefill")
+                    elif active > self._memory_limit_bytes:
+                        logger.warning(
+                            f"Prefill memory soft limit exceeded at "
+                            f"{processed_tokens} tokens: "
+                            f"{active / 1024**3:.1f}GB > "
+                            f"{self._memory_limit_bytes / 1024**3:.1f}GB "
+                            f"(hard limit: "
+                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
+                        )
 
-            # Progress callback
-            if uid is not None:
-                self._on_prompt_progress(
-                    [(uid, processed_tokens, total_length)]
+                # Check for pending aborts between prefill chunks.
+                abort_uids = self._check_pending_aborts_for_uids(
+                    [uid] if uid is not None else []
                 )
+                if abort_uids:
+                    logger.info(
+                        f"Prefill interrupted at {processed_tokens}/"
+                        f"{total_length} tokens: "
+                        f"{len(abort_uids)} request(s) aborted"
+                    )
+                    raise _PrefillAbortedError(abort_uids, processed_tokens)
 
-            # Boundary snapshot emission
+                # Reclaim Metal intermediates between prefill chunks.
+                _sync_and_clear_cache()
+
+            complete = processed_tokens >= total_prefill_tokens
+            if not complete:
+                return prompt_cache, last_token, False, processed_this_call
+
+            # Emit final boundary snapshot if prompt lands exactly on boundary.
             if boundary_enabled:
                 total_tokens = base_size + processed_tokens
                 if (
@@ -1592,66 +1719,15 @@ class Scheduler:
                     self._emit_prefill_boundary_snapshot(
                         request, prompt_cache, total_tokens
                     )
-                    emitted_boundaries[request.request_id] = total_tokens
 
-            # Memory monitoring
-            if self._memory_limit_bytes > 0:
-                active = mx.get_active_memory()
-                if (
-                    self._memory_hard_limit_bytes > 0
-                    and active > self._memory_hard_limit_bytes
-                ):
-                    logger.warning(
-                        f"Prefill force-stopped at {processed_tokens} "
-                        f"tokens: memory {active / 1024**3:.1f}GB "
-                        f"exceeds hard limit "
-                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
-                    )
-                    raise RuntimeError("Memory limit exceeded during prefill")
-                elif active > self._memory_limit_bytes:
-                    logger.warning(
-                        f"Prefill memory soft limit exceeded at "
-                        f"{processed_tokens} tokens: "
-                        f"{active / 1024**3:.1f}GB > "
-                        f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                        f"(hard limit: "
-                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
-                    )
-
-            # Check for pending aborts between prefill chunks.
-            abort_uids = self._check_pending_aborts_for_uids(
-                [uid] if uid is not None else []
-            )
-            if abort_uids:
-                logger.info(
-                    f"Prefill interrupted at {processed_tokens}/"
-                    f"{total_length} tokens: "
-                    f"{len(abort_uids)} request(s) aborted"
-                )
-                raise _PrefillAbortedError(abort_uids, processed_tokens)
-
-            # Reclaim Metal intermediates between prefill chunks.
             _sync_and_clear_cache()
+            self._reset_request_prefill_state(request)
+            return prompt_cache, last_token, True, processed_this_call
 
-        # Emit final boundary snapshot if prompt lands exactly on boundary.
-        if boundary_enabled:
-            total_tokens = base_size + processed_tokens
-            if (
-                total_tokens > 0
-                and total_tokens % block_size == 0
-                and emitted_boundaries.get(request.request_id, -1) < total_tokens
-            ):
-                self._emit_prefill_boundary_snapshot(
-                    request, prompt_cache, total_tokens
-                )
-
-        _sync_and_clear_cache()
-
-        # Restore _rope_deltas after cached VLM prefill (for decode capture)
-        if vlm_embeds is not None and _saved_rope_deltas is not None:
-            self.model._language_model._rope_deltas = _saved_rope_deltas
-
-        return prompt_cache, last_token
+        finally:
+            # Restore _rope_deltas after cached VLM prefill (for decode capture)
+            if vlm_embeds is not None and _saved_rope_deltas is not None:
+                self.model._language_model._rope_deltas = _saved_rope_deltas
 
     def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
         """Build a SequenceStateMachine for per-request stop tokens.
@@ -2637,85 +2713,101 @@ class Scheduler:
                 extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
             )
             if block_table and block_table.num_tokens > 0:
-                # Reconstruct actual KVCache objects from stored tensor data
-                # Note: reconstruct_cache may modify block_table in-place if
-                # partial reconstruction occurs (some blocks invalid)
-                original_tokens = block_table.num_tokens
-                reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
-                if reconstructed:
-                    request.prompt_cache = reconstructed
-                    request.block_table = block_table
-                    request.cached_tokens = block_table.num_tokens
-                    request.shared_prefix_blocks = len(block_table.block_ids)
-                    # Recalculate remaining_tokens in case block_table was truncated
-                    request.remaining_tokens = request.prompt_token_ids[block_table.num_tokens:]
-                    # For exact prefix hits we need cache state at (N-1) and the
-                    # last prompt token as input to produce the first decode logit.
-                    # Reusing cache state at N and feeding the last token again
-                    # shifts the model state and can change greedy output.
-                    if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
-                        if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
-                            # Stateful non-sliceable caches (Rotating/Arrays)
-                            # cannot be safely converted from N to N-1 state
-                            # without cache-type-specific logic.
-                            if self.paged_cache_manager is not None:
-                                self.paged_cache_manager.delete_block_table(request.request_id)
-                            request.prompt_cache = None
-                            request.block_table = None
-                            request.cached_tokens = 0
-                            request.shared_prefix_blocks = 0
-                            request.remaining_tokens = request.prompt_token_ids
-                            logger.debug(
-                                f"Request {request.request_id}: exact cache hit with "
-                                f"stateful cache type, falling back to full prefill "
-                                f"for deterministic kickoff"
-                            )
-                        elif self._trim_prompt_cache_for_generation(request.prompt_cache):
-                            request.cached_tokens = max(0, request.cached_tokens - 1)
-                            request.remaining_tokens = request.prompt_token_ids[-1:]
-                            logger.debug(
-                                f"Request {request.request_id}: exact cache hit adjusted "
-                                f"to N-1 state for generation kickoff "
-                                f"(cached_tokens={request.cached_tokens}, "
-                                f"remaining={len(request.remaining_tokens)})"
-                            )
-                        else:
-                            # Fallback to full recompute when cache layers cannot
-                            # be safely trimmed by one token (e.g., non-trimmable
-                            # recurrent state caches).
-                            if self.paged_cache_manager is not None:
-                                self.paged_cache_manager.delete_block_table(request.request_id)
-                            request.prompt_cache = None
-                            request.block_table = None
-                            request.cached_tokens = 0
-                            request.shared_prefix_blocks = 0
-                            request.remaining_tokens = request.prompt_token_ids
-                            logger.debug(
-                                f"Request {request.request_id}: exact cache hit could "
-                                f"not be trimmed safely, falling back to full prefill"
-                            )
-                    if block_table.num_tokens < original_tokens:
-                        logger.debug(
-                            f"Request {request.request_id}: partial cache hit, "
-                            f"{request.cached_tokens} tokens in {request.shared_prefix_blocks} blocks "
-                            f"(originally {original_tokens} tokens), "
-                            f"{len(request.remaining_tokens)} tokens remaining"
-                        )
-                    else:
-                        logger.debug(
-                            f"Request {request.request_id}: paged cache hit, "
-                            f"{request.cached_tokens} tokens in {request.shared_prefix_blocks} blocks, "
-                            f"{len(request.remaining_tokens)} tokens remaining, cache reconstructed"
-                        )
-                else:
-                    # Reconstruction failed, treat as cache miss
+                if (
+                    self.running
+                    and self.block_aware_cache.block_table_has_cold_blocks(block_table)
+                ):
+                    self._cache_restore_skipped_active_decode += 1
+                    self._cache_restore_skipped_tokens += block_table.num_tokens
                     if self.paged_cache_manager is not None:
                         self.paged_cache_manager.delete_block_table(request.request_id)
                     request.remaining_tokens = request.prompt_token_ids
                     logger.debug(
-                        f"Request {request.request_id}: paged cache reconstruction failed, "
-                        "released shared blocks"
+                        "Request %s: skipped cold cache restore while %d "
+                        "request(s) are decoding; falling back to prefill",
+                        request.request_id,
+                        len(self.running),
                     )
+                else:
+                    # Reconstruct actual KVCache objects from stored tensor data
+                    # Note: reconstruct_cache may modify block_table in-place if
+                    # partial reconstruction occurs (some blocks invalid)
+                    original_tokens = block_table.num_tokens
+                    reconstructed = self.block_aware_cache.reconstruct_cache(block_table)
+                    if reconstructed:
+                        request.prompt_cache = reconstructed
+                        request.block_table = block_table
+                        request.cached_tokens = block_table.num_tokens
+                        request.shared_prefix_blocks = len(block_table.block_ids)
+                        # Recalculate remaining_tokens in case block_table was truncated
+                        request.remaining_tokens = request.prompt_token_ids[block_table.num_tokens:]
+                        # For exact prefix hits we need cache state at (N-1) and the
+                        # last prompt token as input to produce the first decode logit.
+                        # Reusing cache state at N and feeding the last token again
+                        # shifts the model state and can change greedy output.
+                        if len(request.remaining_tokens) == 0 and request.cached_tokens > 0:
+                            if self._cache_list_needs_boundary_snapshot(request.prompt_cache):
+                                # Stateful non-sliceable caches (Rotating/Arrays)
+                                # cannot be safely converted from N to N-1 state
+                                # without cache-type-specific logic.
+                                if self.paged_cache_manager is not None:
+                                    self.paged_cache_manager.delete_block_table(request.request_id)
+                                request.prompt_cache = None
+                                request.block_table = None
+                                request.cached_tokens = 0
+                                request.shared_prefix_blocks = 0
+                                request.remaining_tokens = request.prompt_token_ids
+                                logger.debug(
+                                    f"Request {request.request_id}: exact cache hit with "
+                                    f"stateful cache type, falling back to full prefill "
+                                    f"for deterministic kickoff"
+                                )
+                            elif self._trim_prompt_cache_for_generation(request.prompt_cache):
+                                request.cached_tokens = max(0, request.cached_tokens - 1)
+                                request.remaining_tokens = request.prompt_token_ids[-1:]
+                                logger.debug(
+                                    f"Request {request.request_id}: exact cache hit adjusted "
+                                    f"to N-1 state for generation kickoff "
+                                    f"(cached_tokens={request.cached_tokens}, "
+                                    f"remaining={len(request.remaining_tokens)})"
+                                )
+                            else:
+                                # Fallback to full recompute when cache layers cannot
+                                # be safely trimmed by one token (e.g., non-trimmable
+                                # recurrent state caches).
+                                if self.paged_cache_manager is not None:
+                                    self.paged_cache_manager.delete_block_table(request.request_id)
+                                request.prompt_cache = None
+                                request.block_table = None
+                                request.cached_tokens = 0
+                                request.shared_prefix_blocks = 0
+                                request.remaining_tokens = request.prompt_token_ids
+                                logger.debug(
+                                    f"Request {request.request_id}: exact cache hit could "
+                                    f"not be trimmed safely, falling back to full prefill"
+                                )
+                        if block_table.num_tokens < original_tokens:
+                            logger.debug(
+                                f"Request {request.request_id}: partial cache hit, "
+                                f"{request.cached_tokens} tokens in {request.shared_prefix_blocks} blocks "
+                                f"(originally {original_tokens} tokens), "
+                                f"{len(request.remaining_tokens)} tokens remaining"
+                            )
+                        else:
+                            logger.debug(
+                                f"Request {request.request_id}: paged cache hit, "
+                                f"{request.cached_tokens} tokens in {request.shared_prefix_blocks} blocks, "
+                                f"{len(request.remaining_tokens)} tokens remaining, cache reconstructed"
+                            )
+                    else:
+                        # Reconstruction failed, treat as cache miss
+                        if self.paged_cache_manager is not None:
+                            self.paged_cache_manager.delete_block_table(request.request_id)
+                        request.remaining_tokens = request.prompt_token_ids
+                        logger.debug(
+                            f"Request {request.request_id}: paged cache reconstruction failed, "
+                            "released shared blocks"
+                        )
             else:
                 request.remaining_tokens = request.prompt_token_ids
         else:
@@ -3075,6 +3167,7 @@ class Scheduler:
         if req_to_remove is not None:
             req_to_remove._extracted_cache = None
             req_to_remove.prompt_cache = None
+            self._reset_request_prefill_state(req_to_remove)
 
         logger.debug(f"Aborted request {request_id}")
         return True
@@ -3114,6 +3207,7 @@ class Scheduler:
             if req is not None:
                 req._extracted_cache = None
                 req.prompt_cache = None
+                self._reset_request_prefill_state(req)
         self.running.clear()
         for request in list(self.waiting):
             failed_ids.append(request.request_id)
@@ -3121,6 +3215,7 @@ class Scheduler:
             if req is not None:
                 req._extracted_cache = None
                 req.prompt_cache = None
+                self._reset_request_prefill_state(req)
         self.waiting.clear()
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
@@ -3209,6 +3304,10 @@ class Scheduler:
         """
         scheduled = []
         rejected_outputs: List[RequestOutput] = []
+        prefill_budget = self.config.max_num_batched_tokens
+        if prefill_budget is not None and prefill_budget <= 0:
+            prefill_budget = None
+        prefill_tokens_used = 0
 
         # Track cache status of first scheduled request to ensure homogeneity
         # None = not determined yet, True = has cache, False = no cache
@@ -3272,6 +3371,7 @@ class Scheduler:
                 request.cached_tokens = 0
                 request.remaining_tokens = request.prompt_token_ids
                 tokens_to_process = request.prompt_token_ids
+                self._reset_request_prefill_state(request)
 
             # SpecPrefill requests must be alone in the batch (RoPE patching
             # affects the entire model). Also block scheduling if another
@@ -3460,6 +3560,14 @@ class Scheduler:
             # Only the last token goes to insert() for the first decode step.
             # SpecPrefill already handled its own prefill above, so skip for those.
             if request.specprefill_indices is None and len(tokens_to_process) > 1:
+                available_budget = None
+                if prefill_budget is not None:
+                    available_budget = max(0, prefill_budget - prefill_tokens_used)
+                    if available_budget <= 0:
+                        self.waiting.appendleft(request)
+                        self._prefill_budget_exhaustions += 1
+                        break
+
                 # Assign UID early so progress callbacks can map uid->request_id
                 # during external prefill. Use a temporary UID that will be replaced
                 # by the real one from insert().
@@ -3467,24 +3575,49 @@ class Scheduler:
                 self.request_id_to_uid[request.request_id] = temp_uid
                 self.uid_to_request_id[temp_uid] = request.request_id
 
-                vlm_embeds = None
-                if request.vlm_inputs_embeds is not None:
-                    vlm_embeds = (
-                        request.vlm_inputs_embeds,
-                        request.vlm_extra_kwargs or {},
-                        request.cached_tokens,
+                try:
+                    vlm_embeds = None
+                    if request.vlm_inputs_embeds is not None:
+                        vlm_embeds = (
+                            request.vlm_inputs_embeds,
+                            request.vlm_extra_kwargs or {},
+                            request.cached_tokens,
+                        )
+
+                    (
+                        prefilled_cache,
+                        last_token,
+                        prefill_complete,
+                        processed_now,
+                    ) = self._do_external_prefill(
+                        request,
+                        tokens_to_process,
+                        cache_to_use,
+                        vlm_embeds=vlm_embeds,
+                        token_budget=available_budget,
                     )
+                finally:
+                    # Clean up temp UID mapping
+                    self.uid_to_request_id.pop(temp_uid, None)
+                    if self.request_id_to_uid.get(request.request_id) == temp_uid:
+                        del self.request_id_to_uid[request.request_id]
 
-                prefilled_cache, last_token = self._do_external_prefill(
-                    request,
-                    tokens_to_process,
-                    cache_to_use,
-                    vlm_embeds=vlm_embeds,
-                )
+                prefill_tokens_used += processed_now
+                self._prefill_tokens_budgeted += processed_now
 
-                # Clean up temp UID mapping
-                del self.uid_to_request_id[temp_uid]
-                del self.request_id_to_uid[request.request_id]
+                if not prefill_complete:
+                    self.waiting.appendleft(request)
+                    self._prefill_budget_exhaustions += 1
+                    logger.debug(
+                        "Request %s prefill yielded at %d/%d tokens "
+                        "(budget=%s, processed_now=%d)",
+                        request.request_id,
+                        request.prefill_processed_tokens,
+                        max(0, len(tokens_to_process) - 1),
+                        available_budget,
+                        processed_now,
+                    )
+                    break
 
                 # Prefill complete: remove from progress tracker so dashboard
                 # shows "generating" instead of "PP" during decode.
@@ -3571,6 +3704,14 @@ class Scheduler:
         """
         outputs = []
         finished_ids = set()
+        finishing_response_ids = set()
+        for response in responses:
+            request_id = self.uid_to_request_id.get(response.uid)
+            if request_id is not None and response.finish_reason is not None:
+                finishing_response_ids.add(request_id)
+        has_followup_after_batch = bool(self.waiting) or any(
+            rid not in finishing_response_ids for rid in self.running
+        )
 
         for response in responses:
             request_id = self.uid_to_request_id.get(response.uid)
@@ -3716,14 +3857,22 @@ class Scheduler:
                         # For paged cache, extract actual tensor states
                         # This allows cache to survive BatchGenerator recreation
                         elif self.block_aware_cache is not None:
-                            extracted_cache, model_cache_config = self._extract_cache_states(raw_cache)
-                            if extracted_cache:
-                                request._extracted_cache = extracted_cache
-                                request._model_cache_config = model_cache_config
+                            if has_followup_after_batch:
+                                self._cache_extract_skipped_busy += 1
                                 logger.debug(
-                                    f"Extracted {len(extracted_cache)} layer states "
-                                    f"for request {request_id}"
+                                    "Skipped cache extraction for %s while "
+                                    "decode/follow-up work remains",
+                                    request_id,
                                 )
+                            else:
+                                extracted_cache, model_cache_config = self._extract_cache_states(raw_cache)
+                                if extracted_cache:
+                                    request._extracted_cache = extracted_cache
+                                    request._model_cache_config = model_cache_config
+                                    logger.debug(
+                                        f"Extracted {len(extracted_cache)} layer states "
+                                        f"for request {request_id}"
+                                    )
                         else:
                             # Standard cache stores object references
                             request._extracted_cache = raw_cache
@@ -3943,7 +4092,7 @@ class Scheduler:
                     try:
                         payload = self._build_finished_cache_payload(request_id, request)
                         if payload is not None:
-                            if has_followup_work and payload.boundary_snapshots is None:
+                            if has_followup_work:
                                 self._defer_cache_payload(payload)
                             else:
                                 block_table = self._store_cache_payload(payload)
@@ -4028,6 +4177,7 @@ class Scheduler:
             if req_to_remove is not None:
                 req_to_remove._extracted_cache = None
                 req_to_remove.prompt_cache = None
+                self._reset_request_prefill_state(req_to_remove)
 
         # Schedule deferred Metal cache cleanup after request completion.
         if finished_ids:
@@ -4118,6 +4268,7 @@ class Scheduler:
                     if req is not None:
                         req._extracted_cache = None
                         req.prompt_cache = None
+                        self._reset_request_prefill_state(req)
                     continue
 
             # Reset scheduling state
@@ -4130,6 +4281,7 @@ class Scheduler:
             request.remaining_tokens = request.prompt_token_ids
             request.block_table = None
             request.shared_prefix_blocks = 0
+            self._reset_request_prefill_state(request)
 
             # Reset generation output (prevent duplicate tokens on re-prefill)
             request.output_token_ids = []
@@ -4166,20 +4318,33 @@ class Scheduler:
         Returns:
             SchedulerOutput with results of this step
         """
+        step_start = time.perf_counter()
         output = SchedulerOutput()
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)
+        phase_start = time.perf_counter()
         self._process_pending_aborts()
+        self._record_phase("process_aborts", time.perf_counter() - phase_start)
 
         # Check memory pressure and evict if needed (tiered cache)
         if self.memory_monitor is not None:
+            phase_start = time.perf_counter()
             self._check_memory_pressure()
+            self._record_phase(
+                "memory_pressure", time.perf_counter() - phase_start
+            )
 
         try:
             # Schedule waiting requests
+            phase_start = time.perf_counter()
             scheduled, rejected = self._schedule_waiting()
             output.scheduled_request_ids = [r.request_id for r in scheduled]
             output.num_scheduled_tokens = sum(r.num_prompt_tokens for r in scheduled)
+            self._record_phase(
+                "schedule_waiting",
+                time.perf_counter() - phase_start,
+                output.num_scheduled_tokens,
+            )
             if rejected:
                 output.outputs.extend(rejected)
                 output.has_work = True
@@ -4188,17 +4353,41 @@ class Scheduler:
             # Use next_generated() which returns only GenerationBatch.Response
             # objects (prefill is handled externally before insert).
             if self.batch_generator is not None and self.running:
+                phase_start = time.perf_counter()
                 responses = self.batch_generator.next_generated()
+                self._record_phase(
+                    "next_generated",
+                    time.perf_counter() - phase_start,
+                    len(responses),
+                )
                 output.has_work = True
 
                 if responses:
+                    phase_start = time.perf_counter()
                     outputs, finished_ids = self._process_batch_responses(responses)
+                    self._record_phase(
+                        "process_outputs",
+                        time.perf_counter() - phase_start,
+                        len(outputs),
+                    )
                     output.outputs = outputs
                     output.finished_request_ids = finished_ids
+                    phase_start = time.perf_counter()
                     self._cleanup_finished(finished_ids)
+                    self._record_phase(
+                        "cleanup_finished",
+                        time.perf_counter() - phase_start,
+                        len(finished_ids),
+                    )
 
             if not self.running and not self.waiting:
+                phase_start = time.perf_counter()
                 processed_stores = self._process_pending_cache_stores()
+                self._record_phase(
+                    "pending_cache_stores",
+                    time.perf_counter() - phase_start,
+                    processed_stores,
+                )
                 if processed_stores:
                     output.has_work = True
 
@@ -4276,13 +4465,20 @@ class Scheduler:
             should_clear = True
             self._deferred_clear_at = None
         if should_clear:
+            phase_start = time.perf_counter()
             _sync_and_clear_cache()
+            self._record_phase(
+                "sync_clear_cache", time.perf_counter() - phase_start
+            )
         if (
             self.config.gc_cleanup_interval > 0
             and self._step_counter % self.config.gc_cleanup_interval == 0
         ):
+            phase_start = time.perf_counter()
             gc.collect()
+            self._record_phase("gc_collect", time.perf_counter() - phase_start)
 
+        self._record_phase("step_total", time.perf_counter() - step_start)
         return output
 
     def get_request(self, request_id: str) -> Optional[Request]:
@@ -4311,6 +4507,17 @@ class Scheduler:
                 "max_pending": self._max_pending_cache_stores,
                 "max_deferred_tokens": self._max_deferred_cache_store_tokens,
             },
+            "prefill_budget": {
+                "max_num_batched_tokens": self.config.max_num_batched_tokens,
+                "exhaustions": self._prefill_budget_exhaustions,
+                "tokens_processed": self._prefill_tokens_budgeted,
+            },
+            "cache_scheduling": {
+                "restore_skipped_active_decode": self._cache_restore_skipped_active_decode,
+                "restore_skipped_tokens": self._cache_restore_skipped_tokens,
+                "extract_skipped_busy": self._cache_extract_skipped_busy,
+            },
+            "phase_timings": self._phase_stats_snapshot(),
             "sampler_batching": sampler_batching,
         }
         # Include cache stats

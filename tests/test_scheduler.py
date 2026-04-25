@@ -343,6 +343,40 @@ class TestSchedulerAddRequest:
         assert request.prompt_cache is None
         scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-rotating")
 
+    def test_add_request_skips_cold_cache_restore_while_decoding(
+        self, mock_model, mock_tokenizer
+    ):
+        """Cold SSD cache restore should not interrupt an active decode batch."""
+        from omlx.cache.paged_cache import BlockTable
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = MagicMock()
+        scheduler.running["active"] = Request(
+            request_id="active",
+            prompt=[1],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        block_table = BlockTable(request_id="req-cold", block_ids=[7], num_tokens=4)
+        scheduler.block_aware_cache.fetch_cache.return_value = (block_table, [])
+        scheduler.block_aware_cache.block_table_has_cold_blocks.return_value = True
+
+        request = Request(
+            request_id="req-cold",
+            prompt=[41, 42, 43, 44, 45],
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        scheduler.block_aware_cache.reconstruct_cache.assert_not_called()
+        scheduler.paged_cache_manager.delete_block_table.assert_called_once_with("req-cold")
+        assert request.remaining_tokens == [41, 42, 43, 44, 45]
+        assert request.cached_tokens == 0
+        assert scheduler._cache_restore_skipped_active_decode == 1
+        assert scheduler._cache_restore_skipped_tokens == 4
+
 
 class TestSchedulerAbortRequest:
     """Tests for Scheduler.abort_request() (deferred abort pattern)."""
@@ -1937,3 +1971,114 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         model.clear_vlm_position_state.assert_called_once()
+
+
+class TestSchedulerPrefillBudget:
+    """Tests for external prefill yielding and resume behavior."""
+
+    def _make_model(self):
+        model = MagicMock(spec=["__call__", "make_cache", "parameters"])
+        model.make_cache.return_value = []
+        return model
+
+    def test_schedule_waiting_resumes_prefill_across_budgeted_steps(
+        self, mock_tokenizer
+    ):
+        """A long prompt should yield before insert, then resume next step."""
+        model = self._make_model()
+        config = SchedulerConfig(max_num_batched_tokens=2, prefill_step_size=8)
+        scheduler = Scheduler(model=model, tokenizer=mock_tokenizer, config=config)
+
+        mock_bg = MagicMock()
+        mock_bg.insert = MagicMock(return_value=[42])
+        scheduler.batch_generator = mock_bg
+
+        request = Request(
+            request_id="budget-001",
+            prompt="hello world",
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5]
+        request.num_prompt_tokens = 5
+        scheduler.waiting.append(request)
+        scheduler.requests[request.request_id] = request
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+        assert request.prefill_processed_tokens == 2
+        assert request.prefill_cache is not None
+        mock_bg.insert.assert_not_called()
+        assert scheduler._prefill_budget_exhaustions == 1
+
+        with patch("omlx.scheduler._sync_and_clear_cache"):
+            scheduled, rejected = scheduler._schedule_waiting()
+
+        assert scheduled == [request]
+        assert rejected == []
+        assert request.prefill_processed_tokens == 0
+        assert request.prefill_cache is None
+        mock_bg.insert.assert_called_once()
+        args, kwargs = mock_bg.insert.call_args
+        assert args[0] == [[5]]
+        assert scheduler.running[request.request_id] is request
+
+
+class TestSchedulerCacheCriticalPath:
+    """Tests that cache extraction avoids active decode critical path."""
+
+    def test_finished_response_skips_cache_extraction_when_work_remains(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        finished = Request(
+            request_id="done",
+            prompt="done",
+            sampling_params=SamplingParams(max_tokens=8),
+            prompt_token_ids=[1, 2],
+            num_prompt_tokens=2,
+            status=RequestStatus.RUNNING,
+            batch_uid=11,
+        )
+        active = Request(
+            request_id="active",
+            prompt="active",
+            sampling_params=SamplingParams(max_tokens=8),
+            prompt_token_ids=[3, 4],
+            num_prompt_tokens=2,
+            status=RequestStatus.RUNNING,
+            batch_uid=12,
+        )
+        scheduler.running[finished.request_id] = finished
+        scheduler.running[active.request_id] = active
+        scheduler.uid_to_request_id[11] = finished.request_id
+        scheduler.request_id_to_uid[finished.request_id] = 11
+
+        response = type(
+            "Resp",
+            (),
+            {
+                "uid": 11,
+                "token": 99,
+                "finish_reason": "length",
+                "prompt_cache": [object()],
+                "logprobs": None,
+            },
+        )()
+
+        with (
+            patch.object(scheduler, "_extract_cache_states") as extract,
+            patch.object(scheduler, "_get_detokenizer", return_value=None),
+        ):
+            outputs, finished_ids = scheduler._process_batch_responses([response])
+
+        extract.assert_not_called()
+        assert getattr(finished, "_extracted_cache", None) is None
+        assert scheduler._cache_extract_skipped_busy == 1
+        assert finished_ids == {"done"}
+        assert outputs[0].finished is True

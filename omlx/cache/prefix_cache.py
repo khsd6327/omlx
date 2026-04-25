@@ -624,6 +624,19 @@ class BlockAwarePrefixCache(CacheManager):
 
         return block_table
 
+    def block_table_has_cold_blocks(self, block_table: BlockTable) -> bool:
+        """Return True if restoring this block table would require SSD reads."""
+        if self.paged_ssd_cache is None or not block_table:
+            return False
+
+        for block_id in block_table.block_ids:
+            block = self.paged_cache.allocated_blocks.get(block_id)
+            if block is None or block.block_hash is None:
+                continue
+            if not self.paged_ssd_cache.is_block_hot(block.block_hash):
+                return True
+        return False
+
     def _get_cache_seq_len(self, cache_data: List[Dict[str, Any]]) -> int:
         """
         Get the sequence length from cache data.

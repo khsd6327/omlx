@@ -1193,6 +1193,11 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["errors"] += 1
             return False
 
+    def is_block_hot(self, block_hash: bytes) -> bool:
+        """Return True when a block can be restored without disk I/O."""
+        with self._hot_cache_lock:
+            return block_hash in self._hot_cache
+
     def _reconstruct_cache_data(
         self,
         arrays: Dict[str, Any],
@@ -2019,4 +2024,3 @@ class PagedSSDCacheManager(CacheManager):
             Configured maximum cache size in bytes.
         """
         return self._max_size
-

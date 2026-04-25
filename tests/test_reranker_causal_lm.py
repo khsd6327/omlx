@@ -129,6 +129,41 @@ class TestCausalLMReranker:
             mock_method.assert_called_once()
             assert result.scores == [0.9]
 
+    def test_load_causal_lm_falls_back_for_qwen_reranker_template(self, tmp_path):
+        """Qwen3 reranker chat_template ignores sentinel; use fixed prefix/suffix."""
+        model_dir = self._make_model_dir(tmp_path)
+        reranker = MLXRerankerModel(str(model_dir))
+
+        tokenizer = MagicMock()
+        tokenizer.convert_tokens_to_ids.side_effect = lambda token: {
+            "yes": 9693,
+            "no": 2152,
+        }[token]
+        tokenizer.apply_chat_template.return_value = (
+            "<|im_start|>system\nJudge whether the Document meets the "
+            'requirements based on the Query and the Instruct provided. '
+            'Note that the answer can only be "yes" or "no".<|im_end|>\n'
+            "<|im_start|>user\n<Instruct>: Judge whether the Document meets "
+            "the requirements based on the Query and the Instruct provided. "
+            'Note that the answer can only be "yes" or "no".\n'
+            "<Query>: \n<Document>: <|im_end|>\n<|im_start|>assistant\n"
+        )
+        tokenizer.encode.side_effect = [[1, 2, 3], [4, 5, 6]]
+        tokenizer_wrapper = MagicMock()
+        tokenizer_wrapper._tokenizer = tokenizer
+
+        with patch("mlx_lm.load", return_value=(MagicMock(), tokenizer_wrapper)):
+            reranker._load_causal_lm()
+
+        assert reranker._token_true_id == 9693
+        assert reranker._token_false_id == 2152
+        assert reranker._prefix_tokens == [1, 2, 3]
+        assert reranker._suffix_tokens == [4, 5, 6]
+        prefix_arg = tokenizer.encode.call_args_list[0].args[0]
+        suffix_arg = tokenizer.encode.call_args_list[1].args[0]
+        assert prefix_arg.endswith("<|im_start|>user\n")
+        assert suffix_arg == "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
     def test_max_length_default_for_causal_lm(self, tmp_path):
         """Test that CausalLM reranker uses 8192 as effective max_length by default."""
         model_dir = self._make_model_dir(tmp_path)
