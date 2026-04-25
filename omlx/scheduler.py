@@ -13,7 +13,10 @@ The scheduler follows vLLM's design with:
 
 import copy
 import gc
+import hashlib
+import inspect
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -117,15 +120,191 @@ class _PrefillAbortedError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Monkey-patch GenerationBatch._step to call grammar accept_token() after
-# sampling.  In the pipelined _step(), logits processors fill the bitmask
-# (constrain NEXT token) but can't know which token was just sampled.
-# After _original_step returns, self._next_tokens holds the freshly sampled
-# tokens.  We eval them synchronously and accept in grammar processors.
+# Monkey-patch GenerationBatch._step for two oMLX integration fixes:
+# 1. Set per-request mRoPE deltas before VLM decode steps.
+# 2. Accept grammar tokens after sampling so constrained decoding advances.
+#
+# When the installed mlx-lm _step shape matches the version we know how to
+# mirror, also group equivalent per-request samplers.  mlx-lm otherwise calls
+# one sampler per request whenever any per-request sampler is present, which
+# explodes into many tiny RandomBits/top-p graphs under continuous batching.
+# If mlx-lm changes this method, we keep the integration fixes and disable
+# grouping instead of silently running a stale copy of upstream code.
 # ---------------------------------------------------------------------------
-_original_generation_batch_step = GenerationBatch._step
+_original_generation_batch_step = getattr(
+    GenerationBatch._step,
+    "_omlx_original_generation_batch_step",
+    GenerationBatch._step,
+)
 
-def _patched_generation_batch_step(self):
+_GROUPED_SAMPLING_ENV = "OMLX_GROUPED_SAMPLING"
+_DISABLE_ENV_VALUES = {"0", "false", "no", "off", "disabled"}
+_GENERATION_BATCH_STEP_SNIPPETS = (
+    "self._current_tokens = self._next_tokens",
+    "logits = self.model(inputs[:, None], cache=self.prompt_cache)",
+    "if any(self.samplers):",
+    "sample_sampler = self.samplers[e] or self.fallback_sampler",
+    "mx.async_eval(self._next_tokens, self._next_logprobs, token_context)",
+)
+
+_SAMPLER_BATCH_PATCH = {
+    "installed": False,
+    "mode": "pending",
+    "compatible": False,
+    "disabled_reason": None,
+    "source_sha256": None,
+}
+
+_SAMPLER_BATCH_STATS = {
+    "steps": 0,
+    "grouped_steps": 0,
+    "sampler_calls": 0,
+    "avoided_sampler_calls": 0,
+    "last_batch_size": 0,
+    "last_group_count": 0,
+    "last_group_sizes": [],
+    "last_group_keys": [],
+}
+
+
+def _generation_batch_step_source() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    try:
+        source = inspect.getsource(_original_generation_batch_step)
+    except (OSError, TypeError) as e:
+        return None, None, f"could not inspect mlx-lm GenerationBatch._step: {e}"
+    return source, hashlib.sha256(source.encode()).hexdigest(), None
+
+
+def _generation_batch_step_is_groupable() -> Tuple[bool, Optional[str]]:
+    try:
+        signature = inspect.signature(_original_generation_batch_step)
+    except (TypeError, ValueError) as e:
+        return False, f"could not inspect GenerationBatch._step signature: {e}"
+
+    if tuple(signature.parameters) != ("self",):
+        return False, f"unexpected GenerationBatch._step signature: {signature}"
+
+    source, source_hash, error = _generation_batch_step_source()
+    _SAMPLER_BATCH_PATCH["source_sha256"] = source_hash
+    if error is not None:
+        return False, error
+
+    missing = [
+        snippet for snippet in _GENERATION_BATCH_STEP_SNIPPETS
+        if snippet not in source
+    ]
+    if missing:
+        return False, "unsupported GenerationBatch._step body; missing " + repr(missing)
+    return True, None
+
+
+def _grouped_sampling_enabled() -> bool:
+    value = os.environ.get(_GROUPED_SAMPLING_ENV, "1").strip().lower()
+    return value not in _DISABLE_ENV_VALUES
+
+
+def _sampler_key(
+    sampling_params: SamplingParams,
+    xtc_special_tokens: Optional[List[int]] = None,
+) -> Tuple:
+    """Stable key for samplers that are equivalent on batched logprobs."""
+    if sampling_params.temperature == 0:
+        return ("mlx_lm.make_sampler.v1", "argmax")
+    return (
+        "mlx_lm.make_sampler.v1",
+        "categorical",
+        sampling_params.temperature,
+        sampling_params.top_p,
+        sampling_params.min_p,
+        sampling_params.top_k,
+        sampling_params.xtc_probability,
+        sampling_params.xtc_threshold,
+        tuple(xtc_special_tokens or ()),
+    )
+
+
+def _tag_sampler(
+    sampler: Callable[[mx.array], mx.array],
+    key: Tuple,
+) -> Callable[[mx.array], mx.array]:
+    """Attach sampler metadata so identical per-request samplers can be batched."""
+    try:
+        setattr(sampler, "_omlx_sampler_key", key)
+        setattr(sampler, "_omlx_sampler_groupable", True)
+    except Exception:
+        pass
+    return sampler
+
+
+def _sampler_group_key(sampler: Callable[[mx.array], mx.array]) -> Tuple:
+    if getattr(sampler, "_omlx_sampler_groupable", False):
+        key = getattr(sampler, "_omlx_sampler_key", None)
+        if key is not None:
+            return key
+    # Untagged custom samplers may be stateful or close over arbitrary data.
+    # Group only identical callable objects, preserving correctness first.
+    return ("callable", id(sampler))
+
+
+def _contiguous_run(indices: List[int]) -> Optional[slice]:
+    if not indices:
+        return slice(0, 0)
+    start = indices[0]
+    if all(idx == start + offset for offset, idx in enumerate(indices)):
+        return slice(start, start + len(indices))
+    return None
+
+
+def _record_sampler_batch(batch_size: int, group_keys: List[Tuple], group_sizes: List[int]) -> None:
+    group_count = len(group_keys)
+    _SAMPLER_BATCH_STATS["steps"] += 1
+    if group_count < batch_size:
+        _SAMPLER_BATCH_STATS["grouped_steps"] += 1
+    _SAMPLER_BATCH_STATS["sampler_calls"] += group_count
+    _SAMPLER_BATCH_STATS["avoided_sampler_calls"] += max(0, batch_size - group_count)
+    _SAMPLER_BATCH_STATS["last_batch_size"] = batch_size
+    _SAMPLER_BATCH_STATS["last_group_count"] = group_count
+    _SAMPLER_BATCH_STATS["last_group_sizes"] = group_sizes
+    _SAMPLER_BATCH_STATS["last_group_keys"] = [repr(key)[:240] for key in group_keys]
+
+
+def _grouped_sample(self, logprobs: mx.array) -> mx.array:
+    """Sample by sampler-equivalence groups instead of per request."""
+    batch_size = len(self.uids)
+    if not self.samplers or not any(self.samplers):
+        _record_sampler_batch(batch_size, [("fallback", id(self.fallback_sampler))], [batch_size])
+        return self.fallback_sampler(logprobs)
+
+    groups: Dict[Tuple, Tuple[Callable[[mx.array], mx.array], List[int]]] = {}
+    for idx in range(batch_size):
+        sampler = self.samplers[idx] or self.fallback_sampler
+        key = _sampler_group_key(sampler)
+        groups.setdefault(key, (sampler, []))[1].append(idx)
+
+    sampled_by_index: List[Optional[mx.array]] = [None] * batch_size
+    for _key, (sampler, indices) in groups.items():
+        contiguous = _contiguous_run(indices)
+        if contiguous is not None:
+            group_logprobs = logprobs[contiguous]
+        else:
+            group_logprobs = mx.concatenate(
+                [logprobs[idx : idx + 1] for idx in indices],
+                axis=0,
+            )
+        group_sampled = sampler(group_logprobs)
+        for offset, idx in enumerate(indices):
+            sampled_by_index[idx] = group_sampled[offset : offset + 1]
+
+    _record_sampler_batch(
+        batch_size,
+        list(groups.keys()),
+        [len(indices) for _, indices in groups.values()],
+    )
+
+    return mx.concatenate([s for s in sampled_by_index if s is not None], axis=0)
+
+
+def _set_batch_mrope_deltas(self) -> None:
     # Build per-batch mRoPE deltas from UID mapping before each step.
     # This handles batch size changes during prompt split/generate.
     model = self.model
@@ -135,30 +314,127 @@ def _patched_generation_batch_step(self):
         deltas = [model._uid_rope_deltas.get(uid, 0.0) for uid in self.uids]
         model.set_batch_rope_deltas(mx.array(deltas))
 
-    result = _original_generation_batch_step(self)
 
+def _accept_grammar_tokens(self) -> None:
     # self._next_tokens contains the just-sampled tokens (async eval pending).
-    # We need to accept them NOW so the next __call__ fills the correct bitmask.
-    if any(self.logits_processors):
-        from .api.grammar import GrammarConstraintProcessor
+    # Accept them now so the next __call__ fills the correct bitmask.
+    logits_processors = getattr(self, "logits_processors", None) or []
+    if not any(logits_processors):
+        return
 
-        has_grammar = any(
-            isinstance(p, GrammarConstraintProcessor)
-            for procs in self.logits_processors
-            for p in procs
-        )
-        if has_grammar:
-            # Force eval of the sampled tokens so we can read them.
-            mx.eval(self._next_tokens)
-            sampled = self._next_tokens.tolist()
-            for e in range(len(self.uids)):
-                for proc in self.logits_processors[e]:
-                    if isinstance(proc, GrammarConstraintProcessor):
-                        proc.accept_token(sampled[e])
+    from .api.grammar import GrammarConstraintProcessor
 
+    has_grammar = any(
+        isinstance(processor, GrammarConstraintProcessor)
+        for processors in logits_processors
+        for processor in (processors or [])
+    )
+    if not has_grammar:
+        return
+
+    mx.eval(self._next_tokens)
+    sampled = self._next_tokens.tolist()
+    for idx, processors in enumerate(logits_processors):
+        for processor in processors or []:
+            if isinstance(processor, GrammarConstraintProcessor):
+                processor.accept_token(sampled[idx])
+
+
+def _patched_generation_batch_step_compat(self):
+    _set_batch_mrope_deltas(self)
+    result = _original_generation_batch_step(self)
+    _accept_grammar_tokens(self)
     return result
 
-GenerationBatch._step = _patched_generation_batch_step
+
+def _patched_generation_batch_step_grouped(self):
+    _set_batch_mrope_deltas(self)
+
+    # This mirrors mlx-lm's GenerationBatch._step, except sampling is grouped
+    # by equivalent sampler params.  Upstream samples in a Python loop when any
+    # per-request sampler exists, which creates one RandomBits/top-p graph per
+    # request per token on mixed batches.
+    self._current_tokens = self._next_tokens
+    self._current_logprobs = self._next_logprobs
+    inputs = self._current_tokens
+
+    logits = self.model(inputs[:, None], cache=self.prompt_cache)
+    logits = logits[:, -1, :]
+
+    token_context = []
+    if any(self.logits_processors):
+        token_context = [
+            tc.update_and_fetch(inputs[i : i + 1])
+            for i, tc in enumerate(self._token_context)
+        ]
+        processed_logits = []
+        for e in range(len(self.uids)):
+            sample_logits = logits[e : e + 1]
+            for processor in self.logits_processors[e] or []:
+                sample_logits = processor(token_context[e], sample_logits)
+            processed_logits.append(sample_logits)
+        logits = mx.concatenate(processed_logits, axis=0)
+
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    sampled = _grouped_sample(self, logprobs)
+
+    self._next_tokens = sampled
+    self._next_logprobs = list(logprobs)
+    mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+
+    mx.eval(inputs, self._current_logprobs)
+    inputs = inputs.tolist()
+    for sti, ti in zip(self.tokens, inputs):
+        sti.append(ti)
+
+    _accept_grammar_tokens(self)
+
+    return inputs, self._current_logprobs
+
+
+def _install_generation_batch_step_patch() -> None:
+    grouping_requested = _grouped_sampling_enabled()
+    compatible, reason = _generation_batch_step_is_groupable()
+
+    if grouping_requested and compatible:
+        patched = _patched_generation_batch_step_grouped
+        mode = "grouped"
+        disabled_reason = None
+    else:
+        patched = _patched_generation_batch_step_compat
+        mode = "compat"
+        disabled_reason = (
+            None if grouping_requested else f"{_GROUPED_SAMPLING_ENV}=0"
+        ) or reason
+
+    setattr(patched, "_omlx_original_generation_batch_step", _original_generation_batch_step)
+    setattr(patched, "_omlx_patch_mode", mode)
+    GenerationBatch._step = patched
+
+    _SAMPLER_BATCH_PATCH.update(
+        {
+            "installed": True,
+            "mode": mode,
+            "compatible": compatible,
+            "disabled_reason": disabled_reason,
+        }
+    )
+
+    if mode == "grouped":
+        logger.info(
+            "Installed grouped GenerationBatch._step patch "
+            "(source_sha256=%s)",
+            _SAMPLER_BATCH_PATCH["source_sha256"],
+        )
+    else:
+        logger.warning(
+            "Installed compatibility GenerationBatch._step patch; "
+            "sampler grouping disabled: %s",
+            disabled_reason,
+        )
+
+
+_install_generation_batch_step_patch()
 
 
 # Monkey-patch TurboQuantKVCache.merge so _merge_caches() works
@@ -965,6 +1241,10 @@ class Scheduler:
             xtc_threshold=sampling_params.xtc_threshold,
             xtc_special_tokens=self._xtc_special_tokens,
         )
+        sampler = _tag_sampler(
+            sampler,
+            _sampler_key(sampling_params, self._xtc_special_tokens),
+        )
 
         # Create logits processors for repetition/presence/frequency penalties
         logits_processors = make_logits_processors(
@@ -1395,6 +1675,10 @@ class Scheduler:
             xtc_probability=sampling_params.xtc_probability,
             xtc_threshold=sampling_params.xtc_threshold,
             xtc_special_tokens=self._xtc_special_tokens,
+        )
+        sampler = _tag_sampler(
+            sampler,
+            _sampler_key(sampling_params, self._xtc_special_tokens),
         )
         logits_processors = make_logits_processors(
             repetition_penalty=sampling_params.repetition_penalty
@@ -3855,12 +4139,15 @@ class Scheduler:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get scheduler statistics."""
+        sampler_batching = dict(_SAMPLER_BATCH_STATS)
+        sampler_batching["patch"] = dict(_SAMPLER_BATCH_PATCH)
         stats = {
             "num_waiting": len(self.waiting),
             "num_running": len(self.running),
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "sampler_batching": sampler_batching,
         }
         # Include cache stats
         if self.block_aware_cache is not None:

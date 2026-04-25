@@ -1477,11 +1477,16 @@ async def server_status(_: bool = Depends(verify_api_key)):
     # Aggregate active/waiting requests across all loaded engines
     active_requests = 0
     waiting_requests = 0
+    runtime_stats = {}
     if pool is not None:
-        for entry in pool._entries.values():
+        for model_id, entry in pool._entries.items():
             engine = entry.engine
             if engine is None:
                 continue
+            try:
+                runtime_stats[model_id] = engine.get_stats()
+            except Exception as e:
+                runtime_stats[model_id] = {"error": str(e)}
             async_core = getattr(engine, "_engine", None)
             if async_core is None:
                 continue
@@ -1515,6 +1520,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
         "model_memory_max": model_memory_max,
         "model_memory_used_formatted": format_size(model_memory_used) if model_memory_used else "0B",
         "model_memory_max_formatted": format_size(model_memory_max) if model_memory_max else "unlimited",
+        "runtime_stats": runtime_stats,
     }
 
 

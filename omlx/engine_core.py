@@ -32,33 +32,55 @@ logger = logging.getLogger(__name__)
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
 
-def _init_mlx_thread() -> None:
-    """Replace generation_stream with a thread-local stream on the executor thread.
-
-    mlx-lm's module-level ``generation_stream`` is created at import time in
-    whichever thread imported it first (the main thread at server startup).
-    Arrays produced inside ``with mx.stream(generation_stream):`` blocks carry
-    that stream reference.  If the stream was created on the main thread,
-    subsequent ``.item()`` / ``mx.synchronize()`` calls from the executor
-    thread fail with "There is no Stream(gpu, 0) in current thread".
-
-    Fix: create a thread-local stream HERE and replace the module-level
-    ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
-    """
+def _patch_generation_stream_modules(stream: mx.Stream) -> list[str]:
+    """Point known generation modules at the executor thread-local stream."""
+    import importlib
     import sys
-    import mlx.core as mx
 
-    stream = mx.new_thread_local_stream(mx.default_device())
-
-    gen_mod = sys.modules.get("mlx_lm.generate")
-    if gen_mod is not None:
-        gen_mod.generation_stream = stream
+    patched: list[str] = []
+    for module_name in ("mlx_lm.generate", "mlx_vlm.generate"):
+        module = sys.modules.get(module_name)
+        if module is None:
+            try:
+                module = importlib.import_module(module_name)
+            except Exception as e:
+                logger.debug("Could not import %s for stream patch: %s", module_name, e)
+                continue
+        if hasattr(module, "generation_stream"):
+            module.generation_stream = stream
+            patched.append(module_name)
 
     sched_mod = sys.modules.get("omlx.scheduler")
     if sched_mod is not None:
         sched_mod.generation_stream = stream
+        patched.append("omlx.scheduler")
 
-    logger.info(f"MLX executor thread initialized: generation_stream = {stream}")
+    return patched
+
+
+def _init_mlx_thread() -> None:
+    """Replace generation_stream with a thread-local stream on the executor thread.
+
+    mlx-lm/mlx-vlm builds may expose a module-level stream created on the main
+    thread. All MLX GPU ops are serialized onto this executor thread; arrays
+    produced inside ``with mx.stream(generation_stream):`` blocks carry that
+    stream reference. If it belongs to another thread, later ``.item()`` or
+    ``mx.synchronize()`` calls from the executor can fail with "There is no
+    Stream(gpu, 0) in current thread".
+
+    Create a thread-local stream here and replace the module-level stream in
+    mlx-lm, mlx-vlm, and oMLX's scheduler alias.
+    """
+    import mlx.core as mx
+
+    stream = mx.new_thread_local_stream(mx.default_device())
+    patched = _patch_generation_stream_modules(stream)
+
+    logger.info(
+        "MLX executor thread initialized: generation_stream=%s patched=%s",
+        stream,
+        patched,
+    )
 
 
 def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:

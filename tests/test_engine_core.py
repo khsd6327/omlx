@@ -13,13 +13,39 @@ Note: Uses pytest-asyncio for async tests.
 """
 
 import asyncio
-from unittest.mock import MagicMock, patch, AsyncMock
+import sys
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.engine_core import EngineCore, AsyncEngineCore, EngineConfig
+from omlx.engine_core import (
+    AsyncEngineCore,
+    EngineConfig,
+    EngineCore,
+    _patch_generation_stream_modules,
+)
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import SchedulerConfig
+
+
+def test_patch_generation_stream_modules_updates_known_modules(monkeypatch):
+    """The executor stream patch should cover mlx-lm, mlx-vlm, and scheduler."""
+    stream = object()
+    lm_generate = SimpleNamespace(generation_stream=None)
+    vlm_generate = SimpleNamespace(generation_stream=None)
+    scheduler_module = SimpleNamespace(generation_stream=None)
+
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", lm_generate)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", vlm_generate)
+    monkeypatch.setitem(sys.modules, "omlx.scheduler", scheduler_module)
+
+    patched = _patch_generation_stream_modules(stream)
+
+    assert lm_generate.generation_stream is stream
+    assert vlm_generate.generation_stream is stream
+    assert scheduler_module.generation_stream is stream
+    assert patched == ["mlx_lm.generate", "mlx_vlm.generate", "omlx.scheduler"]
 
 
 class TestEngineConfig:
