@@ -953,6 +953,87 @@ class TestSchedulerBoundarySnapshots:
         args, kwargs = scheduler.block_aware_cache.store_cache.call_args
         assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt + output
 
+    def test_cleanup_finished_defers_cache_store_while_batch_active(
+        self, mock_model, mock_tokenizer
+    ):
+        """Finished cache persistence should not block an active decode batch."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        finished = Request(
+            request_id="req-finished",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        finished.prompt_token_ids = [1, 2, 3, 4]
+        finished.num_prompt_tokens = 4
+        finished.output_token_ids = [5, 6, 7, 8]
+        finished._extracted_cache = [{"state": "cache"}]
+        finished._model_cache_config = None
+
+        active = Request(
+            request_id="req-active",
+            prompt="still running",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.running["req-finished"] = finished
+        scheduler.running["req-active"] = active
+        scheduler.requests["req-finished"] = finished
+        scheduler.requests["req-active"] = active
+
+        scheduler._cleanup_finished({"req-finished"})
+
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        assert len(scheduler._pending_cache_stores) == 1
+        assert scheduler._cache_store_deferred == 1
+
+        assert scheduler._process_pending_cache_stores() == 0
+        scheduler.running.clear()
+
+        assert scheduler._process_pending_cache_stores() == 1
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[0] == "req-finished"
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]
+
+    def test_cleanup_finished_drops_large_deferred_cache_store(
+        self, mock_model, mock_tokenizer
+    ):
+        """Large finished caches should not be held while decode continues."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+        scheduler._max_deferred_cache_store_tokens = 8
+
+        finished = Request(
+            request_id="req-large",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+        finished.prompt_token_ids = [1, 2, 3, 4]
+        finished.num_prompt_tokens = 4
+        finished.output_token_ids = [5, 6, 7, 8, 9]
+        finished._extracted_cache = [{"state": "cache"}]
+
+        active = Request(
+            request_id="req-active",
+            prompt="still running",
+            sampling_params=SamplingParams(),
+        )
+        scheduler.running["req-large"] = finished
+        scheduler.running["req-active"] = active
+        scheduler.requests["req-large"] = finished
+        scheduler.requests["req-active"] = active
+
+        scheduler._cleanup_finished({"req-large"})
+
+        scheduler.block_aware_cache.store_cache.assert_not_called()
+        assert len(scheduler._pending_cache_stores) == 0
+        assert scheduler._cache_store_dropped == 1
+
     def test_cleanup_finished_uses_boundary_snapshot_for_partial_trailing_tokens(
         self, mock_model, mock_tokenizer
     ):

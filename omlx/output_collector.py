@@ -132,14 +132,17 @@ class RequestOutputCollector:
         Returns:
             Merged RequestOutput
         """
-        # Combine new tokens
-        merged_new_token_ids = existing.new_token_ids + new.new_token_ids
-        merged_new_text = existing.new_text + new.new_text
+        # Combine new tokens in-place. This avoids repeatedly allocating a
+        # growing token list when a streaming consumer falls behind.
+        if new.new_token_ids:
+            existing.new_token_ids.extend(new.new_token_ids)
+        if new.new_text:
+            existing.new_text += new.new_text
 
         return RequestOutput(
             request_id=new.request_id,
-            new_token_ids=merged_new_token_ids,
-            new_text=merged_new_text,
+            new_token_ids=existing.new_token_ids,
+            new_text=existing.new_text,
             output_token_ids=new.output_token_ids,  # Use latest cumulative
             output_text=new.output_text,  # Use latest cumulative
             finished=new.finished,

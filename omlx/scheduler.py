@@ -674,6 +674,28 @@ class _BoundarySnapshotProvider:
         return bool(self._valid_tcs)
 
 
+@dataclass
+class _PendingCacheStore:
+    """Deferred finished-request cache store payload.
+
+    Cache persistence is a reuse optimization, not part of producing the
+    response.  Keeping the payload separate lets the scheduler postpone heavy
+    KV slicing/materialization until no decode batch is active.
+    """
+
+    request_id: str
+    token_sequence: List[int]
+    total_tokens: int
+    prompt_tokens: int
+    output_tokens: int
+    cache_data: List[Any]
+    model_cache_config: Optional["ModelCacheConfig"]
+    boundary_snapshots: Optional[Any]
+    extra_keys: Optional[Tuple[Any, ...]]
+    extra_key_token_start: Optional[int]
+    extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]]
+
+
 class Scheduler:
     """
     Scheduler for continuous batching using mlx-lm BatchGenerator.
@@ -783,6 +805,15 @@ class Scheduler:
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self.paged_ssd_cache_manager: Optional["PagedSSDCacheManager"] = None
         self.memory_monitor: Optional["MemoryMonitor"] = None
+        self._pending_cache_stores: deque[_PendingCacheStore] = deque()
+        self._max_pending_cache_stores = 2
+        self._max_deferred_cache_store_tokens = max(
+            8192,
+            self.config.paged_cache_block_size * 4,
+        )
+        self._cache_store_deferred = 0
+        self._cache_store_dropped = 0
+        self._cache_store_processed = 0
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -3051,13 +3082,17 @@ class Scheduler:
     def has_requests(self) -> bool:
         """Check if there are any pending or running requests.
 
-        Also returns True when a deferred Metal cache clear is pending,
-        so that the engine loop keeps calling step() until the clear fires.
+        Also returns True when deferred cleanup/cache-store work is pending,
+        so that the engine loop keeps calling step() until idle work drains.
         Without this, an idle server would never reach the target step and
         stale buffers would accumulate indefinitely.
         """
-        return bool(self.waiting or self.running
-                     or self._deferred_clear_at is not None)
+        return bool(
+            self.waiting
+            or self.running
+            or self._pending_cache_stores
+            or self._deferred_clear_at is not None
+        )
 
     def fail_all_requests(self) -> List[str]:
         """Remove all running and waiting requests after unrecoverable error.
@@ -3617,7 +3652,7 @@ class Scheduler:
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
+                output_token_ids=[],
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 cached_tokens=request.cached_tokens,
@@ -3666,6 +3701,8 @@ class Scheduler:
                     output.output_text = self.tokenizer.decode(request.output_token_ids)
                     request.output_text = output.output_text
 
+                output.output_token_ids = list(request.output_token_ids)
+
                 # Extract cache for future reuse.
                 # In the new API, prompt_cache is a direct value (not callable).
                 raw_cache = getattr(response, 'prompt_cache', None)
@@ -3707,6 +3744,170 @@ class Scheduler:
 
         return outputs, finished_ids
 
+    def _build_finished_cache_payload(
+        self,
+        request_id: str,
+        request: Request,
+    ) -> Optional[_PendingCacheStore]:
+        """Build a cache-store payload for a finished request."""
+        if (
+            self.block_aware_cache is None
+            or request is None
+            or not request.prompt_token_ids
+            or not hasattr(request, '_extracted_cache')
+            or request._extracted_cache is None
+        ):
+            return None
+
+        full_token_sequence = (
+            list(request.prompt_token_ids) + list(request.output_token_ids)
+        )
+        # For reasoning models, only cache prompt tokens. Output contains
+        # <think> tokens that the API layer strips before the next turn, so
+        # they never match.
+        if getattr(request, 'needs_think_prefix', False):
+            cacheable_sequence = list(request.prompt_token_ids)
+        else:
+            cacheable_sequence = full_token_sequence
+
+        token_sequence_to_store = cacheable_sequence
+        cache_to_store = request._extracted_cache
+        model_cache_config = getattr(request, '_model_cache_config', None)
+        intermediate_snapshots = None
+
+        boundary_override = self._get_boundary_store_override(
+            request_id,
+            cacheable_sequence,
+        )
+        if boundary_override is not None:
+            (
+                token_sequence_to_store,
+                boundary_cache,
+                boundary_model_config,
+                intermediate_snapshots,
+            ) = boundary_override
+
+            # Merge boundary snapshot with full extracted cache: KVCache layers
+            # in the snapshot are placeholders when snapshots skip sliceable
+            # layers. Fill them from the full extracted cache so that
+            # _extract_block_tensor_slice can slice KV data.
+            cache_to_store = self._merge_boundary_with_full_cache(
+                boundary_cache, request._extracted_cache
+            )
+
+            if boundary_model_config is not None:
+                model_cache_config = boundary_model_config
+            logger.info(
+                f"Using boundary cache snapshot for {request_id}: "
+                f"storing {len(token_sequence_to_store)}/"
+                f"{len(full_token_sequence)} tokens "
+                f"(skipping trailing partial block, "
+                f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
+                f"intermediate snapshots)"
+            )
+
+        return _PendingCacheStore(
+            request_id=request_id,
+            token_sequence=token_sequence_to_store,
+            total_tokens=len(full_token_sequence),
+            prompt_tokens=len(request.prompt_token_ids),
+            output_tokens=len(request.output_token_ids),
+            cache_data=cache_to_store,
+            model_cache_config=model_cache_config,
+            boundary_snapshots=intermediate_snapshots,
+            extra_keys=request.vlm_extra_keys_for_cache,
+            extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+            extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+        )
+
+    def _store_cache_payload(
+        self,
+        payload: _PendingCacheStore,
+    ) -> Optional[Any]:
+        """Store one finished-request cache payload."""
+        if self.block_aware_cache is None:
+            return None
+
+        with mx.stream(generation_stream):
+            block_table = self.block_aware_cache.store_cache(
+                payload.request_id,
+                payload.token_sequence,
+                payload.cache_data,
+                model_cache_config=payload.model_cache_config,
+                boundary_snapshots=payload.boundary_snapshots,
+                extra_keys=payload.extra_keys,
+                extra_key_token_start=payload.extra_key_token_start,
+                extra_key_ranges=payload.extra_key_ranges,
+            )
+        logger.debug(
+            f"Stored paged cache for request {payload.request_id} "
+            f"({len(payload.token_sequence)} tokens stored, "
+            f"{payload.total_tokens} total: "
+            f"{payload.prompt_tokens} prompt + "
+            f"{payload.output_tokens} output)"
+        )
+        return block_table
+
+    def _defer_cache_payload(self, payload: _PendingCacheStore) -> bool:
+        """Queue a finished-request cache store for idle time."""
+        if len(payload.token_sequence) > self._max_deferred_cache_store_tokens:
+            self._cache_store_dropped += 1
+            logger.debug(
+                "Dropping deferred cache store for %s: %s tokens exceeds "
+                "deferred limit %s",
+                payload.request_id,
+                len(payload.token_sequence),
+                self._max_deferred_cache_store_tokens,
+            )
+            return False
+
+        if len(self._pending_cache_stores) >= self._max_pending_cache_stores:
+            self._cache_store_dropped += 1
+            logger.debug(
+                "Dropping deferred cache store for %s: queue full (%s)",
+                payload.request_id,
+                self._max_pending_cache_stores,
+            )
+            return False
+
+        self._pending_cache_stores.append(payload)
+        self._cache_store_deferred += 1
+        return True
+
+    def _process_pending_cache_stores(self) -> int:
+        """Process deferred cache stores only while no decode work is active."""
+        if not self._pending_cache_stores or self.running or self.waiting:
+            return 0
+
+        processed = 0
+        while self._pending_cache_stores:
+            payload = self._pending_cache_stores.popleft()
+            block_table = None
+            try:
+                block_table = self._store_cache_payload(payload)
+                self._cache_store_processed += 1
+                processed += 1
+            except Exception as e:
+                logger.debug(
+                    f"Failed to process deferred cache store for "
+                    f"{payload.request_id}: {e}"
+                )
+
+            if block_table and self.paged_cache_manager:
+                released = self.paged_cache_manager.release_for_eviction(
+                    block_table.block_ids
+                )
+                if released > 0:
+                    logger.debug(
+                        f"Released {released} deferred cache blocks for eviction "
+                        f"(request {payload.request_id})"
+                    )
+
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.clear_request_entry(payload.request_id)
+
+        return processed
+
     def _cleanup_finished(self, finished_ids: Set[str]) -> None:
         """Clean up finished requests and store caches for reuse."""
         # Synchronize pending generation_stream operations before cache storage.
@@ -3726,89 +3927,35 @@ class Scheduler:
         for rid in finished_ids:
             tracker.remove(rid)
 
+        has_followup_work = (
+            any(rid not in finished_ids for rid in self.running)
+            or bool(self.waiting)
+        )
+        batch_remove_synced = bool(finished_ids)
+
         for request_id in finished_ids:
             request = self.running.get(request_id)
 
             # Store cache for future reuse
             if request is not None and request.prompt_token_ids:
                 if self.block_aware_cache is not None:
-                    # Store in paged cache
-                    # Key includes both prompt and output tokens for multi-turn chat caching
                     block_table = None
-                    if hasattr(request, '_extracted_cache') and request._extracted_cache is not None:
-                        try:
-                            full_token_sequence = list(request.prompt_token_ids) + list(request.output_token_ids)
-                            # For reasoning models, only cache prompt tokens.
-                            # Output contains <think> tokens that the API layer
-                            # strips before the next turn, so they never match.
-                            if getattr(request, 'needs_think_prefix', False):
-                                cacheable_sequence = list(request.prompt_token_ids)
+                    try:
+                        payload = self._build_finished_cache_payload(request_id, request)
+                        if payload is not None:
+                            if has_followup_work and payload.boundary_snapshots is None:
+                                self._defer_cache_payload(payload)
                             else:
-                                cacheable_sequence = full_token_sequence
-                            token_sequence_to_store = cacheable_sequence
-                            cache_to_store = request._extracted_cache
-                            # Get model cache config if available (for hybrid cache support)
-                            model_cache_config = getattr(request, '_model_cache_config', None)
-
-                            # Keep all tensor-touching cache store work on the
-                            # generation stream to avoid cross-stream conflicts
-                            # with arrays extracted from BatchGenerator caches.
-                            with mx.stream(generation_stream):
-                                boundary_override = self._get_boundary_store_override(
-                                    request_id,
-                                    cacheable_sequence,
-                                )
-                                intermediate_snapshots = None
-                                if boundary_override is not None:
-                                    (
-                                        token_sequence_to_store,
-                                        boundary_cache,
-                                        boundary_model_config,
-                                        intermediate_snapshots,
-                                    ) = boundary_override
-
-                                    # Merge boundary snapshot with full extracted cache:
-                                    # KVCache layers in the snapshot are placeholders
-                                    # (empty state) when snapshots skip sliceable layers.
-                                    # Fill them from the full extracted cache so that
-                                    # _extract_block_tensor_slice can slice KV data.
-                                    cache_to_store = self._merge_boundary_with_full_cache(
-                                        boundary_cache, request._extracted_cache
-                                    )
-
-                                    if boundary_model_config is not None:
-                                        model_cache_config = boundary_model_config
-                                    logger.info(
-                                        f"Using boundary cache snapshot for {request_id}: "
-                                        f"storing {len(token_sequence_to_store)}/"
-                                        f"{len(full_token_sequence)} tokens "
-                                        f"(skipping trailing partial block, "
-                                        f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
-                                        f"intermediate snapshots)"
-                                    )
-
-                                block_table = self.block_aware_cache.store_cache(
-                                    request_id,
-                                    token_sequence_to_store,
-                                    cache_to_store,
-                                    model_cache_config=model_cache_config,
-                                    boundary_snapshots=intermediate_snapshots,
-                                    extra_keys=request.vlm_extra_keys_for_cache,
-                                    extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
-                                    extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
-                                )
-                            logger.debug(
-                                f"Stored paged cache for request {request_id} "
-                                f"({len(token_sequence_to_store)} tokens stored, "
-                                f"{len(full_token_sequence)} total: "
-                                f"{len(request.prompt_token_ids)} prompt + "
-                                f"{len(request.output_token_ids)} output)"
-                            )
-                            # Immediately release _extracted_cache to free copy #1
-                            # (store_cache already cloned to PagedCache blocks)
+                                block_table = self._store_cache_payload(payload)
+                                # Store work can enqueue/evaluate MLX arrays on
+                                # generation_stream; sync once before batch
+                                # mutation below.
+                                batch_remove_synced = False
+                            # Release request-owned reference. A deferred payload
+                            # keeps only its bounded queue reference.
                             request._extracted_cache = None
-                        except Exception as e:
-                            logger.debug(f"Failed to store paged cache for {request_id}: {e}")
+                    except Exception as e:
+                        logger.debug(f"Failed to store paged cache for {request_id}: {e}")
 
                     # ALWAYS release blocks for eviction, even if store_cache() failed
                     # This prevents ref_count leak when _extracted_cache is None or exception occurs
@@ -3845,7 +3992,9 @@ class Scheduler:
                 # batch_generator.next() call.  Without this barrier the Metal
                 # driver can hit 'completeMemory() prepare count underflow'.
                 # (Mirrors the fix in _do_abort_request, commit 634603f)
-                mx.synchronize(generation_stream)
+                if not batch_remove_synced:
+                    mx.synchronize(generation_stream)
+                    batch_remove_synced = True
                 self._remove_uid_from_active_batch(uid)
                 if hasattr(self.model, "unregister_rope_delta"):
                     self.model.unregister_rope_delta(uid)
@@ -3911,6 +4060,7 @@ class Scheduler:
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
+        self._pending_cache_stores.clear()
         if self._boundary_snapshot_store is not None:
             self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None
@@ -4047,6 +4197,11 @@ class Scheduler:
                     output.finished_request_ids = finished_ids
                     self._cleanup_finished(finished_ids)
 
+            if not self.running and not self.waiting:
+                processed_stores = self._process_pending_cache_stores()
+                if processed_stores:
+                    output.has_work = True
+
         except _PrefillAbortedError:
             # Prefill was interrupted by a pending abort.
             # BatchGenerator is in an inconsistent state (partial
@@ -4055,6 +4210,7 @@ class Scheduler:
             self.batch_generator = None
             self._current_sampler_params = None
             self._boundary_cache_snapshots.clear()
+            self._pending_cache_stores.clear()
             if self._boundary_snapshot_store is not None:
                 self._boundary_snapshot_store.cleanup_all()
             self._boundary_snapshot_required = None
@@ -4147,6 +4303,14 @@ class Scheduler:
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "deferred_cache_stores": {
+                "pending": len(self._pending_cache_stores),
+                "deferred": self._cache_store_deferred,
+                "processed": self._cache_store_processed,
+                "dropped": self._cache_store_dropped,
+                "max_pending": self._max_pending_cache_stores,
+                "max_deferred_tokens": self._max_deferred_cache_store_tokens,
+            },
             "sampler_batching": sampler_batching,
         }
         # Include cache stats
@@ -4178,6 +4342,7 @@ class Scheduler:
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
+        self._pending_cache_stores.clear()
         if self._boundary_snapshot_store is not None:
             self._boundary_snapshot_store.cleanup_all()
         self._boundary_snapshot_required = None

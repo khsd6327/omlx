@@ -2601,7 +2601,7 @@ async def stream_chat_completion(
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
-    accumulated_text = ""
+    accumulated_text_parts: list[str] = []
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
 
@@ -2637,7 +2637,7 @@ async def stream_chat_completion(
                 first_token_time = time.perf_counter()
             last_output = output
             if output.new_text:
-                accumulated_text += output.new_text
+                accumulated_text_parts.append(output.new_text)
 
             if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
@@ -2738,6 +2738,7 @@ async def stream_chat_completion(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    accumulated_text = "".join(accumulated_text_parts)
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         # Harmony model — tool_calls already extracted by parser
@@ -2927,7 +2928,7 @@ async def stream_anthropic_messages(
     first_token_time = None
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    accumulated_text = ""
+    accumulated_text_parts: list[str] = []
 
     # Track content blocks with thinking separation
     thinking_parser = ThinkingParser()
@@ -2981,7 +2982,7 @@ async def stream_anthropic_messages(
                 first_token_time = time.perf_counter()
 
             if output.new_text:
-                accumulated_text += output.new_text
+                accumulated_text_parts.append(output.new_text)
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
                 # Emit thinking content as thinking block
@@ -3094,6 +3095,7 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
+    accumulated_text = "".join(accumulated_text_parts)
     if last_output and last_output.tool_calls:
         # Harmony model - tool_calls already extracted by parser
         from .api.openai_models import ToolCall, FunctionCall
@@ -3933,7 +3935,7 @@ async def stream_responses_api(
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
-    accumulated_text = ""
+    accumulated_text_parts: list[str] = []
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
     seq = 0
@@ -4016,7 +4018,7 @@ async def stream_responses_api(
                 first_token_time = time.perf_counter()
             last_output = output
             if output.new_text:
-                accumulated_text += output.new_text
+                accumulated_text_parts.append(output.new_text)
 
             if stream_content and output.new_text:
                 _thinking, content_delta = thinking_parser.feed(output.new_text)
@@ -4074,6 +4076,7 @@ async def stream_responses_api(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    accumulated_text = "".join(accumulated_text_parts)
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = last_output.tool_calls
