@@ -122,3 +122,5 @@ docs/native_app_architecture.md
 uv.lock
 # generated TurboQuant memory report (machine-specific)
 tq_batch_memory.md
+# Claude Code fork-private notes (local only, not for the public fork / upstream)
+CLAUDE.md
