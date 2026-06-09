@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from omlx.cache.paged_cache import PagedCacheManager
 
-from omlx.utils.hardware import get_max_working_set_bytes, format_bytes
+from omlx.utils.hardware import format_bytes, get_max_working_set_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,13 @@ try:
 except ImportError:
     HAS_MLX_METAL = False
     mx = None
+
+# MLX >= 0.31 no longer materializes the full fp32 score matrix for
+# head_dim > 128, but local peak measurements still show a tiled score/scratch
+# term. Model it as one fp16 query tile plus the fp32 output buffer.
+_SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD = 128
+_SDPA_TILED_SCRATCH_QUERY_TOKENS = 512
+_SDPA_TILED_SCRATCH_DTYPE_SIZE = 2
 
 
 @dataclass
@@ -113,7 +120,7 @@ class MemoryMonitor:
         self._num_layers: Optional[int] = None
         self._num_kv_heads: Optional[int] = None
         self._head_dim: Optional[int] = None
-        self._dtype_size: int = 2  # Default float16
+        self._dtype_size: float = 2  # Default float16/bfloat16
         self._num_attention_heads: Optional[int] = None
         self._num_kv_cache_layers: Optional[int] = None
 
@@ -134,9 +141,7 @@ class MemoryMonitor:
                 format_bytes(self._max_kv_cache_memory),
             )
         else:
-            logger.info(
-                "MemoryMonitor initialized (estimator-only, eviction disabled)"
-            )
+            logger.info("MemoryMonitor initialized (estimator-only, eviction disabled)")
 
     def _get_max_memory(self) -> int:
         """
@@ -227,7 +232,7 @@ class MemoryMonitor:
 
             process = psutil.Process()
             return process.memory_info().rss
-        except ImportError:
+        except Exception:
             return 0
 
     def get_memory_info(self) -> MemoryInfo:
@@ -291,7 +296,7 @@ class MemoryMonitor:
         num_layers: int,
         num_kv_heads: int,
         head_dim: int,
-        dtype_size: int = 2,
+        dtype_size: float = 2,
         num_attention_heads: Optional[int] = None,
         num_kv_cache_layers: Optional[int] = None,
     ) -> None:
@@ -302,7 +307,8 @@ class MemoryMonitor:
             num_layers: Number of transformer layers
             num_kv_heads: Number of KV attention heads
             head_dim: Dimension per attention head
-            dtype_size: Bytes per element (2 for float16, 4 for float32)
+            dtype_size: Bytes per element. This may be fractional for
+                quantized KV cache layouts.
             num_attention_heads: Number of query attention heads (for SDPA
                 peak estimation). Defaults to num_kv_heads if not set.
             num_kv_cache_layers: Number of layers that use KVCache
@@ -354,8 +360,8 @@ class MemoryMonitor:
         num_layers: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
-        dtype_size: Optional[int] = None,
-    ) -> int:
+        dtype_size: Optional[float] = None,
+    ) -> float:
         """
         Estimate memory usage for a KV cache block.
 
@@ -381,7 +387,7 @@ class MemoryMonitor:
 
         return total
 
-    def estimate_prompt_kv_bytes(self, num_tokens: int) -> int:
+    def estimate_prompt_kv_bytes(self, num_tokens: int) -> float:
         """
         Estimate KV cache memory for a prompt of given length.
 
@@ -406,9 +412,23 @@ class MemoryMonitor:
         per_token = layers * kv_heads * dim * dtype * 2  # keys + values
         return num_tokens * per_token
 
+    def _estimate_sdpa_activation_bytes(self, query_tokens: int, kv_len: int) -> int:
+        hd = self._head_dim or 0
+        n_q = self._num_attention_heads or 0
+        if n_q == 0 or hd == 0 or query_tokens <= 0:
+            return 0
+
+        output = n_q * query_tokens * hd * 4
+        if hd <= _SDPA_TILED_SCRATCH_HEAD_DIM_THRESHOLD:
+            return output
+
+        tiled_query = min(query_tokens, _SDPA_TILED_SCRATCH_QUERY_TOKENS)
+        scratch = n_q * tiled_query * max(kv_len, 0) * _SDPA_TILED_SCRATCH_DTYPE_SIZE
+        return scratch + output
+
     def estimate_prefill_peak_bytes(
         self, new_tokens: int, chunk_size: int, *, cached_tokens: int = 0
-    ) -> int:
+    ) -> float:
         """
         Estimate per-request prefill peak memory contribution (KV + SDPA).
 
@@ -419,30 +439,12 @@ class MemoryMonitor:
         cache pool / python heap overhead (absorbed by enforcer's hard
         threshold margin — see MemorySettings.hard_threshold).
 
-        MLX SDPA internals (C++ fallback path, head_dim > 128):
-          1. scores = scale*Q @ K^T → [B, n_q, chunk, kv_len] float32
-          2. softmax(scores) → in-place (already float32)
-          3. out = scores @ V → [B, n_q, chunk, head_dim] float32
-          GQA: K/V broadcast, no extra allocation.
-
-        Critical: ``kv_len`` for the last chunk is the full prompt
-        (``new_tokens + cached_tokens``), NOT just ``new_tokens``. Even
-        when most of the prompt is served from prefix cache, the SDPA
-        scores tensor spans the entire prompt because attention is
-        computed against the reconstructed KV. Passing only
-        ``new_tokens`` here silently under-counts the panic-prone path
-        — exactly the case where prefix cache hits make long-context
-        prefill possible at all.
-
-        MLX SDPA fused kernel (head_dim <= 128):
-          Tiled computation, O(n) memory. Only output buffer allocated.
-
-        The SDPA scores matrix at the last chunk attends over the FULL context
-        (cached_tokens + new_tokens), not just the newly prefilled tokens. With
-        a large prefix-cache hit (big cached prefix, small new suffix) the
-        kv_len term must use the full span, otherwise the transient is
-        undercounted by the cache-hit ratio and a request that actually
-        overflows the MetalAllocator slips past the preflight guard.
+        MLX SDPA avoids the old full fp32 score-matrix allocation for
+        head_dim > 128, but high-head-dim kernels still need a tiled scratch
+        term that spans the full key/value context. With prefix-cache hits,
+        that context is ``new_tokens + cached_tokens``, not just the new suffix.
+        Passing only ``new_tokens`` here silently under-counts long-context
+        prefill, exactly where prefix caching makes such requests possible.
 
         Args:
             new_tokens: Tokens being prefilled this request (prompt minus
@@ -481,16 +483,7 @@ class MemoryMonitor:
         # raised false-positive 413s on small prompts.
         eff_chunk = min(chunk_size, new_tokens)
         full_kv_len = new_tokens + max(cached_tokens, 0)
-
-        if hd > 128:
-            # Fallback: full attention matrix materialized in float32
-            # scores [B, n_q, eff_chunk, full_kv_len] + output
-            # [B, n_q, eff_chunk, hd]
-            attn = n_q * eff_chunk * full_kv_len * 4
-            attn += n_q * eff_chunk * hd * 4  # output buffer (small)
-        else:
-            # Fused kernel: tiled, only output buffer
-            attn = n_q * eff_chunk * hd * 4
+        attn = self._estimate_sdpa_activation_bytes(eff_chunk, full_kv_len)
 
         # KV growth attributable to this request: only the new tokens.
         # The cached portion is already counted via the baseline
@@ -508,21 +501,14 @@ class MemoryMonitor:
         in the caller's ``current`` baseline once eval'd); it is the quantity
         the adaptive throttle must keep under the remaining headroom.
 
-        head_dim > 128: MLX SDPA fallback materializes the full attention
-        matrix [B, n_q, n_tokens, kv_len] in float32, plus a small output
-        buffer — so the transient scales with ``n_tokens * kv_len``.
-        head_dim <= 128: fused kernel is tiled / O(n), so only the output
-        buffer is allocated and throttling is effectively a no-op (correct).
+        MLX fused SDPA uses the output-buffer estimate for head_dim <= 128.
+        For larger head_dim values, current MLX avoids the old full fp32
+        score matrix but still needs a bounded query-tile scratch term that
+        scales with total ``kv_len``.
 
         Returns 0 when model info is unavailable.
         """
-        hd = self._head_dim or 0
-        n_q = self._num_attention_heads or 0
-        if n_q == 0 or hd == 0 or n_tokens <= 0:
-            return 0
-        if hd > 128:
-            return n_q * n_tokens * max(kv_len, 0) * 4 + n_q * n_tokens * hd * 4
-        return n_q * n_tokens * hd * 4
+        return self._estimate_sdpa_activation_bytes(n_tokens, kv_len)
 
     def estimate_blocks_to_free(self, bytes_to_free: int, block_size: int) -> int:
         """
@@ -545,7 +531,7 @@ class MemoryMonitor:
             return 0
 
         # Round up to ensure we free enough
-        num_blocks = (bytes_to_free + block_mem - 1) // block_mem
+        num_blocks = int((bytes_to_free + block_mem - 1) // block_mem)
         return max(1, num_blocks)
 
     @property

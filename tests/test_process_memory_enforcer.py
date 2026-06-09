@@ -403,6 +403,69 @@ class TestCheckAndEnforce:
         # Should not raise, just log warning
 
 
+class TestCurrentUsageTelemetry:
+    """Tests for enforcer memory telemetry threading behavior."""
+
+    def test_idle_usage_keeps_direct_mlx_telemetry(self, enforcer):
+        """Idle accounting preserves the legacy max(active, phys_footprint)."""
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=3 * 1024**3,
+        ):
+            mock_mx.get_active_memory.return_value = 5 * 1024**3
+            assert enforcer._current_usage_bytes() == 5 * 1024**3
+        mock_mx.get_active_memory.assert_called_once()
+
+    def test_active_usage_uses_cached_executor_sample_without_mlx(self, enforcer):
+        """Active decode ticks must not call MLX from the enforcer thread."""
+        scheduler = MagicMock()
+        scheduler.get_cached_mlx_active_memory_bytes.return_value = 7 * 1024**3
+        engine = MagicMock()
+        engine.has_active_requests.return_value = True
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=5 * 1024**3,
+        ):
+            mock_mx.get_active_memory.side_effect = AssertionError(
+                "background enforcer touched MLX during active decode"
+            )
+            assert enforcer._current_usage_bytes() == 7 * 1024**3
+        mock_mx.get_active_memory.assert_not_called()
+
+    def test_active_usage_keeps_phys_footprint_when_it_dominates(self, enforcer):
+        scheduler = MagicMock()
+        scheduler.get_cached_mlx_active_memory_bytes.return_value = 4 * 1024**3
+        engine = MagicMock()
+        engine.has_active_requests.return_value = True
+        engine.scheduler = scheduler
+        enforcer._engine_pool._entries = {"m": _make_entry("m", engine=engine)}
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx, patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=9 * 1024**3,
+        ):
+            assert enforcer._current_usage_bytes() == 9 * 1024**3
+        mock_mx.get_active_memory.assert_not_called()
+
+    def test_hard_limit_reuses_cached_metal_cap(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool,
+            memory_guard_tier="custom",
+            memory_guard_custom_ceiling_gb=1024.0,
+        )
+        enforcer._effective_metal_cap_bytes = 48 * 1024**3
+        with patch(
+            "omlx.settings.get_system_memory", return_value=64 * 1024**3
+        ), patch(
+            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+            side_effect=AssertionError("Metal cap cache was bypassed"),
+        ):
+            assert enforcer._get_hard_limit_bytes() == 48 * 1024**3
+
+
 class TestDisabledWhenCeilingZero:
     """Tests for enforcement disabled when the ceiling is 0 (guard off)."""
 
@@ -631,6 +694,8 @@ class TestDynamicCeilingActiveRatio:
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
         with patch(
+            "omlx.process_memory_enforcer.sys.platform", "linux"
+        ), patch(
             "omlx.process_memory_enforcer.get_phys_footprint",
             return_value=2 * 1024**3,
         ), patch(
@@ -643,11 +708,35 @@ class TestDynamicCeilingActiveRatio:
             result = enforcer._get_dynamic_ceiling()
         assert result == 2 * 1024**3 + 15 * 1024**3
 
+    def test_macos_vm_stat_failure_uses_static_ceiling(self, mock_engine_pool):
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with patch(
+            "omlx.process_memory_enforcer.sys.platform", "darwin"
+        ), patch(
+            "omlx.process_memory_enforcer.get_phys_footprint",
+            return_value=2 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_macos_vm_stats",
+            return_value=None,
+        ), patch(
+            "omlx.process_memory_enforcer.psutil.virtual_memory"
+        ) as mock_virtual_memory, patch(
+            "omlx.settings.get_system_memory", return_value=64 * 1024**3
+        ):
+            result = enforcer._get_dynamic_ceiling()
+
+        assert result == 58 * 1024**3
+        mock_virtual_memory.assert_not_called()
+
     def test_psutil_failure_falls_back_to_static_ceiling(self, mock_engine_pool):
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
         with patch(
+            "omlx.process_memory_enforcer.sys.platform", "linux"
+        ), patch(
             "omlx.process_memory_enforcer.get_phys_footprint",
             return_value=2 * 1024**3,
         ), patch(
@@ -836,10 +925,7 @@ class TestAbortLimitCalculation:
 
 
 class TestMetalWiredLimit:
-    """enforcer.start() raises the per-process Metal wired memory limit
-    via mx.set_wired_limit so allocations within the ceiling don't bounce
-    off Apple's default cap.
-    """
+    """enforcer.start() applies MLX wired limits only for explicit sysctl caps."""
 
     def test_start_calls_set_wired_limit_with_static_ceiling(
         self, mock_engine_pool
@@ -852,6 +938,9 @@ class TestMetalWiredLimit:
         ), patch(
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
             return_value=64 * 1024**3,  # cap above static ceiling
+        ), patch(
+            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+            return_value=64 * 1024**3,
         ), patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
@@ -890,31 +979,33 @@ class TestMetalWiredLimit:
         # Desired (60 GB) is stored, not the post-clamp 42 GB.
         assert enforcer._metal_wired_limit_request == 60 * 1024**3
 
-    def test_start_clamps_to_apple_default_when_sysctl_unset(
-        self, mock_engine_pool
+    def test_start_skips_set_wired_limit_when_sysctl_unset(
+        self, mock_engine_pool, caplog
     ):
-        """sysctl=0 path: fall back to mx.device_info()'s working set size."""
+        """sysctl=0 path: plan against Apple cap, but don't touch MLX state."""
         enforcer = ProcessMemoryEnforcer(
             engine_pool=mock_engine_pool, memory_guard_tier="balanced"
         )
-        with patch(
-            "omlx.settings.get_system_memory", return_value=512 * 1024**3
-        ), patch(
-            "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=128 * 1024**3,  # Apple default below static ceiling
-        ), patch(
-            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
-            return_value=0,  # sysctl unset; cap comes from working set
-        ), patch(
-            "omlx.process_memory_enforcer.mx"
-        ) as mock_mx, patch.object(
-            asyncio, "create_task", side_effect=_close_coro
-        ):
-            mock_mx.set_wired_limit.return_value = 0
-            enforcer.start()
-        # balanced @ 512 GB static = 506 GB, clamped to working set 128 GB
-        mock_mx.set_wired_limit.assert_called_once_with(128 * 1024**3)
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            with patch(
+                "omlx.settings.get_system_memory", return_value=512 * 1024**3
+            ), patch(
+                "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                return_value=128 * 1024**3,  # Apple default below static ceiling
+            ), patch(
+                "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+                return_value=0,  # sysctl unset; cap comes from working set
+            ), patch(
+                "omlx.process_memory_enforcer.mx"
+            ) as mock_mx, patch.object(
+                asyncio, "create_task", side_effect=_close_coro
+            ):
+                enforcer.start()
+        # balanced @ 512 GB static = 506 GB. The scheduler still clamps to the
+        # 128 GB effective cap, but MLX's wired limit is left untouched.
+        mock_mx.set_wired_limit.assert_not_called()
         assert enforcer._metal_wired_limit_request == 506 * 1024**3
+        assert "leaving Apple's default Metal cap active" in caplog.text
 
     def test_start_handles_set_wired_limit_error(self, mock_engine_pool):
         """Older macOS (<15) raises on the call; enforcer keeps going."""
@@ -925,7 +1016,10 @@ class TestMetalWiredLimit:
             "omlx.settings.get_system_memory", return_value=48 * 1024**3
         ), patch(
             "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
-            return_value=0,
+            return_value=64 * 1024**3,
+        ), patch(
+            "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+            return_value=64 * 1024**3,
         ), patch(
             "omlx.process_memory_enforcer.mx"
         ) as mock_mx, patch.object(
@@ -1377,6 +1471,26 @@ class TestUnresolvableSchedulerWarning:
         assert warnings == [], (
             f"Unloaded engine must not warn, got {len(warnings)} warning(s)"
         )
+
+    def test_no_warning_for_dflash_without_fallback(self, enforcer, caplog):
+        """DFlash normal mode has no scheduler until fallback is started."""
+
+        class DFlashEngine:
+            _fallback_engine = None
+
+        entry = _make_entry("model-dflash", engine=DFlashEngine())
+        enforcer._engine_pool._entries = {"model-dflash": entry}
+
+        with caplog.at_level(
+            "WARNING", logger="omlx.process_memory_enforcer"
+        ):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
 
 
 class TestStoreCacheCapWalk:
