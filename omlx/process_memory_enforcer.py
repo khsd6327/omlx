@@ -368,8 +368,7 @@ class ProcessMemoryEnforcer:
         self._over_ceiling_polls: int = 0
 
         # fork: emergency-brake thresholds. Precedence: explicit constructor
-        # arg > global_settings.memory field (forward-compatible getattr; the
-        # field may not exist yet in MemorySettings) > module-constant default.
+        # arg > global_settings.memory field > module-constant default.
         # Mirrors how soft/hard thresholds flow from settings into __init__.
         mem_settings = getattr(global_settings, "memory", None)
         self._emergency_over_ceiling_margin_bytes: int = int(

@@ -3276,7 +3276,11 @@ class Scheduler:
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                 )
 
-        _sync_and_clear_cache(self._stream)
+        # Normal chunks can accumulate in the MLX buffer pool and be released
+        # in batches. Hard-limit recovery still uses _reclaim_prefill_headroom()
+        # above for an immediate clear when it is actually needed.
+        if mx.get_cache_memory() > self._periodic_clear_threshold_bytes():
+            _sync_and_clear_cache(self._stream)
         return state.tokens_remaining.shape[1] == 0
 
     def _emit_final_boundary_if_needed(self, state: _PrefillState) -> None:
@@ -5057,6 +5061,7 @@ class Scheduler:
                 draft_block_size=self._vlm_mtp_draft_block_size,
                 token_dtype=mx.int32,
                 eos_token_ids=eos_ids or None,
+                clear_cache=lambda: _sync_and_clear_cache(self._stream),
             )
         except Exception as e:
             logger.warning(

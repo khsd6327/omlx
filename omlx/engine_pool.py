@@ -59,6 +59,7 @@ class EngineEntry:
     engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     actual_size: int | None = None  # Observed process-memory delta after load settles
+    resident_size: int = 0  # Bytes charged to pool accounting while loaded
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
@@ -141,6 +142,36 @@ class EnginePool:
         cb = self._get_final_ceiling
         if cb is None:
             return 0
+        try:
+            return int(cb() or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _estimated_entry_size(self, model_id_or_path: str | None) -> int:
+        if not model_id_or_path:
+            return 0
+        entry = self._entries.get(model_id_or_path)
+        return int(entry.estimated_size) if entry is not None else 0
+
+    def _estimate_auxiliary_size(self, model_settings: object | None) -> int:
+        """Estimate additional resident models loaded inside a primary engine."""
+        if model_settings is None:
+            return 0
+
+        total = 0
+        if (
+            getattr(model_settings, "dflash_enabled", False)
+            and getattr(model_settings, "dflash_draft_model", None)
+        ):
+            total += self._estimated_entry_size(model_settings.dflash_draft_model)
+
+        if (
+            getattr(model_settings, "vlm_mtp_enabled", False)
+            and getattr(model_settings, "vlm_mtp_draft_model", None)
+        ):
+            total += self._estimated_entry_size(model_settings.vlm_mtp_draft_model)
+
+        return max(0, int(total))
         try:
             return int(cb())
         except Exception:  # noqa: BLE001
@@ -397,6 +428,12 @@ class EnginePool:
             #
             # ceiling == 0 means the enforcer is off (guard disabled or
             # not yet wired up), so we admit unconditionally.
+            model_settings = None
+            if self._settings_manager is not None:
+                model_settings = self._settings_manager.get_settings(model_id)
+            load_estimated_size = entry.estimated_size + self._estimate_auxiliary_size(
+                model_settings
+            )
             ceiling = self._current_ceiling()
             if ceiling > 0:
                 while True:
@@ -412,7 +449,7 @@ class EnginePool:
                         get_phys_footprint(),
                         self._current_model_memory,
                     )
-                    projected = current + entry.estimated_size
+                    projected = current + load_estimated_size
                     if projected <= ceiling:
                         break
                     victim = self._find_lru_victim()
@@ -430,19 +467,19 @@ class EnginePool:
                     # ceiling (no chance of fitting), InsufficientMemoryError
                     # when the model would fit on a clean process but the
                     # current usage leaves no room.
-                    if entry.estimated_size > ceiling:
+                    if load_estimated_size > ceiling:
                         raise ModelTooLargeError(
-                            model_id, entry.estimated_size, ceiling
+                            model_id, load_estimated_size, ceiling
                         )
                     raise InsufficientMemoryError(
-                        required=entry.estimated_size,
+                        required=load_estimated_size,
                         current=current,
                         message=(
                             f"Cannot load {model_id}: projected memory "
                             f"{format_size(projected)} would exceed the memory "
                             f"ceiling {format_size(ceiling)} "
                             f"(current: {format_size(current)}, "
-                            f"model: {format_size(entry.estimated_size)}). "
+                            f"model: {format_size(load_estimated_size)}). "
                             "Free system memory or lower memory_guard_tier."
                         ),
                     )
@@ -750,6 +787,7 @@ class EnginePool:
 
         logger.info(f"Unloading model: {model_id} (immediate abort)")
         pre_unload_active = mx.get_active_memory()
+        resident_size = entry.resident_size or entry.actual_size or entry.estimated_size
 
         try:
             await entry.engine.stop()
@@ -813,8 +851,8 @@ class EnginePool:
         # Scale tolerance with model size: estimated_size includes a 5%
         # overhead factor (model_discovery.py) that may not be reflected in
         # actual freed memory. Use 2 GB floor for small models. See #768.
-        settle_tolerance = max(2 * 1024**3, int(entry.estimated_size * 0.05))
-        min_expected_freed = max(0, entry.estimated_size - settle_tolerance)
+        settle_tolerance = max(2 * 1024**3, int(resident_size * 0.05))
+        min_expected_freed = max(0, resident_size - settle_tolerance)
         settled = False
         for _settle_round in range(10):
             active_now = mx.get_active_memory()
@@ -838,7 +876,10 @@ class EnginePool:
             await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
 
         # Release memory tracking AFTER barrier
-        self._current_model_memory -= entry.estimated_size
+        self._current_model_memory = max(
+            0, self._current_model_memory - resident_size
+        )
+        entry.resident_size = 0
 
         if settled:
             logger.info(
@@ -1174,7 +1215,8 @@ class EnginePool:
 
             entry.engine = engine
             entry.last_access = time.time()
-            self._current_model_memory += entry.estimated_size
+            entry.resident_size = entry.estimated_size
+            self._current_model_memory += entry.resident_size
             load_completed = True
 
             # VLM MTP: load gemma4_assistant drafter and attach to engine.
@@ -1233,11 +1275,20 @@ class EnginePool:
             post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
             observed_delta = max(0, post_load_memory - pre_load_memory)
             entry.actual_size = observed_delta or entry.estimated_size
+            auxiliary_size = self._estimate_auxiliary_size(model_settings)
+            charged_size = max(
+                entry.estimated_size + auxiliary_size,
+                entry.actual_size,
+            )
+            if charged_size != entry.resident_size:
+                self._current_model_memory += charged_size - entry.resident_size
+                entry.resident_size = charged_size
 
             logger.info(
                 f"Loaded model: {model_id} "
                 f"(actual: {format_size(entry.actual_size)}, "
                 f"estimated: {format_size(entry.estimated_size)}, "
+                f"resident: {format_size(entry.resident_size)}, "
                 f"total: {format_size(self._current_model_memory)})"
             )
         finally:
@@ -1322,6 +1373,7 @@ class EnginePool:
                     "loading_started_at": e.loading_started_at,
                     "estimated_size": e.estimated_size,
                     "actual_size": e.actual_size,
+                    "resident_size": e.resident_size,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,

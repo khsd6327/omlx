@@ -309,6 +309,7 @@ class TestEngineEntry:
         assert entry.last_access == 0.0
         assert entry.is_loading is False
         assert entry.is_pinned is False
+        assert entry.resident_size == 0
 
     def test_entry_with_values(self):
         """Test EngineEntry with custom values."""
