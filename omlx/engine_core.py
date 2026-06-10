@@ -1069,6 +1069,9 @@ class AsyncEngineCore:
         config: Optional[EngineConfig] = None,
     ):
         self.engine = EngineCore(model, tokenizer, config)
+        # fork: hold the fire-and-forget start task so it isn't GC'd mid-flight
+        # and its exceptions aren't silently dropped (see start()).
+        self._start_task: Optional[asyncio.Task] = None
 
     @property
     def _mlx_executor(self):
@@ -1083,8 +1086,26 @@ class AsyncEngineCore:
         await self.stop()
 
     def start(self) -> None:
-        """Start engine (creates task in current loop)."""
-        asyncio.create_task(self.engine.start())
+        """Start engine (creates task in current loop).
+
+        Kept synchronous for backward compat (callers rely on it not being a
+        coroutine). fork: store the task on self so it isn't garbage-collected
+        before it runs, and attach a done-callback that surfaces a failed
+        engine.start() instead of swallowing the exception. Prefer
+        ``async with AsyncEngineCore(...)`` (which awaits start) when you need
+        to know startup actually completed.
+        """
+        task = asyncio.create_task(self.engine.start())
+        self._start_task = task
+
+        def _log_start_result(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error("AsyncEngineCore.start() failed: %s", exc, exc_info=exc)
+
+        task.add_done_callback(_log_start_result)
 
     async def stop(self) -> None:
         """Stop the engine."""
