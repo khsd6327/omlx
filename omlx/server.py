@@ -1706,6 +1706,30 @@ async def _safe_anext(ait):
         return _KEEPALIVE_SENTINEL
 
 
+# fork: sanitized error body for mid-stream / post-keepalive error frames.
+# Once streaming has started the registered exception handlers can't run,
+# so these frames are the only error channel — they must not leak raw
+# exception text (paths, model internals), mirroring the non-streaming
+# 500 handling. HTTPException details are client-intended and pass through.
+def _stream_error_payload(e: BaseException, context: str) -> dict:
+    if isinstance(e, HTTPException):
+        detail = e.detail if isinstance(e.detail, str) else "Request failed"
+        return {
+            "error": {
+                "message": detail,
+                "type": "api_error",
+                "code": e.status_code,
+            }
+        }
+    logger.exception("Error during %s", context)
+    return {
+        "error": {
+            "message": "Internal server error",
+            "type": "server_error",
+        }
+    }
+
+
 async def _with_sse_keepalive(
     generator: AsyncIterator[str],
     http_request: Optional["FastAPIRequest"] = None,
@@ -1772,8 +1796,7 @@ async def _with_sse_keepalive(
                 try:
                     result = task.result()
                 except Exception as e:
-                    logger.error(f"SSE generator error: {e}")
-                    error_data = {"error": {"message": str(e), "type": "server_error"}}
+                    error_data = _stream_error_payload(e, "SSE streaming")
                     yield f"data: {json.dumps(error_data)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -1861,7 +1884,15 @@ async def _with_json_keepalive(
             if keepalive_elapsed >= interval:
                 keepalive_elapsed = 0.0
                 yield " "
-        result = task.result()
+        # fork: once the first keepalive byte went out, 200 headers are
+        # committed and exception handlers can't run — without this catch a
+        # failed build coroutine produced "200 OK" with a blank body and the
+        # real error vanished. Emit a parseable error JSON body instead.
+        try:
+            result = task.result()
+        except Exception as e:
+            yield json.dumps(_stream_error_payload(e, "non-streaming response"))
+            return
         if result is not None:
             yield result
     finally:
@@ -3505,10 +3536,7 @@ async def stream_completion(
             }
             yield f"data: {json.dumps(data)}\n\n"
     except Exception as e:
-        logger.error(f"Error during completion streaming: {e}")
-        error_data = {
-            "error": {"message": str(e), "type": "server_error"}
-        }
+        error_data = _stream_error_payload(e, "completion streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -3653,10 +3681,7 @@ async def stream_chat_completion(
                         )
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
     except Exception as e:
-        logger.error(f"Error during chat streaming: {e}")
-        error_data = {
-            "error": {"message": str(e), "type": "server_error"}
-        }
+        error_data = _stream_error_payload(e, "chat streaming")
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -4040,8 +4065,8 @@ async def stream_anthropic_messages(
             if output.finished:
                 break
     except Exception as e:
-        logger.error(f"Error during Anthropic streaming: {e}")
-        yield create_error_event("api_error", str(e))
+        payload = _stream_error_payload(e, "Anthropic streaming")
+        yield create_error_event("api_error", payload["error"]["message"])
         yield create_message_stop_event()
         return
 
