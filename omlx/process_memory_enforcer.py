@@ -89,8 +89,21 @@ _PREFILL_ABORT_MARGIN: dict[str, float] = {
 # hard watermark (usually 95% of ceiling); pinned workloads are only aborted
 # after the process crosses the actual ceiling by a small margin, or stays
 # over the ceiling for consecutive polls.
+#
+# fork: these are the DEFAULTS only. They are overridable per-instance via
+# ProcessMemoryEnforcer(emergency_over_ceiling_margin_bytes=...,
+# emergency_over_ceiling_polls=...), which in turn reads them from
+# global_settings.memory when those fields exist (forward-compatible getattr,
+# see __init__). The defaults below were too tight under the 1s active poll
+# interval (2 polls = 2s before the last-resort brake fires).
 _EMERGENCY_OVER_CEILING_MARGIN_BYTES = 2 * 1024**3
 _EMERGENCY_OVER_CEILING_POLLS = 2
+
+# fork: once aborting in-flight requests provably cannot bring the process
+# back under the ceiling (resident model weights alone already exceed it),
+# stop re-aborting every poll. Hold off re-arming the emergency brake for this
+# many seconds so newly admitted requests aren't killed on every 1s tick.
+_EMERGENCY_ABORT_BACKOFF_SECONDS = 30.0
 
 
 def _format_gb(b: int) -> str:
@@ -297,6 +310,10 @@ class ProcessMemoryEnforcer:
         hard_threshold: float = 0.95,
         prefill_safe_zone_ratio: float = 0.89,
         prefill_min_chunk_tokens: int = 256,
+        # fork: last-resort emergency-brake tuning. None => read from
+        # global_settings.memory if present, else the module-constant default.
+        emergency_over_ceiling_margin_bytes: int | None = None,
+        emergency_over_ceiling_polls: int | None = None,
     ):
         """
         Initialize the process memory enforcer.
@@ -349,6 +366,35 @@ class ProcessMemoryEnforcer:
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
         self._over_ceiling_polls: int = 0
+
+        # fork: emergency-brake thresholds. Precedence: explicit constructor
+        # arg > global_settings.memory field (forward-compatible getattr; the
+        # field may not exist yet in MemorySettings) > module-constant default.
+        # Mirrors how soft/hard thresholds flow from settings into __init__.
+        mem_settings = getattr(global_settings, "memory", None)
+        self._emergency_over_ceiling_margin_bytes: int = int(
+            emergency_over_ceiling_margin_bytes
+            if emergency_over_ceiling_margin_bytes is not None
+            else getattr(
+                mem_settings,
+                "emergency_over_ceiling_margin_bytes",
+                _EMERGENCY_OVER_CEILING_MARGIN_BYTES,
+            )
+        )
+        self._emergency_over_ceiling_polls: int = int(
+            emergency_over_ceiling_polls
+            if emergency_over_ceiling_polls is not None
+            else getattr(
+                mem_settings,
+                "emergency_over_ceiling_polls",
+                _EMERGENCY_OVER_CEILING_POLLS,
+            )
+        )
+        # fork: degraded-state latch for the "abort cannot help" case (resident
+        # weights alone exceed the ceiling). Once latched we stop re-aborting
+        # admitted requests every poll and back off re-arming the brake.
+        self._emergency_abort_backoff_until: float = 0.0
+        self._emergency_weights_over_ceiling_warned: bool = False
         # Last value passed to mx.set_wired_limit (0 if not yet applied
         # or the call failed). Used by the admin dashboard to surface a
         # warning when the kernel iogpu.wired_limit_mb is below this.
@@ -647,9 +693,11 @@ class ProcessMemoryEnforcer:
             return False
 
         self._over_ceiling_polls += 1
-        if current >= ceiling + _EMERGENCY_OVER_CEILING_MARGIN_BYTES:
+        # fork: use the per-instance (settings-driven) thresholds, not the
+        # module constants, so operators can widen the brake under the 1s poll.
+        if current >= ceiling + self._emergency_over_ceiling_margin_bytes:
             return True
-        return self._over_ceiling_polls >= _EMERGENCY_OVER_CEILING_POLLS
+        return self._over_ceiling_polls >= self._emergency_over_ceiling_polls
 
     def _refresh_effective_metal_cap_bytes(self) -> int:
         """Refresh the cached effective Metal cap outside the poll hot path."""
@@ -793,6 +841,19 @@ class ProcessMemoryEnforcer:
                         engine_type,
                     )
                 continue
+            # fork: lock-free cross-thread publish. These are written here from
+            # the enforcer thread and read on the inference/scheduler threads
+            # with NO lock. Correctness relies on each being an INDEPENDENT
+            # scalar whose write is GIL-atomic, so a reader can only ever see an
+            # old-or-new value of a single field, never a torn one. There is no
+            # cross-field invariant that must hold atomically (a reader briefly
+            # seeing a new soft_limit with an old hard_limit is self-correcting
+            # on the next ~1s poll). INVARIANT: do NOT group these into a struct/
+            # dataclass/tuple and publish by rebinding one attribute -- that
+            # would turn N atomic scalar writes into one multi-field object swap
+            # whose partial visibility a lock-free reader cannot tolerate. If
+            # grouping is ever needed, add an explicit lock or publish an
+            # immutable snapshot via a single atomic rebind read consistently.
             scheduler._memory_limit_bytes = soft_limit
             scheduler._memory_hard_limit_bytes = ceiling
             scheduler._memory_abort_limit_bytes = self._get_abort_limit_bytes()
@@ -1067,20 +1128,76 @@ class ProcessMemoryEnforcer:
                             else:
                                 emergency_current = 0
                             if emergency and emergency_current >= ceiling:
-                                aborted = await (
-                                    self._abort_loaded_requests_for_memory_emergency()
-                                )
-                                if aborted > 0:
-                                    logger.warning(
-                                        "Emergency memory pressure: aborted "
-                                        "%d in-flight request(s) "
-                                        "(current=%s, ceiling=%s); models "
-                                        "kept loaded.",
-                                        aborted,
-                                        _format_gb(emergency_current),
-                                        _format_gb(ceiling),
+                                # fork: detect the unwinnable case. Aborting
+                                # in-flight requests only frees KV cache. When
+                                # the resident base weights ALONE already exceed
+                                # the ceiling, no amount of KV freeing can bring
+                                # us back under it, so re-aborting every poll
+                                # just kills each newly admitted request forever.
+                                # Latch a degraded state + backoff instead.
+                                try:
+                                    resident_weights = int(
+                                        self._engine_pool.current_model_memory
                                     )
-                                    break
+                                except (TypeError, ValueError):
+                                    # Accumulator unavailable/unreadable -- treat
+                                    # "abort cannot help" as unknown (False) so
+                                    # we fall back to the prior abort behavior.
+                                    resident_weights = 0
+                                now = time.monotonic()
+                                abort_cannot_help = (
+                                    resident_weights > 0 and resident_weights >= ceiling
+                                )
+                                in_backoff = now < self._emergency_abort_backoff_until
+
+                                if abort_cannot_help:
+                                    if not self._emergency_weights_over_ceiling_warned:
+                                        logger.warning(
+                                            "Emergency memory pressure but "
+                                            "resident model weights (%s) alone "
+                                            "exceed the ceiling (%s): aborting "
+                                            "in-flight requests cannot recover "
+                                            "memory. Entering degraded state -- "
+                                            "suppressing further emergency "
+                                            "aborts. Unpin or shrink a model to "
+                                            "recover.",
+                                            _format_gb(resident_weights),
+                                            _format_gb(ceiling),
+                                        )
+                                        self._emergency_weights_over_ceiling_warned = (
+                                            True
+                                        )
+                                    # Back off re-arming so admitted requests
+                                    # aren't re-killed on the next 1s tick; fall
+                                    # through to idle reclaim (the only safe
+                                    # lever left).
+                                    self._emergency_abort_backoff_until = (
+                                        now + _EMERGENCY_ABORT_BACKOFF_SECONDS
+                                    )
+                                elif in_backoff:
+                                    # Recently aborted; give newly admitted
+                                    # requests a window before aborting again.
+                                    pass
+                                else:
+                                    aborted = await (
+                                        self._abort_loaded_requests_for_memory_emergency()
+                                    )
+                                    # Back off so we don't re-abort every poll
+                                    # while memory settles after the abort.
+                                    self._emergency_abort_backoff_until = (
+                                        now + _EMERGENCY_ABORT_BACKOFF_SECONDS
+                                    )
+                                    if aborted > 0:
+                                        logger.warning(
+                                            "Emergency memory pressure: aborted "
+                                            "%d in-flight request(s) "
+                                            "(current=%s, ceiling=%s); models "
+                                            "kept loaded.",
+                                            aborted,
+                                            _format_gb(emergency_current),
+                                            _format_gb(ceiling),
+                                        )
+                                        break
 
                             # Nothing to evict (all pinned) and no load to
                             # abort — but the resident footprint may still hold
@@ -1126,6 +1243,11 @@ class ProcessMemoryEnforcer:
             post_level = "hard"
         if post_ceiling <= 0 or post_current < post_ceiling:
             self._over_ceiling_polls = 0
+            # fork: recovered below the ceiling -- clear the degraded-state
+            # latch + backoff so a genuinely new future emergency can re-arm
+            # the brake (and re-log the once-only weights-over-ceiling warning).
+            self._emergency_abort_backoff_until = 0.0
+            self._emergency_weights_over_ceiling_warned = False
         if post_level != self._pressure_level:
             self._pressure_level = post_level
             self._propagate_memory_limit()
