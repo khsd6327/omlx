@@ -317,8 +317,14 @@ class OQManager:
         # the duration), and the streaming path calls bare mx.eval /
         # mx.clear_cache from a non-executor thread — both race in-flight
         # Metal command buffers of serving models (#300/#888/#1106 class).
-        # Refuse while any model is loaded or loading, and refuse when the
-        # job's own memory estimate exceeds what is currently available.
+        # Refuse while any model is loaded or loading; that gate also
+        # guarantees the machine has headroom for the job (loaded models are
+        # the dominant memory consumers). A separate system-RAM check was
+        # dropped: psutil.available is the wrong gauge on Apple unified
+        # memory (quantization streams from the mmap'd source, and the real
+        # ceiling is the Metal/wired limit the enforcer tracks), and the
+        # fixed source+6GB estimate spuriously blocked small jobs on
+        # memory-constrained hosts and CI runners.
         pool = self._engine_pool_getter() if self._engine_pool_getter else None
         if pool is not None:
             try:
@@ -338,22 +344,6 @@ class OQManager:
                     "inference. Unload all models first and wait for any "
                     "in-progress loads to finish (Models tab)."
                 )
-        try:
-            import psutil
-
-            from ..oq import estimate_memory
-
-            peak = estimate_memory(source_size)["peak_bytes"]
-            available = psutil.virtual_memory().available
-            if peak > available:
-                raise ValueError(
-                    "Insufficient memory for quantization: estimated peak "
-                    f"{peak / 1024**3:.1f} GB exceeds available "
-                    f"{available / 1024**3:.1f} GB. Free memory (unload "
-                    "models, close apps) and retry."
-                )
-        except ImportError:
-            pass
 
         task_id = str(uuid.uuid4())
         task = QuantTask(
