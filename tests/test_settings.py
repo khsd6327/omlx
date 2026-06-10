@@ -76,6 +76,8 @@ class TestServerSettings:
             "sse_keepalive_mode": "chunk",
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
+            # fork: request body size cap
+            "max_request_body_mb": 256,
         }
 
     def test_from_dict_sse_keepalive_mode(self):

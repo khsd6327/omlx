@@ -365,6 +365,9 @@ def _requeue_ctx():
         model=SimpleNamespace(),  # no _language_model attr → rope restore skipped
         _MAX_PREFILL_OOM_RETRIES=2,
         _reclaim_prefill_headroom=lambda: 0,
+        # fork: the requeue path now unpatches SpecPrefill RoPE via
+        # _cleanup_specprefill instead of clearing only the id.
+        _cleanup_specprefill=lambda request_id: None,
     )
     return ns
 
