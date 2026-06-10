@@ -164,6 +164,7 @@ class DFlashEngine(BaseEngine):
         self._draft_backend = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
+        self._tokenizer_lock = threading.RLock()
         self._loaded = False
         self._active_request = False
         self._model_type_str = None
@@ -621,6 +622,113 @@ class DFlashEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
 
+    def _encode_prompt_sync(self, prompt: str) -> list[int]:
+        lock = getattr(self, "_tokenizer_lock", None)
+        if lock is None:
+            return list(self._tokenizer_obj.encode(prompt))
+        with lock:
+            return list(self._tokenizer_obj.encode(prompt))
+
+    async def _encode_prompt_async(self, prompt: str) -> list[int]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._encode_prompt_sync, prompt)
+
+    def _decode_generated_sync(self, token_ids: list[int]) -> str:
+        lock = getattr(self, "_tokenizer_lock", None)
+        if lock is None:
+            return self._tokenizer_obj.decode(token_ids, skip_special_tokens=True)
+        with lock:
+            return self._tokenizer_obj.decode(token_ids, skip_special_tokens=True)
+
+    async def _decode_generated_async(self, token_ids: list[int]) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._decode_generated_sync, token_ids)
+
+    def _render_chat_prompt_sync(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> str:
+        lock = getattr(self, "_tokenizer_lock", None)
+        if lock is None:
+            return self._apply_chat_template(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            )
+        with lock:
+            return self._apply_chat_template(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            )
+
+    async def _render_chat_prompt_async(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            self._render_chat_prompt_sync,
+            messages,
+            tools,
+            chat_template_kwargs,
+            is_partial,
+        )
+
+    def _count_chat_tokens_sync(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> int:
+        lock = getattr(self, "_tokenizer_lock", None)
+        if lock is None:
+            template_tools = convert_tools_for_template(tools) if tools else None
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            )
+            return len(self._tokenizer_obj.encode(prompt))
+        with lock:
+            template_tools = convert_tools_for_template(tools) if tools else None
+            prompt = self._apply_chat_template(
+                messages,
+                template_tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            )
+            return len(self._tokenizer_obj.encode(prompt))
+
+    async def _count_chat_tokens_async(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> int:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.count_chat_tokens(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            ),
+        )
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -639,13 +747,12 @@ class DFlashEngine(BaseEngine):
         Returns:
             Number of prompt tokens
         """
-        template_tools = convert_tools_for_template(tools) if tools else None
-        prompt = self._apply_chat_template(
-            messages, template_tools,
+        return self._count_chat_tokens_sync(
+            messages,
+            tools,
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return len(self._tokenizer_obj.encode(prompt))
 
     async def preflight_chat(
         self,
@@ -676,22 +783,13 @@ class DFlashEngine(BaseEngine):
             )
             return
         try:
-            # fork: render template + encode on the executor thread, not the
-            # event loop. The generate path re-tokenizes the same prompt (the
-            # HTTP layer issues preflight + generate as two separate calls, so
-            # the ids can't be threaded through without a per-request cache),
-            # but at least this preflight tokenization no longer blocks the loop.
-            loop = asyncio.get_running_loop()
             ct_kwargs = kwargs.get("chat_template_kwargs")
             is_partial = kwargs.get("is_partial")
-            num_tokens = await loop.run_in_executor(
-                None,
-                lambda: self.count_chat_tokens(
-                    messages,
-                    tools,
-                    chat_template_kwargs=ct_kwargs,
-                    is_partial=is_partial,
-                ),
+            num_tokens = await self._count_chat_tokens_async(
+                messages,
+                tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=is_partial,
             )
         except Exception as e:
             logger.warning(
@@ -732,13 +830,7 @@ class DFlashEngine(BaseEngine):
             )
             return
         try:
-            # fork: encode on the executor thread, not the event loop (the
-            # generate path re-encodes the same prompt — see preflight_chat
-            # for why ids can't be threaded across the two HTTP-level calls).
-            loop = asyncio.get_running_loop()
-            num_tokens = await loop.run_in_executor(
-                None, lambda: len(self._tokenizer_obj.encode(prompt))
-            )
+            num_tokens = len(await self._encode_prompt_async(prompt))
         except Exception as e:
             logger.warning(
                 "DFlashEngine.preflight_completion: tokenizer.encode raised %s; "
@@ -778,7 +870,8 @@ class DFlashEngine(BaseEngine):
     def _get_think_token_id(self, attr: str) -> int | None:
         """Safely read think_start_id / think_end_id from the tokenizer."""
         try:
-            return getattr(self._tokenizer_obj, attr, None)
+            with self._tokenizer_lock:
+                return getattr(self._tokenizer_obj, attr, None)
         except (ValueError, TypeError):
             return None
 
@@ -792,47 +885,49 @@ class DFlashEngine(BaseEngine):
         Returns False for disabled-thinking patterns like <think></think>
         where </think> immediately follows <think> in the prompt tail.
         """
-        if not prompt_tokens:
-            return False
-
-        think_start_id = self._get_think_token_id('think_start_id')
-        if think_start_id is None and self._tokenizer_obj is not None:
-            try:
-                tid = self._tokenizer_obj.convert_tokens_to_ids("<think>")
-                if tid == getattr(self._tokenizer_obj, 'unk_token_id', None):
-                    return False
-                think_start_id = tid
-            except (AttributeError, KeyError, TypeError):
+        with self._tokenizer_lock:
+            if not prompt_tokens:
                 return False
 
-        if not think_start_id:
-            return False
-
-        last_tokens = list(prompt_tokens[-3:])
-        if think_start_id not in last_tokens:
-            return False
-
-        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
-        after_start = last_tokens[last_idx + 1:]
-
-        if after_start:
-            think_end_id = self._get_think_token_id('think_end_id')
-            if think_end_id is not None and think_end_id in after_start:
-                return False
-            if self._tokenizer_obj is not None:
+            think_start_id = self._get_think_token_id('think_start_id')
+            if think_start_id is None and self._tokenizer_obj is not None:
                 try:
-                    tid = self._tokenizer_obj.convert_tokens_to_ids("</think>")
-                    unk = getattr(self._tokenizer_obj, 'unk_token_id', None)
-                    if tid != unk and tid in after_start:
+                    tid = self._tokenizer_obj.convert_tokens_to_ids("<think>")
+                    if tid == getattr(self._tokenizer_obj, 'unk_token_id', None):
                         return False
+                    think_start_id = tid
                 except (AttributeError, KeyError, TypeError):
-                    pass
+                    return False
 
-        return True
+            if not think_start_id:
+                return False
+
+            last_tokens = list(prompt_tokens[-3:])
+            if think_start_id not in last_tokens:
+                return False
+
+            last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
+            after_start = last_tokens[last_idx + 1:]
+
+            if after_start:
+                think_end_id = self._get_think_token_id('think_end_id')
+                if think_end_id is not None and think_end_id in after_start:
+                    return False
+                if self._tokenizer_obj is not None:
+                    try:
+                        tid = self._tokenizer_obj.convert_tokens_to_ids("</think>")
+                        unk = getattr(self._tokenizer_obj, 'unk_token_id', None)
+                        if tid != unk and tid in after_start:
+                            return False
+                    except (AttributeError, KeyError, TypeError):
+                        pass
+
+            return True
 
     def _think_prefix_text(self) -> str:
         """Return the opening think tag string to prepend (e.g. '<think>\\n')."""
-        tag = getattr(self._tokenizer_obj, 'think_start', '<think>')
+        with self._tokenizer_lock:
+            tag = getattr(self._tokenizer_obj, 'think_start', '<think>')
         return f"{tag}\n"
 
     def _stream_dflash_events(
@@ -1055,7 +1150,7 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt_tokens = self._tokenizer_obj.encode(prompt)
+        prompt_tokens = await self._encode_prompt_async(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
@@ -1165,7 +1260,7 @@ class DFlashEngine(BaseEngine):
             # reintroduce the raw markers and double-buffer detokenization.
             text = "".join(parsed_visible_parts)
         else:
-            text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
+            text = await self._decode_generated_async(generated)
             text = clean_special_tokens(text)
 
             # Reasoning models (Qwen3.x with enable_thinking, DeepSeek,
@@ -1211,7 +1306,7 @@ class DFlashEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        prompt_tokens = self._tokenizer_obj.encode(prompt)
+        prompt_tokens = await self._encode_prompt_async(prompt)
 
         # Fallback: evict dflash models, start LLM/VLM engine
         if self._should_fallback(prompt_tokens):
@@ -1371,7 +1466,7 @@ class DFlashEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         is_partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = await self._render_chat_prompt_async(
             messages, template_tools,
             chat_template_kwargs=ct_kwargs, is_partial=is_partial,
         )
@@ -1429,7 +1524,7 @@ class DFlashEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         is_partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = await self._render_chat_prompt_async(
             messages, template_tools,
             chat_template_kwargs=ct_kwargs, is_partial=is_partial,
         )

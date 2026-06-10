@@ -31,6 +31,7 @@ import importlib
 import json
 import logging
 from collections.abc import AsyncIterator
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,7 +47,12 @@ from ..utils.image import (
     extract_images_from_messages,
 )
 from ..utils.tokenizer import get_tokenizer_config
-from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    _warn_scheduler_unreachable_once,
+    sync_and_clear_mlx_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -682,6 +688,68 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+
+    def _tokenizer_executor(self):
+        engine = getattr(self._engine, "engine", None)
+        return getattr(engine, "_mlx_executor", None)
+
+    async def _run_tokenizer_async(self, func, /, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._tokenizer_executor(),
+            partial(func, *args, **kwargs),
+        )
+
+    def _encode_prompt_sync(self, prompt: str) -> list[int]:
+        return list(self._tokenizer.encode(prompt))
+
+    async def _encode_prompt_async(self, prompt: str) -> list[int]:
+        return await self._run_tokenizer_async(self._encode_prompt_sync, prompt)
+
+    async def _count_chat_tokens_async(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> int:
+        return await self._run_tokenizer_async(
+            self.count_chat_tokens,
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
+    def _specprefill_system_end_sync(
+        self,
+        messages: list[dict[str, Any]],
+        prompt_token_count: int,
+    ) -> int | None:
+        non_system = [
+            m for m in messages if m.get("role") not in ("system", "developer")
+        ]
+        if len(non_system) >= len(messages) or not non_system:
+            return None
+        non_system_prompt = self._tokenizer.apply_chat_template(
+            non_system,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+        system_end = prompt_token_count - non_system_tokens
+        return system_end if system_end > 0 else None
+
+    async def _specprefill_system_end_async(
+        self,
+        messages: list[dict[str, Any]],
+        prompt_token_count: int,
+    ) -> int | None:
+        return await self._run_tokenizer_async(
+            self._specprefill_system_end_sync,
+            messages,
+            prompt_token_count,
+        )
 
     @property
     def model_name(self) -> str:
@@ -2245,7 +2313,6 @@ class VLMBatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
-        template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
         # Strip image content-parts BEFORE templating. Modern HF chat
@@ -2259,13 +2326,6 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, _, _ = extract_images_from_messages(messages)
-        prompt = self._apply_chat_template(
-            text_messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
         # Tokenizer errors propagate as 500 today regardless of where they
         # fire; the real chat path's add_request → tokenize call has no
         # path-specific 400 handler. Don't introduce a NEW failure mode
@@ -2273,7 +2333,12 @@ class VLMBatchedEngine(BaseEngine):
         # the real chat path surface the same error through the existing
         # handler chain.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = await self._count_chat_tokens_async(
+                messages,
+                tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
@@ -2308,7 +2373,7 @@ class VLMBatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = len(await self._encode_prompt_async(prompt))
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_completion: tokenizer.encode "
@@ -2371,23 +2436,14 @@ class VLMBatchedEngine(BaseEngine):
             else False
         )
         if specprefill_model_enabled and kwargs.get("specprefill") is not False:
-            non_system = [
-                m for m in messages if m.get("role") not in ("system", "developer")
-            ]
-            if len(non_system) < len(messages) and non_system:
-                try:
-                    non_system_prompt = self._tokenizer.apply_chat_template(
-                        non_system,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                    )
-                    full_tokens = len(prompt)
-                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                    system_end = full_tokens - non_system_tokens
-                    if system_end > 0:
-                        kwargs["specprefill_system_end"] = system_end
-                except Exception as e:
-                    logger.debug(f"SpecPrefill: system_end calc failed: {e}")
+            try:
+                system_end = await self._specprefill_system_end_async(
+                    messages, len(prompt)
+                )
+                if system_end is not None:
+                    kwargs["specprefill_system_end"] = system_end
+            except Exception as e:
+                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -2503,8 +2559,9 @@ class VLMBatchedEngine(BaseEngine):
 
         if images:
             # Free Metal intermediates from vision encoding.
-            mx.synchronize()
-            mx.clear_cache()
+            scheduler = getattr(self, "scheduler", None)
+            stream = getattr(scheduler, "_stream", None)
+            sync_and_clear_mlx_cache(stream)
 
         return (
             token_ids,

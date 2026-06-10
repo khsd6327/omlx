@@ -40,6 +40,7 @@ The server provides:
 
 import argparse
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -50,6 +51,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from typing import Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
@@ -1360,6 +1362,56 @@ def validate_context_window(
         )
 
 
+async def _encode_tokens_for_engine(engine: BaseEngine, prompt: str) -> list[int]:
+    encode_async = getattr(engine, "_encode_prompt_async", None)
+    if callable(encode_async):
+        return list(await encode_async(prompt))
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(lambda tok, text: list(tok.encode(text)), engine.tokenizer, prompt),
+    )
+
+
+async def _count_prompt_tokens_for_engine(
+    engine: BaseEngine, prompt: str
+) -> int:
+    return len(await _encode_tokens_for_engine(engine, prompt))
+
+
+async def _count_chat_tokens_for_engine(
+    engine: BaseEngine,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    *,
+    chat_template_kwargs: dict | None = None,
+    is_partial: bool | None = None,
+) -> int:
+    count_async = getattr(engine, "_count_chat_tokens_async", None)
+    if callable(count_async) and inspect.iscoroutinefunction(count_async):
+        return int(
+            await count_async(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            )
+        )
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            engine.count_chat_tokens,
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        ),
+    )
+
+
 def init_server(
     model_dirs: str | list[str],
     scheduler_config=None,
@@ -2508,7 +2560,7 @@ async def create_completion(
 
     # Validate context window for each prompt
     for prompt in prompts:
-        num_tokens = len(engine.tokenizer.encode(prompt))
+        num_tokens = await _count_prompt_tokens_for_engine(engine, prompt)
         validate_context_window(num_tokens, request.model)
 
     # Pre-flight prefill memory guard — see create_chat_completion for
@@ -2775,8 +2827,10 @@ async def create_chat_completion(
     if tools_for_template and "gemma" in (resolved_model or "").lower():
         tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
     try:
-        num_prompt_tokens = engine.count_chat_tokens(
-            messages, tools_for_template,
+        num_prompt_tokens = await _count_chat_tokens_for_engine(
+            engine,
+            messages,
+            tools_for_template,
             chat_template_kwargs=merged_ct_kwargs or None,
             is_partial=is_partial,
         )
@@ -3894,16 +3948,12 @@ async def stream_anthropic_messages(
     estimated_input_tokens = 0
     try:
         if hasattr(engine, 'tokenizer') and engine.tokenizer is not None:
-            # Build the prompt using chat template
-            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-            if kwargs.get("tools"):
-                template_kwargs["tools"] = kwargs["tools"]
-            if kwargs.get("chat_template_kwargs"):
-                template_kwargs.update(kwargs["chat_template_kwargs"])
-            prompt = engine.tokenizer.apply_chat_template(messages, **template_kwargs)
-            # Tokenize to count
-            tokens = engine.tokenizer.encode(prompt)
-            estimated_input_tokens = len(tokens)
+            estimated_input_tokens = await _count_chat_tokens_for_engine(
+                engine,
+                messages,
+                kwargs.get("tools"),
+                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+            )
     except Exception as e:
         logger.debug(f"Could not estimate input tokens: {e}")
 
@@ -4361,8 +4411,10 @@ async def create_anthropic_message(
 
     # Validate context window before sending to model
     try:
-        num_prompt_tokens = engine.count_chat_tokens(
-            messages, internal_tools,
+        num_prompt_tokens = await _count_chat_tokens_for_engine(
+            engine,
+            messages,
+            internal_tools,
             chat_template_kwargs=merged_ct_kwargs or None,
             is_partial=is_partial,
         )
@@ -4524,32 +4576,21 @@ async def count_anthropic_tokens(
     # Convert tools if present
     internal_tools = convert_anthropic_tools_to_internal(request.tools)
 
-    # Apply chat template to get prompt
-    tokenizer = engine.tokenizer
-    template_kwargs = {
-        "tokenize": False,
-        "add_generation_prompt": True,
-    }
-    if internal_tools:
-        template_kwargs["tools"] = internal_tools
-
     try:
-        prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+        token_count = await _count_chat_tokens_for_engine(
+            engine,
+            messages,
+            internal_tools,
+        )
     except Exception as e:
         logger.warning(f"Failed to apply chat template: {e}, using simple concatenation")
-        # Fallback: simple concatenation
         prompt = "\n".join(
             f"{msg.get('role', 'user')}: {msg.get('content', '')}"
             for msg in messages
         )
+        token_count = await _count_prompt_tokens_for_engine(engine, prompt)
 
-    # Tokenize to count tokens
-    if isinstance(prompt, str):
-        token_ids = tokenizer.encode(prompt)
-    else:
-        token_ids = prompt  # Already tokenized
-
-    input_tokens = scale_anthropic_tokens(len(token_ids), request.model)
+    input_tokens = scale_anthropic_tokens(token_count, request.model)
     logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
 
     return TokenCountResponse(input_tokens=input_tokens)
@@ -4715,7 +4756,8 @@ async def create_response(
 
     # Validate context window
     try:
-        num_prompt_tokens = engine.count_chat_tokens(
+        num_prompt_tokens = await _count_chat_tokens_for_engine(
+            engine,
             messages,
             tools_for_template,
             chat_template_kwargs=merged_ct_kwargs or None,
@@ -4920,7 +4962,7 @@ async def create_response(
                 )
 
         reasoning_token_count = (
-            len(engine.tokenizer.encode(reasoning_text))
+            await _count_prompt_tokens_for_engine(engine, reasoning_text)
             if reasoning_text else 0
         )
         usage = build_response_usage(
@@ -5439,7 +5481,7 @@ async def stream_responses_api(
             model_id=resolved_model or request.model,
         )
         reasoning_token_count = (
-            len(engine.tokenizer.encode(accumulated_reasoning))
+            await _count_prompt_tokens_for_engine(engine, accumulated_reasoning)
             if accumulated_reasoning else 0
         )
         usage_data = {

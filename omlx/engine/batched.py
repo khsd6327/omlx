@@ -7,8 +7,10 @@ for better throughput when serving multiple concurrent requests.
 """
 
 import copy
+import asyncio
 import logging
 from collections.abc import AsyncIterator
+from functools import partial
 from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
@@ -72,6 +74,88 @@ class BatchedEngine(BaseEngine):
         self._loaded = False
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
+
+    def _tokenizer_executor(self):
+        engine = getattr(self._engine, "engine", None)
+        return getattr(engine, "_mlx_executor", None)
+
+    async def _run_tokenizer_async(self, func, /, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._tokenizer_executor(),
+            partial(func, *args, **kwargs),
+        )
+
+    def _encode_prompt_sync(self, prompt: str) -> list[int]:
+        return list(self._tokenizer.encode(prompt))
+
+    async def _encode_prompt_async(self, prompt: str) -> list[int]:
+        return await self._run_tokenizer_async(self._encode_prompt_sync, prompt)
+
+    async def _render_chat_prompt_async(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> str:
+        return await self._run_tokenizer_async(
+            self._apply_chat_template,
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
+    async def _count_chat_tokens_async(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> int:
+        return await self._run_tokenizer_async(
+            self.count_chat_tokens,
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
+    def _specprefill_system_end_sync(
+        self,
+        messages: list[dict[str, Any]],
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        prompt: str,
+    ) -> int | None:
+        non_system = [
+            m for m in messages if m.get("role") not in ("system", "developer")
+        ]
+        if len(non_system) >= len(messages) or not non_system:
+            return None
+        non_system_prompt = self._apply_chat_template(
+            non_system, template_tools, chat_template_kwargs=chat_template_kwargs
+        )
+        full_tokens = len(self._tokenizer.encode(prompt))
+        non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+        system_end = full_tokens - non_system_tokens
+        return system_end if system_end > 0 else None
+
+    async def _specprefill_system_end_async(
+        self,
+        messages: list[dict[str, Any]],
+        template_tools: list[dict] | None,
+        chat_template_kwargs: dict[str, Any] | None,
+        prompt: str,
+    ) -> int | None:
+        return await self._run_tokenizer_async(
+            self._specprefill_system_end_sync,
+            messages,
+            template_tools,
+            chat_template_kwargs,
+            prompt,
+        )
 
     @property
     def model_name(self) -> str:
@@ -700,7 +784,7 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = await self._render_chat_prompt_async(
             messages,
             template_tools,
             chat_template_kwargs=ct_kwargs,
@@ -742,16 +826,8 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
-        messages = self._preprocess_messages(messages)
-        template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
-        prompt = self._apply_chat_template(
-            messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
         # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
         # malformed input) are normally surfaced by the real chat path's
         # add_request → tokenize call as a 500 — there's no path-specific
@@ -761,7 +837,12 @@ class BatchedEngine(BaseEngine):
         # through the existing handler chain so the response shape stays
         # consistent.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = await self._count_chat_tokens_async(
+                messages,
+                tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_chat: tokenizer.encode raised %s; "
@@ -791,7 +872,7 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = len(await self._encode_prompt_async(prompt))
         except Exception as e:
             logger.warning(
                 "BatchedEngine.preflight_completion: tokenizer.encode raised "
@@ -851,7 +932,7 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
-        prompt = self._apply_chat_template(
+        prompt = await self._render_chat_prompt_async(
             messages,
             template_tools,
             chat_template_kwargs=ct_kwargs,
@@ -872,13 +953,10 @@ class BatchedEngine(BaseEngine):
             ]
             if len(non_system) < len(messages) and non_system:
                 try:
-                    non_system_prompt = self._apply_chat_template(
-                        non_system, template_tools, chat_template_kwargs=ct_kwargs
+                    system_end = await self._specprefill_system_end_async(
+                        messages, template_tools, ct_kwargs, prompt
                     )
-                    full_tokens = len(self._tokenizer.encode(prompt))
-                    non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
-                    system_end = full_tokens - non_system_tokens
-                    if system_end > 0:
+                    if system_end is not None:
                         kwargs["specprefill_system_end"] = system_end
                 except Exception as e:
                     logger.debug(f"SpecPrefill: system_end calc failed: {e}")
