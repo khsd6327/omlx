@@ -1444,21 +1444,6 @@ class Scheduler:
             self._phase_total_ms[phase] += (time.perf_counter() - t0) * 1000.0
             self._phase_count[phase] += 1
 
-    def get_phase_stats(self) -> dict[str, dict[str, float]]:
-        """Return accumulated phase timings for diagnostics.
-
-        Returns dict of phase -> {total_ms, count, avg_ms}.
-        """
-        result = {}
-        for phase, total in self._phase_total_ms.items():
-            count = self._phase_count.get(phase, 0)
-            result[phase] = {
-                "total_ms": total,
-                "count": count,
-                "avg_ms": total / count if count else 0.0,
-            }
-        return result
-
     def _periodic_clear_threshold_bytes(self) -> int:
         """Cache-bytes threshold above which the periodic clear runs.
 
@@ -8381,109 +8366,6 @@ class Scheduler:
         # All KV cache data is on paged SSD, so no GPU memory pressure from PagedCache
         pass
 
-    def _evict_blocks_permanently(self, bytes_to_free: int) -> int:
-        """
-        Evict LRU blocks permanently (metadata cleanup).
-
-        In paged SSD-only mode, blocks don't store data in GPU memory.
-        This method just removes block metadata to free up slots.
-
-        Args:
-            bytes_to_free: Target bytes to free (used for estimation).
-
-        Returns:
-            Number of bytes freed (estimated).
-        """
-        if self.paged_cache_manager is None or self.memory_monitor is None:
-            return 0
-
-        # Estimate how many blocks to evict
-        block_size = self.config.paged_cache_block_size
-        num_blocks_to_evict = self.memory_monitor.estimate_blocks_to_free(
-            bytes_to_free, block_size
-        )
-
-        # Get evictable blocks in LRU order
-        evictable = self.paged_cache_manager.get_evictable_blocks(num_blocks_to_evict)
-
-        if not evictable:
-            logger.debug("No evictable blocks found for permanent eviction")
-            return 0
-
-        freed = 0
-        evicted_count = 0
-
-        for block in evictable:
-            # In paged SSD-only mode, just clear metadata (data is on paged SSD)
-            if self.paged_cache_manager.evict_block_permanently(block.block_id):
-                freed += self.memory_monitor.estimate_block_memory(block_size)
-                evicted_count += 1
-
-            if freed >= bytes_to_free:
-                break
-
-        if evicted_count > 0:
-            logger.info(
-                f"Evicted {evicted_count} blocks permanently "
-                f"(~{self._format_bytes(freed)} estimated)"
-            )
-
-        return freed
-
-    def _evict_blocks_to_cold(self, bytes_to_free: int) -> int:
-        """
-        Evict LRU blocks (with paged SSD cache configured).
-
-        In paged SSD-only mode, data is already on paged SSD, so this just evicts
-        block metadata from the index. The data remains on paged SSD and can
-        be re-discovered if the same token sequence is requested.
-
-        Args:
-            bytes_to_free: Target bytes to free (used for estimation).
-
-        Returns:
-            Number of bytes freed (estimated).
-        """
-        if self.paged_cache_manager is None or self.paged_ssd_cache_manager is None:
-            return 0
-
-        if self.memory_monitor is None:
-            return 0
-
-        # Estimate how many blocks to evict
-        block_size = self.config.paged_cache_block_size
-        num_blocks_to_evict = self.memory_monitor.estimate_blocks_to_free(
-            bytes_to_free, block_size
-        )
-
-        # Get evictable blocks in LRU order
-        evictable = self.paged_cache_manager.get_evictable_blocks(num_blocks_to_evict)
-
-        if not evictable:
-            logger.debug("No evictable blocks found")
-            return 0
-
-        evicted_count = 0
-
-        for block in evictable:
-            # In paged SSD-only mode, data is already on paged SSD
-            # Just evict the block metadata
-            if self.paged_cache_manager.evict_block_permanently(block.block_id):
-                evicted_count += 1
-
-        # Estimate bytes freed based on block count
-        estimated_freed = evicted_count * self.memory_monitor.estimate_block_memory(
-            block_size
-        )
-
-        if evicted_count > 0:
-            logger.info(
-                f"Evicted {evicted_count} blocks from index "
-                f"(data preserved on paged SSD, ~{self._format_bytes(estimated_freed)} metadata freed)"
-            )
-
-        return estimated_freed
-
     def _restore_block_from_cold(self, block_id: int, block_hash: bytes) -> bool:
         """
         Restore a block from cold storage (deprecated in paged SSD-only mode).
@@ -8521,39 +8403,6 @@ class Scheduler:
             f"Block {block_id} verified on paged SSD (hash={block_hash.hex()[:16]}...)"
         )
         return True
-
-    def restore_cold_blocks_for_request(self, request_id: str) -> int:
-        """
-        Verify all blocks needed for a request exist on paged SSD.
-
-        In paged SSD-only mode, blocks don't store cache_data. This method
-        just verifies that blocks exist on paged SSD.
-
-        Args:
-            request_id: Request ID.
-
-        Returns:
-            Number of blocks verified on paged SSD.
-        """
-        if self.paged_cache_manager is None or self.paged_ssd_cache_manager is None:
-            return 0
-
-        if self.block_aware_cache is None:
-            return 0
-
-        # Get block table for request
-        block_table = self.paged_cache_manager.request_tables.get(request_id)
-        if block_table is None:
-            return 0
-
-        verified = 0
-        for block_id in block_table.block_ids:
-            block = self.paged_cache_manager.blocks[block_id]
-            if block.block_hash is not None:
-                if self._restore_block_from_cold(block_id, block.block_hash):
-                    verified += 1
-
-        return verified
 
     def _collect_cache_counters(self) -> dict[str, int] | None:
         if self.block_aware_cache is None:

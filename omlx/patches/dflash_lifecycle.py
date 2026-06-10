@@ -137,8 +137,3 @@ def restore_dflash_class_patches() -> None:
 
     _DFLASH_BACKUP.clear()
     logger.info("dflash class patches restored on %d class(es)", restored)
-
-
-def get_backup_classes() -> list[type]:
-    """Return classes currently in the backup table — used by tests."""
-    return list(_DFLASH_BACKUP.keys())

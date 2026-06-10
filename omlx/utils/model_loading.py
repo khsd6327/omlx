@@ -415,18 +415,6 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
     )
 
 
-def load_text_model(
-    model_name: str,
-    tokenizer_config: dict[str, Any] | None = None,
-    model_settings: Any | None = None,
-):
-    """Load an LLM model/tokenizer pair via mlx-lm."""
-    maybe_apply_pre_load_patches(model_name, model_settings=model_settings)
-    from mlx_lm import load
-
-    return load(model_name, tokenizer_config=tokenizer_config)
-
-
 def materialize_lazy_state(model: Any) -> None:
     """Force-evaluate every mx.array in the model tree on the loader thread.
 

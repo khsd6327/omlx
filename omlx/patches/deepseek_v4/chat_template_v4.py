@@ -20,7 +20,7 @@ import copy
 import json
 import re
 from inspect import isfunction
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 from transformers.utils.chat_template_utils import get_json_schema
 
@@ -138,24 +138,6 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
         P_dsml_strs.append(p_dsml_str)
 
     return "\n".join(P_dsml_strs)
-
-
-def decode_dsml_to_arguments(
-    tool_name: str, tool_args: Dict[str, Tuple[str, str]]
-) -> Dict[str, str]:
-    def _decode_value(key: str, value: str, string: str):
-        if string == "true":
-            value = to_json(value)
-        return f"{to_json(key)}: {value}"
-
-    tool_args_json = (
-        "{"
-        + ", ".join(
-            [_decode_value(k, v, string=is_str) for k, (v, is_str) in tool_args.items()]
-        )
-        + "}"
-    )
-    return dict(name=tool_name, arguments=tool_args_json)
 
 
 def render_tools(tools: List[Dict[str, Union[str, Dict[str, Any]]]]) -> str:

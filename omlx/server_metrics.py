@@ -209,19 +209,6 @@ class ServerMetrics:
             # Periodic save
             self._maybe_save_alltime()
 
-    def record_preflight_rejection(self, reason: str) -> None:
-        """Increment the preflight-rejection counter for ``reason``.
-
-        Unknown reasons are bucketed under ``"other"`` rather than
-        silently dropped so an operator notices when a new reject path
-        is added without updating the metric.
-        """
-        with self._lock:
-            if reason not in self.preflight_rejections:
-                reason = "other"
-                self.preflight_rejections.setdefault("other", 0)
-            self.preflight_rejections[reason] += 1
-
     def _build_snapshot(
         self,
         prompt: int,

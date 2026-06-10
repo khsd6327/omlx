@@ -145,29 +145,6 @@ def request_has_file_parts(messages: list[Message]) -> bool:
     return any(_iter_file_part_dicts(msg.content) for msg in messages)
 
 
-def convert_messages_to_markdown(
-    messages: list[Message],
-    *,
-    global_settings: Any | None = None,
-    latest_user_only: bool = False,
-) -> str:
-    """Render request messages into Markdown, converting file parts."""
-    if latest_user_only:
-        messages = _latest_user_turn(messages)
-
-    converted_messages = preprocess_markitdown_file_parts(
-        messages,
-        global_settings=global_settings,
-        fail_when_disabled=True,
-    )
-    sections: list[str] = []
-    for msg in converted_messages:
-        text = _content_text(msg.content).strip()
-        if text:
-            sections.append(text)
-    return "\n\n".join(sections).strip()
-
-
 async def convert_messages_to_markdown_async(
     messages: list[Message],
     *,

@@ -12,16 +12,6 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 
-class AudioTranscriptionRequest(BaseModel):
-    """OpenAI-compatible audio transcription request."""
-
-    model: str
-    language: Optional[str] = None
-    prompt: Optional[str] = None
-    response_format: Optional[str] = "json"
-    temperature: Optional[float] = 0.0
-
-
 class AudioTranscriptionResponse(BaseModel):
     text: str
     language: Optional[str] = None

@@ -27,19 +27,6 @@ def normalize_update_channel(channel: str | None) -> str:
     return UPDATE_CHANNEL_STABLE
 
 
-def select_latest_stable_release(
-    releases: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    """Pick the highest stable release from a GitHub /releases response.
-
-    Don't trust the GitHub `prerelease` flag alone. Historically dev/rc tags
-    have been published with that flag unset, which makes /releases/latest
-    return them as if they were stable. Filter via PEP 440 too, and skip
-    drafts and unparseable tags.
-    """
-    return select_latest_release(releases, channel=UPDATE_CHANNEL_STABLE)
-
-
 def select_latest_release(
     releases: list[dict[str, Any]],
     channel: str | None = UPDATE_CHANNEL_STABLE,

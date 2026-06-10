@@ -333,12 +333,6 @@ def _extract_layer_index(path: str) -> int:
     return int(m.group(1)) if m else -1
 
 
-def _default_bits(config: dict) -> int:
-    """Read default quantization bits from config."""
-    q = config.get("quantization", {})
-    return q.get("bits", 4)
-
-
 def _normalize_quant_path(path: str) -> str:
     """Normalize tensor/module names to the module path used in configs."""
     if path.endswith(".weight"):
@@ -411,18 +405,6 @@ def _estimate_effective_bpw(
     return total_bits / max(total_params, 1)
 
 
-def _collect_named_weight_shapes_from_model(model) -> dict[str, tuple]:
-    """Collect quantizable weight shapes from the in-memory model."""
-    named_shapes = {}
-    for path, module in tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module):
-        if not hasattr(module, "weight") or not hasattr(module, "to_quantized"):
-            continue
-        if getattr(module.weight, "ndim", 0) < 2:
-            continue
-        named_shapes[_normalize_quant_path(path)] = tuple(module.weight.shape)
-    return named_shapes
-
-
 def _collect_named_weight_shapes_from_weights(
     weights: dict[str, Any],
 ) -> dict[str, tuple]:
@@ -455,22 +437,6 @@ _MANDATORY_BOOST_PATTERNS = {
     "embed_tokens": {"bits": 8, "group_size": 64, "mode": "affine"},
     "wte": {"bits": 8, "group_size": 64, "mode": "affine"},
 }
-
-
-def _sensitivity_tier(layer_score: float, max_score: float) -> int:
-    """Map sensitivity score to boost tier: +4 (top), +2 (high), +1 (moderate).
-
-    Greedy allocator will fallback to lower tiers if budget can't fit the
-    requested bits (e.g., 8-bit → try 6-bit → try 5-bit).
-    """
-    if max_score <= 0:
-        return 1
-    ratio = layer_score / max_score
-    if ratio >= 0.5:
-        return 4
-    if ratio >= 0.2:
-        return 2
-    return 1
 
 
 def _build_quant_plan(

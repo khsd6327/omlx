@@ -220,21 +220,6 @@ class MemoryMonitor:
         # All KV cache data is on paged SSD
         return 0
 
-    def _get_process_rss(self) -> int:
-        """
-        Get process RSS memory (fallback method).
-
-        Returns:
-            Process resident set size in bytes.
-        """
-        try:
-            import psutil
-
-            process = psutil.Process()
-            return process.memory_info().rss
-        except Exception:
-            return 0
-
     def get_memory_info(self) -> MemoryInfo:
         """
         Get current memory state.

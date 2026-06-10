@@ -704,19 +704,6 @@ class EngineCore:
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
 
-    async def _delayed_cleanup(self, request_id: str, delay: float = 5.0) -> None:
-        """
-        Cleanup request after delay if not already cleaned.
-
-        This handles the case where a client disconnects before consuming
-        the stream_outputs() generator, which would prevent the finally
-        block from running.
-        """
-        await asyncio.sleep(delay)
-        if request_id in self._output_collectors:
-            logger.debug(f"Delayed cleanup for request {request_id}")
-            self._cleanup_request(request_id)
-
     async def stream_outputs(
         self,
         request_id: str,
@@ -837,58 +824,6 @@ class EngineCore:
             raise RuntimeError(final_output.error)
 
         return final_output
-
-    def generate_batch_sync(
-        self,
-        prompts: List[Union[str, List[int]]],
-        sampling_params: Optional[SamplingParams] = None,
-    ) -> List[RequestOutput]:
-        """
-        Generate responses synchronously for maximum throughput.
-
-        This bypasses the async engine loop entirely, running the scheduler
-        directly for optimal batching performance. Use this when you don't
-        need streaming and want maximum throughput.
-
-        Args:
-            prompts: List of input prompts
-            sampling_params: Generation parameters (same for all)
-
-        Returns:
-            List of RequestOutput in same order as prompts
-        """
-        from .request import Request
-        import uuid as uuid_module
-
-        if sampling_params is None:
-            sampling_params = SamplingParams()
-
-        # Add all requests to scheduler
-        request_ids = []
-        for prompt in prompts:
-            request_id = str(uuid_module.uuid4())
-            request = Request(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params=sampling_params,
-            )
-            self.scheduler.add_request(request)
-            request_ids.append(request_id)
-
-        # Process until all done - direct scheduler access, no async overhead
-        results: Dict[str, RequestOutput] = {}
-        while self.scheduler.has_requests():
-            output = self.scheduler.step()
-            for req_output in output.outputs:
-                if req_output.finished:
-                    results[req_output.request_id] = req_output
-
-        # Cleanup
-        for rid in request_ids:
-            self.scheduler.remove_finished_request(rid)
-
-        # Return in original order
-        return [results[rid] for rid in request_ids]
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

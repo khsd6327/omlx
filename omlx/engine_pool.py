@@ -284,23 +284,6 @@ class EnginePool:
         """Get entry for a specific model, or None if not found."""
         return self._entries.get(model_id)
 
-    def set_pinned(self, model_id: str, pinned: bool) -> bool:
-        """
-        Set the pinned status for a model.
-
-        Args:
-            model_id: The model ID to update
-            pinned: Whether to pin (True) or unpin (False) the model
-
-        Returns:
-            True if successful, False if model not found.
-        """
-        entry = self._entries.get(model_id)
-        if entry is None:
-            return False
-        entry.is_pinned = pinned
-        return True
-
     def _case_insensitive_entry_match(self, name: str) -> str | None:
         """Find a model entry matching *name* case-insensitively.
 
