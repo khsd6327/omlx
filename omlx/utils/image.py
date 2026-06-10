@@ -17,6 +17,11 @@ from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
 
+# fork: cap on a single image's encoded size (URL download or decoded
+# base64). Without it a remote URL (or one huge data URI) could stream an
+# unbounded payload into memory on a serving thread.
+MAX_IMAGE_BYTES = 64 * 1024 * 1024
+
 
 def load_image(url_or_base64: str) -> Image.Image:
     """
@@ -33,7 +38,8 @@ def load_image(url_or_base64: str) -> Image.Image:
         PIL Image object
 
     Raises:
-        ValueError: If the URL format is unsupported
+        ValueError: If the URL format is unsupported or the image exceeds
+            MAX_IMAGE_BYTES
         IOError: If the image cannot be loaded
     """
     if url_or_base64.startswith("data:"):
@@ -42,13 +48,25 @@ def load_image(url_or_base64: str) -> Image.Image:
             _, data_part = url_or_base64.split(",", 1)
         except ValueError:
             raise ValueError(f"Invalid data URI format: {url_or_base64[:50]}...")
+        # fork: cheap pre-decode size check (base64 is ~4/3 of raw).
+        if len(data_part) * 3 // 4 > MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"Image data URI too large (> {MAX_IMAGE_BYTES // (1024 * 1024)} MB)"
+            )
         img_bytes = base64.b64decode(data_part)
         img = Image.open(io.BytesIO(img_bytes))
     elif url_or_base64.startswith(("http://", "https://")):
         import urllib.request
 
         with urllib.request.urlopen(url_or_base64, timeout=30) as response:
-            img_bytes = response.read()
+            # fork: bounded read so a remote server can't stream an
+            # unbounded body (declared Content-Length is advisory only).
+            img_bytes = response.read(MAX_IMAGE_BYTES + 1)
+            if len(img_bytes) > MAX_IMAGE_BYTES:
+                raise ValueError(
+                    f"Image URL response too large "
+                    f"(> {MAX_IMAGE_BYTES // (1024 * 1024)} MB): {url_or_base64[:80]}"
+                )
         img = Image.open(io.BytesIO(img_bytes))
     else:
         # Try as local file path

@@ -38,7 +38,7 @@ async def test_vlm_chat_forwards_specprefill_threshold_and_keep_pct():
     engine._engine.stream_outputs = _one_output_stream
 
     # Mock _process_chat_messages to skip mlx-vlm template processing
-    def _mock_process(messages, tools, kwargs):
+    def _mock_process(messages, tools, kwargs, preextracted_media=None):
         return "<prompt>", None, {}, None, None, []
 
     with patch.object(engine, "_process_chat_messages", side_effect=_mock_process):

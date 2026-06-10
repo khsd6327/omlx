@@ -24,6 +24,7 @@ Usage:
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import copy
 import inspect
@@ -688,6 +689,46 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        # fork: dedicated single-thread executor for image/audio extraction
+        # (URL download with up to 30s timeout, base64 decode, PIL
+        # open/EXIF/convert). This used to run on _mlx_executor — the SAME
+        # thread that runs every scheduler.step() decode burst — so one slow
+        # remote image froze all token generation on this engine. A single
+        # worker serializes media prep per model (PIL/HF processors are not
+        # guaranteed thread-safe) without touching the decode thread.
+        self._media_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vlm-media"
+        )
+
+    def _get_media_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """fork: lazily (re)create the media-prep executor.
+
+        stop() shuts it down, but a stopped engine instance can be
+        restarted in place via start() (chat() calls start() when
+        _loaded is False), so recreate on demand.
+        """
+        ex = self._media_executor
+        if ex is None or getattr(ex, "_shutdown", False):
+            ex = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vlm-media"
+            )
+            self._media_executor = ex
+        return ex
+
+    async def _extract_chat_media_async(self, messages: list[dict[str, Any]]):
+        """fork: run image/audio extraction off the MLX executor thread.
+
+        extract_images_from_messages performs URL downloads (30s timeout),
+        base64 decode, and PIL open/EXIF/convert — pure CPU/network work
+        with no mx involvement. Running it on _mlx_executor stalled every
+        decode step on this engine for the duration.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._get_media_executor(),
+            extract_images_from_messages,
+            messages,
+        )
 
     def _tokenizer_executor(self):
         engine = getattr(self._engine, "engine", None)
@@ -1108,6 +1149,10 @@ class VLMBatchedEngine(BaseEngine):
         self._tokenizer = None
         self._vlm_mtp_drafter = None
         self._loaded = False
+        # fork: stop accepting media-prep work; don't wait for an in-flight
+        # download (cancel_futures drops queued items, the worker thread is
+        # a daemon-style pool member that exits after its current task).
+        self._media_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("VLMBatchedEngine stopped")
 
     def _inject_tool_calling(self, tokenizer) -> None:
@@ -2240,6 +2285,9 @@ class VLMBatchedEngine(BaseEngine):
             await self.start()
 
         loop = asyncio.get_running_loop()
+        # fork: fetch/decode media off the MLX thread first; only template +
+        # vision encode run on the MLX executor.
+        media = await self._extract_chat_media_async(messages)
         (
             prompt,
             vlm_embeds,
@@ -2249,10 +2297,13 @@ class VLMBatchedEngine(BaseEngine):
             image_cache_key_ranges,
         ) = await loop.run_in_executor(
             self._engine._mlx_executor,
-            self._process_chat_messages,
-            messages,
-            tools,
-            kwargs,
+            partial(
+                self._process_chat_messages,
+                messages,
+                tools,
+                kwargs,
+                preextracted_media=media,
+            ),
         )
 
         return await self.generate(
@@ -2411,7 +2462,9 @@ class VLMBatchedEngine(BaseEngine):
         # the event loop.  Blocking here (synchronous mx.eval) prevents
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
+        # fork: media fetch/decode happens off the MLX thread first.
         loop = asyncio.get_running_loop()
+        media = await self._extract_chat_media_async(messages)
         (
             prompt,
             vlm_embeds,
@@ -2421,10 +2474,13 @@ class VLMBatchedEngine(BaseEngine):
             image_cache_key_ranges,
         ) = await loop.run_in_executor(
             self._engine._mlx_executor,
-            self._process_chat_messages,
-            messages,
-            tools,
-            kwargs,
+            partial(
+                self._process_chat_messages,
+                messages,
+                tools,
+                kwargs,
+                preextracted_media=media,
+            ),
         )
 
         # SpecPrefill: compute system prompt token count for protection.
@@ -2523,17 +2579,26 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None,
         kwargs: dict,
+        preextracted_media: tuple | None = None,
     ) -> Tuple[
         str | list[int], Any, dict | None, str | None, int, List[Tuple[int, str]]
     ]:
         """
         Process chat messages, extracting images and preparing VLM inputs.
 
+        fork: pass preextracted_media (the extract_images_from_messages
+        result, fetched on the media executor via
+        _extract_chat_media_async) so the network/PIL work doesn't run on
+        the MLX executor thread this method is dispatched to.
+
         Returns:
             Tuple of (prompt_or_token_ids, vlm_embeds, vlm_kwargs, image_hash)
         """
         # Extract images from messages
-        text_messages, images, audio = extract_images_from_messages(messages)
+        if preextracted_media is not None:
+            text_messages, images, audio = preextracted_media
+        else:
+            text_messages, images, audio = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
 
