@@ -14,6 +14,7 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any, Dict, Optional
 
+import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
