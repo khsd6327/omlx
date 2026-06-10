@@ -2559,7 +2559,12 @@ class VLMBatchedEngine(BaseEngine):
 
         if images:
             # Free Metal intermediates from vision encoding.
-            scheduler = getattr(self, "scheduler", None)
+            # fork: VLMBatchedEngine has no `scheduler` attribute — the old
+            # getattr(self, "scheduler") always returned None, so this clear
+            # never synchronized this engine's own stream before clearing
+            # the shared buffer pool (same race class as #300/#888).
+            engine_core = getattr(self._engine, "engine", None)
+            scheduler = getattr(engine_core, "scheduler", None)
             stream = getattr(scheduler, "_stream", None)
             sync_and_clear_mlx_cache(stream)
 

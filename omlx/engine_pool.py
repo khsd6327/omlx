@@ -172,10 +172,6 @@ class EnginePool:
             total += self._estimated_entry_size(model_settings.vlm_mtp_draft_model)
 
         return max(0, int(total))
-        try:
-            return int(cb())
-        except Exception:  # noqa: BLE001
-            return 0
 
     def _wake_process_memory_enforcer(self, *, active: bool = False) -> None:
         enforcer = self._process_memory_enforcer

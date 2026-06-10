@@ -1145,12 +1145,22 @@ class GlobalSettings:
             "idle_timeout": self.idle_timeout.to_dict(),
         }
 
+        # fork: write atomically (tmp + os.replace, mirroring
+        # model_settings.py). A plain truncate-and-write can corrupt the
+        # file holding auth.api_key and the claude_code model pointers if
+        # the process dies or a concurrent admin write-back lands mid-write.
+        tmp_file = settings_file.with_suffix(".json.tmp")
         try:
-            with open(settings_file, "w", encoding="utf-8") as f:
+            with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp_file, settings_file)
             logger.info(f"Saved settings to {settings_file}")
         except OSError as e:
             logger.error(f"Failed to save settings to {settings_file}: {e}")
+            try:
+                tmp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
             raise
 
     def ensure_directories(self) -> None:
