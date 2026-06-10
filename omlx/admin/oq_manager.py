@@ -132,6 +132,7 @@ class OQManager:
         self,
         model_dirs: list[str],
         on_complete: Optional[Callable] = None,
+        engine_pool_getter: Optional[Callable] = None,
     ):
         self._model_dirs = [Path(d) for d in model_dirs]
         self._output_dir = self._model_dirs[0] if self._model_dirs else Path(".")
@@ -141,6 +142,9 @@ class OQManager:
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
         self._quant_sem = asyncio.Semaphore(1)
+        # fork: used to refuse quantization while models are serving (see
+        # start_quantization). Callable returning the EnginePool or None.
+        self._engine_pool_getter = engine_pool_getter
 
     def update_model_dirs(self, model_dirs: list[str]) -> None:
         """Update model directory paths."""
@@ -306,6 +310,45 @@ class OQManager:
         source_size = sum(f.stat().st_size for f in source.glob("*.safetensors"))
         if source_size == 0:
             source_size = sum(f.stat().st_size for f in source.glob("*.bin"))
+
+        # fork: in-process quantization cannot run concurrently with
+        # inference. oq.py's sanitize plan discovery monkey-patches
+        # process-global mx.eval/mx.synchronize/mx.clear_cache (no-ops for
+        # the duration), and the streaming path calls bare mx.eval /
+        # mx.clear_cache from a non-executor thread — both race in-flight
+        # Metal command buffers of serving models (#300/#888/#1106 class).
+        # Refuse while any model is loaded, and refuse when the job's own
+        # memory estimate exceeds what is currently available.
+        pool = self._engine_pool_getter() if self._engine_pool_getter else None
+        if pool is not None:
+            try:
+                loaded = pool.get_loaded_model_ids()
+            except Exception:  # noqa: BLE001 - gate must never crash start
+                loaded = []
+            if loaded:
+                raise ValueError(
+                    "Cannot start quantization while models are loaded "
+                    f"({', '.join(sorted(loaded))}). In-process quantization "
+                    "patches global MLX evaluation and performs "
+                    "unsynchronized cache clears that corrupt concurrent "
+                    "inference. Unload all models first (Models tab)."
+                )
+        try:
+            import psutil
+
+            from ..oq import estimate_memory
+
+            peak = estimate_memory(source_size)["peak_bytes"]
+            available = psutil.virtual_memory().available
+            if peak > available:
+                raise ValueError(
+                    "Insufficient memory for quantization: estimated peak "
+                    f"{peak / 1024**3:.1f} GB exceeds available "
+                    f"{available / 1024**3:.1f} GB. Free memory (unload "
+                    "models, close apps) and retry."
+                )
+        except ImportError:
+            pass
 
         task_id = str(uuid.uuid4())
         task = QuantTask(

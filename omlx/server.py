@@ -40,13 +40,16 @@ The server provides:
 
 import argparse
 import asyncio
+import hashlib  # fork: grammar compile LRU cache key
 import inspect
 import json
 import logging
 import os
+import threading  # fork: grammar compile LRU cache lock
 from pathlib import Path
 import time
 import uuid
+from collections import OrderedDict  # fork: grammar compile LRU cache
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -751,6 +754,151 @@ class DebugRequestLoggingMiddleware:
 
 
 app.add_middleware(DebugRequestLoggingMiddleware)
+
+
+# fork: request body size cap (no limit existed; a multi-hundred-MB JSON body
+# was fully read and parsed on the event loop before auth).
+_DEFAULT_MAX_REQUEST_BODY_MB = 256
+
+
+def _max_request_body_bytes() -> int:
+    """Configured request body cap in bytes. 0 means disabled."""
+    gs = _server_state.global_settings
+    mb = getattr(getattr(gs, "server", None), "max_request_body_mb", None)
+    if gs is None:
+        mb = _DEFAULT_MAX_REQUEST_BODY_MB
+    if mb is None:
+        # Explicit null in settings.json = disabled.
+        return 0
+    try:
+        mb = float(mb)
+    except (TypeError, ValueError):
+        mb = _DEFAULT_MAX_REQUEST_BODY_MB
+    if mb <= 0:
+        return 0
+    return int(mb * 1024 * 1024)
+
+
+class _RequestBodyTooLarge(HTTPException):
+    """Raised from the receive wrapper when a (chunked) body exceeds the cap.
+
+    Subclasses HTTPException so that, when raised while a route handler is
+    reading the request body, FastAPI's normal exception handling renders it
+    as a 413 (OpenAI error shape on /v1/ routes via http_exception_handler).
+    """
+
+    def __init__(self, limit_bytes: int):
+        super().__init__(
+            status_code=413,
+            detail=(
+                "Request body too large: exceeds the configured limit of "
+                f"{limit_bytes // (1024 * 1024)} MB "
+                "(server.max_request_body_mb)."
+            ),
+        )
+
+
+class BodySizeLimitMiddleware:
+    """Pure-ASGI request body size cap.
+
+    Rejects requests whose Content-Length exceeds the configured cap with an
+    immediate 413; for chunked/absent Content-Length, counts bytes in the
+    ``receive`` wrapper and aborts with 413 once the cap is exceeded. Only
+    ``receive`` is wrapped, so streaming (SSE) responses are unaffected.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    def _error_body(path: str, detail: str) -> bytes:
+        if path.startswith("/v1/"):
+            content = _openai_error_body(detail, 413)
+        else:
+            content = {"detail": detail}
+        return json.dumps(content).encode("utf-8")
+
+    async def _send_413(self, scope, send, limit_bytes: int) -> None:
+        detail = (
+            "Request body too large: exceeds the configured limit of "
+            f"{limit_bytes // (1024 * 1024)} MB "
+            "(server.max_request_body_mb)."
+        )
+        logger.warning(
+            "%s %s → 413: %s",
+            scope.get("method", "?"),
+            scope.get("path", "?"),
+            detail,
+        )
+        body = self._error_body(scope.get("path", ""), detail)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        limit = _max_request_body_bytes()
+        if limit <= 0:
+            await self.app(scope, receive, send)
+            return
+
+        # Fast path: declared Content-Length over the cap → 413 before the
+        # body is read at all.
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except (TypeError, ValueError):
+                    break
+                if declared > limit:
+                    await self._send_413(scope, send, limit)
+                    return
+                break
+
+        # Chunked/absent Content-Length (or a lying client): count bytes in
+        # the receive wrapper and abort once the cap is exceeded.
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise _RequestBodyTooLarge(limit)
+            return message
+
+        response_started = False
+
+        async def send_wrapper(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, send_wrapper)
+        except _RequestBodyTooLarge:
+            # Raised outside FastAPI's exception handling (e.g. a pure-ASGI
+            # middleware reading the body). Send the 413 ourselves when the
+            # response has not started; otherwise abort the connection.
+            if response_started:
+                raise
+            await self._send_413(scope, send, limit)
+
+
+app.add_middleware(BodySizeLimitMiddleware)
 
 
 # =============================================================================
@@ -1616,6 +1764,8 @@ def init_server(
     _server_state.oq_manager = OQManager(
         model_dirs=[str(d) for d in dir_list],
         on_complete=_refresh_models_after_download,
+        # fork: lets start_quantization refuse to run while models serve
+        engine_pool_getter=lambda: _server_state.engine_pool,
     )
     set_oq_manager(_server_state.oq_manager)
     logger.info("oQ Quantizer initialized")
@@ -2824,7 +2974,7 @@ async def create_chat_completion(
     )
     if structured_outputs is not None or response_format:
         await engine.start()
-    compiled_grammar = _compile_grammar_for_request(
+    compiled_grammar = await _compile_grammar_for_request_async(
         engine,
         structured_outputs=structured_outputs,
         response_format=response_format,
@@ -3426,6 +3576,87 @@ def _compile_grammar_for_request(
             )
         _warn_response_format_not_enforced(response_format, error=e)
     return None
+
+
+# fork: xgrammar compilation of a complex JSON schema takes hundreds of ms
+# to seconds and ran synchronously on the event loop, stalling every
+# concurrent SSE stream. Run it on the default thread pool and cache
+# compiled grammars per engine (lifetime tied to the engine object, so an
+# unload/reload naturally drops the cache). xgrammar's GrammarCompiler and
+# compiled grammars are immutable/thread-safe.
+_GRAMMAR_COMPILE_LRU_MAX = 64
+
+
+def _grammar_cache_key(
+    structured_outputs, response_format, chat_template_kwargs, reasoning_parser
+) -> str:
+    def _norm(obj) -> str:
+        if obj is None:
+            return ""
+        dump = getattr(obj, "model_dump_json", None)
+        if callable(dump):
+            return dump()
+        try:
+            return json.dumps(obj, sort_keys=True, default=repr)
+        except (TypeError, ValueError):
+            return repr(obj)
+
+    raw = "\x1f".join(
+        (
+            _norm(structured_outputs),
+            _norm(response_format),
+            _norm(chat_template_kwargs),
+            str(reasoning_parser or ""),
+        )
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _compile_grammar_for_request_async(
+    engine: BaseEngine,
+    structured_outputs=None,
+    response_format=None,
+    chat_template_kwargs=None,
+    reasoning_parser=None,
+):
+    """Async wrapper for _compile_grammar_for_request: executor + per-engine LRU."""
+    if structured_outputs is None and response_format is None:
+        return None
+
+    key = _grammar_cache_key(
+        structured_outputs, response_format, chat_template_kwargs, reasoning_parser
+    )
+    cache = getattr(engine, "_grammar_compile_lru", None)
+    lock = getattr(engine, "_grammar_compile_lru_lock", None)
+    if cache is None or lock is None:
+        cache = OrderedDict()
+        lock = threading.Lock()
+        engine._grammar_compile_lru = cache
+        engine._grammar_compile_lru_lock = lock
+    with lock:
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+
+    loop = asyncio.get_running_loop()
+    compiled = await loop.run_in_executor(
+        None,
+        partial(
+            _compile_grammar_for_request,
+            engine,
+            structured_outputs=structured_outputs,
+            response_format=response_format,
+            chat_template_kwargs=chat_template_kwargs,
+            reasoning_parser=reasoning_parser,
+        ),
+    )
+    if compiled is not None:
+        with lock:
+            cache[key] = compiled
+            cache.move_to_end(key)
+            while len(cache) > _GRAMMAR_COMPILE_LRU_MAX:
+                cache.popitem(last=False)
+    return compiled
 
 
 def _warn_response_format_not_enforced(response_format, error=None):
@@ -4754,7 +4985,7 @@ async def create_response(
 
             await engine.start()
             rf = ResponseFormat(**response_format)
-            compiled_grammar = _compile_grammar_for_request(
+            compiled_grammar = await _compile_grammar_for_request_async(
                 engine, response_format=rf,
                 chat_template_kwargs=merged_ct_kwargs or None,
                 reasoning_parser=reasoning_parser,
