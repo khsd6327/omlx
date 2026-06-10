@@ -322,6 +322,36 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     return raw, dtype_str, shape
 
 
+def _extract_tensors_batch(
+    arrays: dict[str, mx.array],
+) -> dict[str, tuple[bytes, str, list[int]]]:
+    """fork: batched variant of _extract_tensor_bytes.
+
+    One mx.eval for all arrays (plus one for the bf16 uint16 views) instead
+    of 1-2 GPU sync round-trips per tensor — ~80-160 per block on deep
+    models, paid on the store-cache worker while it holds
+    _mx_buffer_access_lock. Semantics identical to looping
+    _extract_tensor_bytes (same race-history rationale: #978/#1040/#1106).
+    """
+    if not arrays:
+        return {}
+    mx.eval(*arrays.values())
+    views: dict[str, mx.array] = {}
+    for name, arr in arrays.items():
+        if arr.dtype == mx.bfloat16:
+            views[name] = arr.view(mx.uint16)
+    if views:
+        mx.eval(*views.values())
+    extracted: dict[str, tuple[bytes, str, list[int]]] = {}
+    for name, arr in arrays.items():
+        dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
+        shape = list(arr.shape)
+        view = views.get(name)
+        raw = bytes(memoryview(view if view is not None else arr))
+        extracted[name] = (raw, dtype_str, shape)
+    return extracted
+
+
 def _restore_tensor_from_bytes(
     raw: bytes, dtype_str: str, shape: list[int]
 ) -> mx.array:
@@ -1226,9 +1256,8 @@ class PagedSSDCacheManager(CacheManager):
     ) -> None:
         """Promote a block loaded from SSD into the hot cache."""
         try:
-            promoted_raw = {}
-            for name, arr in arrays.items():
-                promoted_raw[name] = _extract_tensor_bytes(arr)
+            # fork: batched extraction (one eval, not per tensor).
+            promoted_raw = _extract_tensors_batch(arrays)
             entry = {
                 "tensors_raw": promoted_raw,
                 "file_metadata": (
@@ -1796,16 +1825,15 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
-            # Last-mile materialization happens in _extract_tensor_bytes.
+            # Last-mile materialization happens in _extract_tensors_batch.
             # scheduler._cleanup_finished still pre-dispatches real KV arrays,
             # but store_cache creates additional lazy slices, clones, and
             # placeholders here after that collection step. Evaluate those
             # derived arrays before memoryview() so the buffer protocol never
             # becomes the first MLX eval site on the store-cache worker thread.
             # Race history: #978/#1040/#1106/#1437/#1558.
-            tensors_raw = {}
-            for name, arr in arrays.items():
-                tensors_raw[name] = _extract_tensor_bytes(arr)
+            # fork: batched (one eval for the whole block, not per tensor).
+            tensors_raw = _extract_tensors_batch(arrays)
 
             # Estimate file size: raw tensor bytes + safetensors header.
             # The header is JSON-encoded per tensor (name + dtype + shape +

@@ -8,7 +8,9 @@ with SSD persistence. oMLX only supports paged SSD-based caching.
 
 import logging
 import math
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -42,6 +44,12 @@ class BlockCacheEntry:
 
     block_table: BlockTable
     last_access: float
+
+
+# fork: cap on _prefix_index entries (each stores a block-id tuple, so the
+# unbounded dict grew quadratically with stored sequence length and was
+# never evicted).
+_PREFIX_INDEX_MAX_ENTRIES = 4096
 
 
 class BlockAwarePrefixCache(CacheManager):
@@ -102,7 +110,14 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Hash table for quick prefix lookup
         # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
-        self._prefix_index: dict[bytes, tuple[int, tuple[int, ...], int]] = {}
+        # fork: bounded LRU (entries were never evicted — B(B+1)/2 ints per
+        # stored sequence, a steady metadata leak on a 24/7 server) and
+        # guarded by a lock (fetch runs on the MLX executor thread, store on
+        # the async-store thread).
+        self._prefix_index: OrderedDict[bytes, tuple[int, tuple[int, ...], int]] = (
+            OrderedDict()
+        )
+        self._prefix_index_lock = threading.Lock()
 
         # Request to block table mapping
         self._request_tables: dict[str, BlockCacheEntry] = {}
@@ -292,11 +307,17 @@ class BlockAwarePrefixCache(CacheManager):
 
             for block_id in shared_block_ids:
                 # Increment ref count for sharing
-                self.paged_cache.increment_ref(block_id)
-                block = self.paged_cache.allocated_blocks.get(block_id)
-                if block:
-                    block_table.block_ids.append(block_id)
-                    block_table.num_tokens += block.token_count
+                # fork: a block freed between match and claim must TRUNCATE
+                # the match (stop here), not be skipped — skipping left a
+                # hole mid-table that reconstruct_cache concatenated around.
+                block = None
+                if self.paged_cache.increment_ref(block_id):
+                    block = self.paged_cache.allocated_blocks.get(block_id)
+                if block is None:
+                    remaining = tokens[block_table.num_tokens :]
+                    break
+                block_table.block_ids.append(block_id)
+                block_table.num_tokens += block.token_count
 
             num_prefix_tokens = len(tokens) - len(remaining)
             self._hits += 1
@@ -319,20 +340,27 @@ class BlockAwarePrefixCache(CacheManager):
             # Fork the matched blocks
             block_table = self.paged_cache.create_block_table(request_id)
             for block_id in matched_block_ids[:num_blocks]:
-                self.paged_cache.increment_ref(block_id)
-                block = self.paged_cache.allocated_blocks.get(block_id)
-                if block:
-                    block_table.block_ids.append(block_id)
-                    block_table.num_tokens += block.token_count
+                # fork: truncate (don't skip) on a block freed between match
+                # and claim — see the path-1 loop above.
+                block = None
+                if self.paged_cache.increment_ref(block_id):
+                    block = self.paged_cache.allocated_blocks.get(block_id)
+                if block is None:
+                    break
+                block_table.block_ids.append(block_id)
+                block_table.num_tokens += block.token_count
 
-            remaining = tokens[prefix_len:]
+            # fork: derive matched length from the blocks actually claimed.
+            matched_tokens = block_table.num_tokens
+            remaining = tokens[matched_tokens:]
             self._hits += 1
-            self._tokens_saved += prefix_len
-            self._tokens_matched_total += prefix_len
+            self._tokens_saved += matched_tokens
+            self._tokens_matched_total += matched_tokens
             self._tokens_requested_total += len(tokens)
 
             logger.debug(
-                f"Prefix index hit for {request_id}: " f"{prefix_len} tokens matched"
+                f"Prefix index hit for {request_id}: "
+                f"{matched_tokens} tokens matched"
             )
 
             return block_table, remaining
@@ -2375,6 +2403,9 @@ class BlockAwarePrefixCache(CacheManager):
         parent_hash = b""
         prefix_len = 0
         num_blocks = 0
+        # fork: chain hashes per position, used to validate candidate
+        # entries against the blocks' current content (see below).
+        chain_hashes: list[bytes] = []
 
         for start in range(0, len(tokens), self.block_size):
             end = min(start + self.block_size, len(tokens))
@@ -2390,13 +2421,49 @@ class BlockAwarePrefixCache(CacheManager):
             )
             prefix_len += len(block_tokens)
             num_blocks += 1
+            chain_hashes.append(parent_hash)
 
-            entry = self._prefix_index.get(parent_hash)
+            with self._prefix_index_lock:
+                entry = self._prefix_index.get(parent_hash)
+                if entry is not None:
+                    self._prefix_index.move_to_end(parent_hash)
             if entry and entry[0] == prefix_len and prefix_len > best_len:
-                best_match = entry
-                best_len = prefix_len
+                # fork: stored block ids were never invalidated when blocks
+                # got freed and reallocated to NEW content — and this path
+                # fires exactly when find_shared_prefix missed, i.e. when
+                # eviction is likely. Without validation a request could
+                # silently decode against another prompt's KV. Verify every
+                # block still exists and its block_hash matches the expected
+                # chain hash for its position; drop stale entries.
+                if self._validate_prefix_index_entry(
+                    parent_hash, entry, chain_hashes
+                ):
+                    best_match = entry
+                    best_len = prefix_len
 
         return best_match
+
+    def _validate_prefix_index_entry(
+        self,
+        key: bytes,
+        entry: tuple[int, tuple[int, ...], int],
+        chain_hashes: list[bytes],
+    ) -> bool:
+        """fork: check a _prefix_index entry against live block metadata."""
+        _, block_ids, num_blocks = entry
+        valid = num_blocks <= len(chain_hashes) and num_blocks <= len(block_ids)
+        if valid:
+            allocated = self.paged_cache.allocated_blocks
+            for pos in range(num_blocks):
+                block = allocated.get(block_ids[pos])
+                if block is None or block.block_hash != chain_hashes[pos]:
+                    valid = False
+                    break
+        if not valid:
+            with self._prefix_index_lock:
+                self._prefix_index.pop(key, None)
+            logger.debug("Dropped stale prefix-index entry (recycled blocks)")
+        return valid
 
     def _update_prefix_index(
         self,
@@ -2430,11 +2497,16 @@ class BlockAwarePrefixCache(CacheManager):
 
             parent_hash = block_hash
             prefix_len += len(block_tokens)
-            self._prefix_index[block_hash] = (
-                prefix_len,
-                tuple(block_ids[: i + 1]),
-                i + 1,
-            )
+            # fork: bounded LRU insert (see __init__).
+            with self._prefix_index_lock:
+                self._prefix_index[block_hash] = (
+                    prefix_len,
+                    tuple(block_ids[: i + 1]),
+                    i + 1,
+                )
+                self._prefix_index.move_to_end(block_hash)
+                while len(self._prefix_index) > _PREFIX_INDEX_MAX_ENTRIES:
+                    self._prefix_index.popitem(last=False)
 
     def get_stats(self) -> PrefixCacheStats:
         """
@@ -2509,7 +2581,8 @@ class BlockAwarePrefixCache(CacheManager):
         """
         cleared_count = len(self._request_tables) + len(self._prefix_index)
         self._request_tables.clear()
-        self._prefix_index.clear()
+        with self._prefix_index_lock:
+            self._prefix_index.clear()
         self.paged_cache.clear()
         self.reset_stats()
         return cleared_count

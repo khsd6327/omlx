@@ -549,17 +549,60 @@ class TestPrefixIndexOperations:
     def test_find_best_prefix_match_with_match(self, prefix_cache, paged_cache):
         """Test _find_best_prefix_match finding a matching prefix."""
         tokens = [1, 2, 3, 4]
-        block_ids = [1, 2]
 
-        # Manually add to prefix index
+        # fork: matches must now be backed by live blocks whose block_hash
+        # equals the position's chain hash; set up a real block.
+        block = paged_cache.allocate_block()
         block_hash = compute_block_hash(b"", tokens, model_name=paged_cache.model_name)
-        prefix_cache._prefix_index[block_hash] = (4, block_ids, 1)
+        block.block_hash = block_hash
+        prefix_cache._prefix_index[block_hash] = (4, (block.block_id,), 1)
 
         result = prefix_cache._find_best_prefix_match(tokens)
 
         assert result is not None
         prefix_len, matched_ids, num_blocks = result
         assert prefix_len == 4
+
+    def test_find_best_prefix_match_rejects_recycled_blocks(
+        self, prefix_cache, paged_cache
+    ):
+        """fork regression: an index entry whose blocks were freed (and
+        possibly recycled to new content) must be dropped, not matched."""
+        tokens = [1, 2, 3, 4]
+        block_hash = compute_block_hash(b"", tokens, model_name=paged_cache.model_name)
+        # Entry references a block id that no longer exists in
+        # allocated_blocks (freed and returned to the pool).
+        prefix_cache._prefix_index[block_hash] = (4, (999,), 1)
+
+        assert prefix_cache._find_best_prefix_match(tokens) is None
+        # The stale entry is pruned on detection.
+        assert block_hash not in prefix_cache._prefix_index
+
+    def test_find_best_prefix_match_rejects_wrong_hash(
+        self, prefix_cache, paged_cache
+    ):
+        """fork regression: a live block whose content hash changed (block
+        recycled to a different prompt) must not match."""
+        tokens = [1, 2, 3, 4]
+        block = paged_cache.allocate_block()
+        block.block_hash = b"different-content"
+        block_hash = compute_block_hash(b"", tokens, model_name=paged_cache.model_name)
+        prefix_cache._prefix_index[block_hash] = (4, (block.block_id,), 1)
+
+        assert prefix_cache._find_best_prefix_match(tokens) is None
+
+    def test_prefix_index_bounded(self, prefix_cache, paged_cache):
+        """fork regression: _prefix_index is a bounded LRU."""
+        from omlx.cache.prefix_cache import _PREFIX_INDEX_MAX_ENTRIES
+
+        blocks = paged_cache.get_new_blocks(2)
+        block_ids = [b.block_id for b in blocks]
+        for i in range(_PREFIX_INDEX_MAX_ENTRIES + 50):
+            # Force a fresh hash per iteration so each insert is a new key.
+            for b in blocks:
+                b.block_hash = None
+            prefix_cache._update_prefix_index([i, i + 1, i + 2, i + 3], block_ids)
+        assert 0 < len(prefix_cache._prefix_index) <= _PREFIX_INDEX_MAX_ENTRIES
 
     def test_prefix_index_immutable_after_store(self, prefix_cache, paged_cache):
         """Test that _prefix_index entries are not affected by later mutations
@@ -2595,3 +2638,43 @@ class TestPerBlockMetaStates:
             f"Last block should use snapshot offset=8, not shared offset=11, "
             f"got {b2_meta[1]}"
         )
+
+
+class TestParkedBlockReclaim:
+    """fork regression: ref-0 'parked' blocks must be reclaimable when the
+    pool is exhausted at max_blocks (previously allocation failed forever)."""
+
+    def _exhausted_manager(self):
+        mgr = PagedCacheManager(
+            block_size=4,
+            max_blocks=8,
+            model_name="test-model",
+            initial_blocks=8,
+        )
+        blocks = mgr.get_new_blocks(7)  # block 0 is the null block
+        # Park all blocks at ref 0, still registered in allocated_blocks
+        # (the production lifecycle for finished requests' cached blocks).
+        mgr.release_for_eviction([b.block_id for b in blocks])
+        assert mgr.free_block_queue.num_free_blocks == 0
+        return mgr
+
+    def test_allocate_block_reclaims_parked(self):
+        mgr = self._exhausted_manager()
+        block = mgr.allocate_block()
+        assert block is not None
+        assert block.ref_count == 1
+
+    def test_get_new_blocks_reclaims_parked(self):
+        mgr = self._exhausted_manager()
+        blocks = mgr.get_new_blocks(4)
+        assert len(blocks) == 4
+
+    def test_allocate_block_still_fails_when_all_referenced(self):
+        mgr = PagedCacheManager(
+            block_size=4,
+            max_blocks=8,
+            model_name="test-model",
+            initial_blocks=8,
+        )
+        mgr.get_new_blocks(7)  # all usable blocks held at ref 1
+        assert mgr.allocate_block() is None

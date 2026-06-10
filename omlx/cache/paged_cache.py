@@ -628,6 +628,41 @@ class PagedCacheManager(CacheManager):
     # Block Allocation (vLLM style)
     # =========================================================================
 
+    def _reclaim_parked_blocks(self, needed: int) -> int:
+        """fork: return ref-0 "parked" cached blocks to the free queue.
+
+        release_for_eviction() parks finished requests' blocks at ref 0 in
+        allocated_blocks (kept findable for prefix reuse) but nothing on the
+        production path ever returns them to the free queue. Once the pool
+        reaches max_blocks, allocation would otherwise fail permanently
+        ("Out of cache blocks" forever — ~25.6M cached tokens at the SSD-mode
+        default). Sweeps LRU-first in batches to amortize. Caller must hold
+        self._lock (RLock).
+
+        Returns the number of blocks returned to the free queue.
+        """
+        candidates = [
+            b
+            for b in self.allocated_blocks.values()
+            if b.ref_count == 0 and not b.is_null
+        ]
+        if not candidates:
+            return 0
+        candidates.sort(key=lambda b: b.last_access)
+        target = max(needed, 64)
+        evicted = 0
+        for block in candidates[:target]:
+            if self.evict_block_permanently(block.block_id):
+                evicted += 1
+        if evicted:
+            logger.info(
+                "Reclaimed %d parked ref-0 cache blocks (pool at %d/%d)",
+                evicted,
+                self._current_allocated_count,
+                self.max_blocks,
+            )
+        return evicted
+
     def allocate_block(self) -> Optional[CacheBlock]:
         """
         Allocate a new cache block.
@@ -639,7 +674,9 @@ class PagedCacheManager(CacheManager):
             if self.free_block_queue.num_free_blocks == 0:
                 # Try to grow the block pool dynamically
                 grown = self._grow_blocks(min(256, self.max_blocks - self._current_allocated_count))
-                if grown == 0:
+                # fork: at max_blocks, sweep parked ref-0 blocks before
+                # giving up (see _reclaim_parked_blocks).
+                if grown == 0 and self._reclaim_parked_blocks(1) == 0:
                     logger.warning("Out of cache blocks (max reached)")
                     return None
 
@@ -676,6 +713,13 @@ class PagedCacheManager(CacheManager):
                 # Try to grow the block pool dynamically
                 needed = num_blocks - self.free_block_queue.num_free_blocks
                 self._grow_blocks(needed + 128)  # Extra buffer for future allocations
+
+            if num_blocks > self.free_block_queue.num_free_blocks:
+                # fork: at max_blocks, sweep parked ref-0 blocks before
+                # failing (see _reclaim_parked_blocks).
+                self._reclaim_parked_blocks(
+                    num_blocks - self.free_block_queue.num_free_blocks + 128
+                )
 
             if num_blocks > self.free_block_queue.num_free_blocks:
                 raise ValueError(
