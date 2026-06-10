@@ -14,6 +14,7 @@ when memory limits are exceeded. It supports:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import logging
 import time
@@ -42,7 +43,7 @@ from .exceptions import (
 )
 from .model_discovery import DiscoveredModel, discover_models, format_size
 from .engine_core import get_mlx_executor
-from .scheduler import SchedulerConfig
+from .scheduler import SchedulerConfig, _sync_and_clear_cache
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
@@ -594,6 +595,79 @@ class EnginePool:
         except AttributeError:
             return None
 
+    @staticmethod
+    def _resolve_core_from_engine(engine: object) -> object | None:
+        """Best-effort resolve the EngineCore (has _mlx_executor + scheduler).
+
+        # fork: reclaim safety -- to clear the Metal buffer cache without
+        # racing another engine's in-flight command buffers we need that
+        # engine's dedicated executor + stream (#1248). The EngineCore holds
+        # both. Returns None for engine flavors that don't wrap an EngineCore
+        # (embedding/reranker/audio).
+        """
+        try:
+            core = engine._engine.engine  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+        if core is None:
+            return None
+        # close() nulls _mlx_executor; treat a torn-down core as unusable.
+        # Require a real Executor: this guards against test doubles (a
+        # MagicMock engine exposes a truthy mock here) and any non-loaded
+        # wrapper, so we cleanly fall back to the global executor instead of
+        # handing run_in_executor a fake.
+        executor = getattr(core, "_mlx_executor", None)
+        if not isinstance(executor, concurrent.futures.Executor):
+            return None
+        return core
+
+    def _find_reclaim_core(self, *, exclude_model_id: str | None = None) -> object | None:
+        """Find a still-loaded engine's EngineCore to host a safe reclaim.
+
+        # fork: returns the EngineCore of some currently-loaded engine (other
+        # than ``exclude_model_id``, which during an unload is already being
+        # torn down) whose per-engine executor + stream are still live. Used to
+        # route _sync_and_clear_cache onto that engine's stream so the reclaim
+        # synchronizes its in-flight command buffers instead of racing them on
+        # the global default stream.
+        """
+        for mid, entry in self._entries.items():
+            if mid == exclude_model_id:
+                continue
+            engine = entry.engine
+            if engine is None:
+                continue
+            core = self._resolve_core_from_engine(engine)
+            if core is not None:
+                return core
+        return None
+
+    async def _reclaim_mlx_cache(
+        self, loop, *, exclude_model_id: str | None = None
+    ) -> None:
+        """Synchronize + clear the Metal buffer cache safely.
+
+        # fork (#300/#888/#1106): never call bare mx.synchronize()/clear_cache()
+        # on the global default stream while another engine has in-flight work
+        # -- that races its command buffers and the async store-cache worker
+        # into M3/M4 Metal panics. Route the reclaim through a still-loaded
+        # engine's dedicated executor + stream when one exists; only fall back
+        # to the global executor (default stream) when no live engine remains,
+        # and even then go through the locked _sync_and_clear_cache helper
+        # rather than bare synchronize+clear_cache.
+        """
+        core = self._find_reclaim_core(exclude_model_id=exclude_model_id)
+        if core is not None:
+            executor = core._mlx_executor
+            stream = getattr(core.scheduler, "_stream", None)
+            await loop.run_in_executor(
+                executor, lambda: _sync_and_clear_cache(stream)
+            )
+            return
+        # No live engine reachable -- pool effectively empty. Safe to use the
+        # global executor / default stream, still via the locked helper.
+        await loop.run_in_executor(get_mlx_executor(), lambda: _sync_and_clear_cache())
+
     def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
         if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
@@ -747,9 +821,9 @@ class EnginePool:
         # still referenced by in-flight command buffers. See issue #300.
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+        # fork: route through a still-loaded engine's stream when one exists;
+        # the engine being unloaded (model_id) is already torn down here.
+        await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
 
         # Memory settle barrier: poll actual freed memory instead of
         # trusting the cumulative _current_model_memory estimate.
@@ -777,9 +851,8 @@ class EnginePool:
             )
             await asyncio.sleep(0.5)
             gc.collect()
-            await loop.run_in_executor(
-                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-            )
+            # fork: safe reclaim via a live engine's stream (model_id torn down).
+            await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
 
         # Release memory tracking AFTER barrier
         self._current_model_memory -= entry.estimated_size
@@ -800,10 +873,8 @@ class EnginePool:
             )
             for _ in range(3):
                 gc.collect()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+                # fork: safe reclaim via a live engine's stream (model_id torn down).
+                await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
                 await asyncio.sleep(1.0)
             active_after = mx.get_active_memory()
             if active_after > self._current_model_memory + 5 * 1024**3:
@@ -994,10 +1065,9 @@ class EnginePool:
                         pass
                     gc.collect()
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        get_mlx_executor(),
-                        lambda: (mx.synchronize(), mx.clear_cache()),
-                    )
+                    # fork: safe reclaim -- the failed engine is stopped; other
+                    # already-loaded engines may still have in-flight work.
+                    await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
 
                     if effective_type == "vlm":
                         engine = VLMBatchedEngine(
@@ -1041,10 +1111,9 @@ class EnginePool:
                         pass
                     gc.collect()
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        get_mlx_executor(),
-                        lambda: (mx.synchronize(), mx.clear_cache()),
-                    )
+                    # fork: safe reclaim -- the failed engine is stopped; other
+                    # already-loaded engines may still have in-flight work.
+                    await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
 
                     engine = VLMBatchedEngine(
                         model_name=entry.model_path,
@@ -1077,10 +1146,9 @@ class EnginePool:
                         pass
                     gc.collect()
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        get_mlx_executor(),
-                        lambda: (mx.synchronize(), mx.clear_cache()),
-                    )
+                    # fork: safe reclaim -- the failed engine is stopped; other
+                    # already-loaded engines may still have in-flight work.
+                    await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
 
                     engine = BatchedEngine(
                         model_name=entry.model_path,
@@ -1114,10 +1182,9 @@ class EnginePool:
                     logger.warning(f"Error stopping aborted engine for {model_id}: {e}")
                 gc.collect()
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
-                )
+                # fork: safe reclaim -- aborted engine is stopped; other
+                # already-loaded engines may still have in-flight work.
+                await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
                 raise ModelLoadingError(
                     f"Model {model_id} load aborted: " f"process memory limit exceeded"
                 )
@@ -1175,10 +1242,10 @@ class EnginePool:
             # Without this, memory stays at ~2x model size until the first
             # inference request triggers a clear. (#429)
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
-            )
+            # fork: the just-loaded engine is now in _entries[model_id]; route
+            # the reclaim through its own stream (no exclude) so it drains the
+            # load temporaries on the stream that produced them.
+            await self._reclaim_mlx_cache(loop)
 
             post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
             observed_delta = max(0, post_load_memory - pre_load_memory)
