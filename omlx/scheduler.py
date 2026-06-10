@@ -5647,6 +5647,12 @@ class Scheduler:
         # Clean up protocol-specific output parser session
         self._cleanup_output_parser_session(request_id)
 
+        # fork: an aborted SpecPrefill request must restore the patched RoPE
+        # and release the exclusivity gate. Without this, the offset RoPE
+        # stays installed (corrupting positions for every later request) and
+        # _schedule_waiting defers all non-specprefill requests forever.
+        self._cleanup_specprefill(request_id)
+
         # Clean up VLM adapter state to prevent contamination
         if hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
@@ -5731,6 +5737,15 @@ class Scheduler:
         Returns:
             List of failed request IDs.
         """
+        # fork: restore SpecPrefill RoPE patches before tearing requests
+        # down. If the active specprefill request is among the failures the
+        # finished-path cleanup never runs, leaving the offset RoPE patched
+        # model-wide and the admission gate wedged (mirrors
+        # _recover_from_generation_overflow_error).
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
         failed_ids: list[str] = []
         for request_id in list(self.running):
             failed_ids.append(request_id)
@@ -6515,7 +6530,27 @@ class Scheduler:
                     self.request_id_to_uid.pop(request.request_id, None)
                     self._release_paged_cache_for_request(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
-                    self._pause_for_prefill_eviction(request, e.request)
+                    # fork: _do_external_prefill advances request.prompt_cache
+                    # in place chunk by chunk. Pausing without a reset lets the
+                    # retry re-prefill the full remaining_tokens into the
+                    # already-advanced cache (duplicate KV / shifted
+                    # positions), with block_table still pointing at the
+                    # blocks released above. Restore the stashed mRoPE deltas
+                    # (the normal post-prefill restore never ran), drop any
+                    # SpecPrefill patch so the retry re-scores cleanly, and
+                    # reset to a clean pre-prefill state.
+                    saved = getattr(request, "_prefill_saved_rope_deltas", None)
+                    if saved is not None:
+                        lm = getattr(self.model, "_language_model", None)
+                        if lm is not None and hasattr(lm, "_rope_deltas"):
+                            lm._rope_deltas = saved
+                        request._prefill_saved_rope_deltas = None
+                    self._cleanup_specprefill(request.request_id)
+                    self._pause_for_prefill_eviction(
+                        request,
+                        e.request,
+                        reset_chunked_state=True,
+                    )
                     break
                 except RuntimeError as e:
                     # Hard memory limit hit during external prefill. Without
@@ -7302,6 +7337,14 @@ class Scheduler:
             self.block_aware_cache.clear()
         self._cache_rate_tracker.clear()
 
+        # fork: restore SpecPrefill RoPE patches; recovery reschedules all
+        # requests for re-prefill, and a stale offset RoPE would corrupt
+        # positions on the retry (mirrors
+        # _recover_from_generation_overflow_error).
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
         # Clear UID mappings
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
@@ -7513,9 +7556,10 @@ class Scheduler:
         self._reclaim_prefill_headroom()
 
         # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly.
-        if self._specprefill_active_request_id == request.request_id:
-            self._specprefill_active_request_id = None
+        # re-scores cleanly. fork: must go through _cleanup_specprefill —
+        # clearing only the id would leave the _OffsetAdjustedRoPE wrappers
+        # installed on every attention layer.
+        self._cleanup_specprefill(request.request_id)
 
         # Restore mRoPE deltas if an external VLM prefill was interrupted before
         # its own restore ran (value stashed on the request in
