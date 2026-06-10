@@ -34,11 +34,7 @@ _CONTEXT_LENGTH_ATTRS = (
 )
 
 # sentence-transformers Pooling boolean keys (in `1_Pooling/config.json`),
-# mapped to the pooling_mode strings consumed by xlm_roberta.ModelArgs. Only
-# "cls" changes behavior in the native XLM-RoBERTa model (CLS-token pooling);
-# every other value falls back to mean pooling there. bge-m3 sets
-# pooling_mode_cls_token=true, so without this resolution its dense vectors are
-# silently mean-pooled and degraded.
+# mapped to the pooling_mode strings consumed by xlm_roberta.ModelArgs.
 _POOLING_MODE_KEY_TO_NAME = (
     ("pooling_mode_cls_token", "cls"),
     ("pooling_mode_mean_tokens", "mean"),

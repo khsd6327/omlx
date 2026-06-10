@@ -18,7 +18,14 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base_model import BaseModelArgs, BaseModelOutput, mean_pooling, normalize_embeddings
+from .base_model import (
+    BaseModelArgs,
+    BaseModelOutput,
+    max_pooling,
+    mean_pooling,
+    mean_sqrt_len_pooling,
+    normalize_embeddings,
+)
 
 
 @dataclass
@@ -473,6 +480,10 @@ class Model(nn.Module):
         pooling_mode = (self.config.pooling_config or {}).get("pooling_mode", "mean")
         if pooling_mode == "cls":
             text_embeds = sequence_output[:, 0]
+        elif pooling_mode == "max":
+            text_embeds = max_pooling(sequence_output, attention_mask)
+        elif pooling_mode in {"mean_sqrt_len", "mean_sqrt_len_tokens"}:
+            text_embeds = mean_sqrt_len_pooling(sequence_output, attention_mask)
         else:
             text_embeds = mean_pooling(sequence_output, attention_mask)
         text_embeds = normalize_embeddings(text_embeds)

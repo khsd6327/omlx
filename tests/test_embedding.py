@@ -152,8 +152,8 @@ class TestEmbeddingModels:
         assert response.model == "all-MiniLM-L6-v2"
 
 
-class TestEmbeddingUtils:
-    """Tests for embedding utility functions."""
+class TestEmbeddingEncoding:
+    """Tests for embedding encoding helpers."""
 
     def test_encode_embedding_base64(self):
         """Test base64 encoding of embeddings."""
@@ -164,6 +164,45 @@ class TestEmbeddingUtils:
         decoded = base64.b64decode(encoded)
         values = struct.unpack(f"<{len(embedding)}f", decoded)
         assert list(values) == embedding
+
+
+class TestEmbeddingUtils:
+    """Tests for embedding utility and pooling helpers."""
+
+    def test_max_and_mean_sqrt_pooling_honor_attention_mask(self):
+        """Pooling helpers should ignore padded tokens."""
+        import mlx.core as mx
+
+        from omlx.models.base_model import max_pooling, mean_sqrt_len_pooling
+
+        hidden = mx.array(
+            [
+                [
+                    [1.0, 2.0],
+                    [3.0, 1.0],
+                    [100.0, 100.0],
+                ]
+            ]
+        )
+        mask = mx.array([[1, 1, 0]])
+
+        maxed = max_pooling(hidden, mask)
+        mean_sqrt = mean_sqrt_len_pooling(hidden, mask)
+
+        assert maxed.tolist() == [[3.0, 2.0]]
+        expected = [[4.0 / math.sqrt(2), 3.0 / math.sqrt(2)]]
+        assert np.allclose(np.array(mean_sqrt), np.array(expected), atol=1e-6)
+
+    def test_normalize_embeddings_clamps_zero_norm(self):
+        """Zero embeddings should normalize without NaN."""
+        import mlx.core as mx
+
+        from omlx.models.base_model import normalize_embeddings
+
+        normalized = normalize_embeddings(mx.array([[0.0, 0.0]]))
+
+        assert np.isfinite(np.array(normalized)).all()
+        assert normalized.tolist() == [[0.0, 0.0]]
 
     def test_encode_embedding_base64_empty(self):
         """Test base64 encoding of empty embedding."""
