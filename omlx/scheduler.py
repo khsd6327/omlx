@@ -1230,6 +1230,9 @@ class Scheduler:
         # Track in-flight store futures per request_id for lookup wait /
         # shutdown wait.
         self._inflight_store_futures: dict[str, concurrent.futures.Future] = {}
+        # fork: count async store-cache submit failures so silent cache-store
+        # loss is observable (bumped where the submit except-handler logs).
+        self._async_store_submit_failures: int = 0
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
@@ -2612,7 +2615,18 @@ class Scheduler:
                 raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
-            _sync_and_clear_cache(self._stream)
+            # fork: the unconditional per-chunk _sync_and_clear_cache was a
+            # double-synchronize + full buffer-pool clear under the global lock
+            # on EVERY chunk, even when the pool is tiny (small prompts / many
+            # short chunks). Gate it on the same accumulated-bytes threshold the
+            # per-step periodic clear uses (_periodic_clear_threshold_bytes) so
+            # small chunks skip the barrier. Metal-OOM safety is preserved: the
+            # pre-chunk guards (_adaptive_chunk_size / _guard_prefill_chunk) and
+            # the _memory_limit_bytes check above already reclaim under pressure,
+            # we still clear the moment the pool crosses the threshold, and the
+            # post-loop _sync_and_clear_cache below always clears at prefill end.
+            if mx.get_cache_memory() > self._periodic_clear_threshold_bytes():
+                _sync_and_clear_cache(self._stream)
 
         # Emit final boundary snapshot if prompt lands exactly on boundary.
         if boundary_enabled:
@@ -5579,8 +5593,23 @@ class Scheduler:
                 r for r in self.prefilling if r.request_id != request_id
             )
 
+        # fork: a same-step abort must NOT tear down the batch/uid maps while an
+        # async store_cache worker is still slicing this request's KV buffers
+        # under _mx_buffer_access_lock. _cleanup_finished defers the
+        # batch_generator.remove + uid-map deletion to _drain_pending_async_removes
+        # (which runs AFTER _process_pending_aborts in step()). If we removed the
+        # uid here we'd race the worker (Metal 'prepare count underflow') and the
+        # later drain would double-free / leak the store gate. So when this
+        # request has an in-flight store future (or is already queued for a
+        # deferred remove), skip the teardown below and let the drain finalize it.
+        has_inflight_store = (
+            request.request_id in self._inflight_store_futures
+            or any(
+                rid == request.request_id for _uid, rid, _f in self._pending_async_removes
+            )
+        )
         # Remove from running (BatchGenerator)
-        if request.request_id in self.request_id_to_uid:
+        if request.request_id in self.request_id_to_uid and not has_inflight_store:
             uid = self.request_id_to_uid[request.request_id]
             # Synchronize in-flight GPU work before modifying batch state.
             # batch_generator.remove() triggers lazy KV cache array slicing
@@ -5597,24 +5626,30 @@ class Scheduler:
         if request_id in self.running:
             del self.running[request_id]
 
-        # Release blocks for eviction (same as _cleanup_finished)
-        if self.paged_cache_manager is not None:
-            block_table = self.paged_cache_manager.get_block_table(request_id)
-            if block_table is None and hasattr(request, "block_table"):
-                block_table = request.block_table
-            if block_table:
-                released = self.paged_cache_manager.release_for_eviction(
-                    block_table.block_ids
-                )
-                if released > 0:
-                    logger.debug(
-                        f"Released {released} blocks for eviction on abort "
-                        f"(request {request_id})"
+        # fork: when an async store_cache future is in flight, the deferred
+        # _drain_pending_async_removes path is the single owner of block
+        # release, boundary-snapshot rmtree, and the self.requests pop (it must
+        # keep _extracted_cache / blocks alive until the worker finishes). Skip
+        # those teardown steps here and let the drain finalize them.
+        if not has_inflight_store:
+            # Release blocks for eviction (same as _cleanup_finished)
+            if self.paged_cache_manager is not None:
+                block_table = self.paged_cache_manager.get_block_table(request_id)
+                if block_table is None and hasattr(request, "block_table"):
+                    block_table = request.block_table
+                if block_table:
+                    released = self.paged_cache_manager.release_for_eviction(
+                        block_table.block_ids
                     )
+                    if released > 0:
+                        logger.debug(
+                            f"Released {released} blocks for eviction on abort "
+                            f"(request {request_id})"
+                        )
 
-        # Clear request entry from block_aware_cache
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear_request_entry(request_id)
+            # Clear request entry from block_aware_cache
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.clear_request_entry(request_id)
 
         # Clean up streaming detokenizer to prevent state contamination
         self._cleanup_detokenizer(request_id)
@@ -5628,9 +5663,12 @@ class Scheduler:
         if hasattr(self.model, "clear_pending_embeddings"):
             self.model.clear_pending_embeddings()
 
-        # Drop any boundary snapshot for this request.
+        # Drop any boundary snapshot for this request. The in-memory dict pop is
+        # always safe; the on-disk rmtree races the worker's load() calls, so
+        # fork: defer cleanup_request to _drain_pending_async_removes when a
+        # store future is in flight (mirrors _cleanup_finished).
         self._boundary_cache_snapshots.pop(request_id, None)
-        if self._boundary_snapshot_store is not None:
+        if self._boundary_snapshot_store is not None and not has_inflight_store:
             self._boundary_snapshot_store.cleanup_request(request_id)
 
         # Remove from prefill progress tracker.
@@ -5644,10 +5682,16 @@ class Scheduler:
         # MLX arrays promptly (mirrors _cleanup_finished behavior).
         # _cleanup_request (engine_core) no longer calls remove_finished_request,
         # so this is the single cleanup point for aborted requests.
-        req_to_remove = self.requests.pop(request_id, None)
-        if req_to_remove is not None:
-            req_to_remove._extracted_cache = None
-            req_to_remove.prompt_cache = None
+        # fork: but if an async store_cache worker is still reading this
+        # request's KV buffers, popping it (and nulling _extracted_cache /
+        # prompt_cache) would free buffers mid-slice. Leave the request in
+        # self.requests so reachability keeps the buffers alive; the matching
+        # _pending_async_removes entry finalizes the pop + gate note_done.
+        if not has_inflight_store:
+            req_to_remove = self.requests.pop(request_id, None)
+            if req_to_remove is not None:
+                req_to_remove._extracted_cache = None
+                req_to_remove.prompt_cache = None
 
         logger.debug(f"Aborted request {request_id}")
         return True
@@ -6750,12 +6794,26 @@ class Scheduler:
             ):
                 response.logprobs = None
 
-            # Create output
+            # fork: avoid O(N^2) per-decode copy of the whole cumulative token
+            # list. `list(request.output_token_ids)` was rebuilt on EVERY token
+            # for EVERY running request, so a single generation copied the
+            # growing list len(output)*(len(output)+1)/2 times. The only
+            # consumers of RequestOutput.output_token_ids read it on the FINAL
+            # (finished) output (server streaming uses new_text / new_token_ids;
+            # _merge_outputs always takes the latest `new.output_token_ids`, and
+            # the finished output is the last one produced for a request). So
+            # only materialize the full cumulative list when finished (or when
+            # full ids are explicitly requested); pass an empty list otherwise.
+            wants_full_ids = is_finished or bool(
+                getattr(request.sampling_params, "include_output_token_ids", False)
+            )
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
                 new_text=new_text,
-                output_token_ids=list(request.output_token_ids),
+                output_token_ids=(
+                    list(request.output_token_ids) if wants_full_ids else []
+                ),
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 cached_tokens=request.cached_tokens,
@@ -7085,8 +7143,16 @@ class Scheduler:
                                 f"{len(request.output_token_ids)} output)"
                             )
                         except Exception as e:
-                            logger.debug(
-                                f"Failed to submit async store for {request_id}: {e}"
+                            # fork: a failed store submit silently drops the
+                            # request's KV cache (cache-store loss). Surface at
+                            # warning + bump a counter so it is observable.
+                            self._async_store_submit_failures += 1
+                            logger.warning(
+                                "Failed to submit async store for %s: %s "
+                                "(total submit failures=%d)",
+                                request_id,
+                                e,
+                                self._async_store_submit_failures,
                             )
                     else:
                         # No extracted_cache to store, but ensure block leak guard.
@@ -7807,6 +7873,37 @@ class Scheduler:
         # Drain any pending deferred aborts
         self._pending_abort_ids.clear()
 
+        # fork: drain in-flight async store_cache futures BEFORE aborting, the
+        # same way shutdown() does. Two reasons: (1) _do_abort_request now skips
+        # teardown for requests with an in-flight store future (FIX 1), so
+        # without a drain those requests would never be finalized and the bare
+        # _pending_async_removes.clear() below would leak the store gate counter
+        # (no note_done) and drop Request refs while the worker still slices
+        # their KV buffers; (2) draining + _drain_pending_async_removes runs the
+        # Metal-safe deferred remove and note_done for each entry. After this,
+        # _pending_async_removes / _inflight_store_futures are empty and the
+        # abort loop takes the normal (non-deferred) path.
+        if self._inflight_store_futures:
+            inflight = list(self._inflight_store_futures.values())
+            logger.info(
+                "reset(): waiting for %d inflight async store_cache future(s)...",
+                len(inflight),
+            )
+            _done, not_done = concurrent.futures.wait(
+                inflight, timeout=FATAL_TEARDOWN_TIMEOUT_S
+            )
+            if not_done:
+                logger.warning(
+                    "reset(): %d async store_cache future(s) did not finish "
+                    "within %.0fs; finalizing remaining drain entries anyway",
+                    len(not_done),
+                    FATAL_TEARDOWN_TIMEOUT_S,
+                )
+        # Run the deferred-remove finalizer so each pending entry gets its
+        # Metal-safe batch_generator.remove + uid-map cleanup + gate note_done.
+        if self._pending_async_removes:
+            self._drain_pending_async_removes()
+
         # Abort all requests directly (reset is synchronous)
         for request_id in list(self.requests.keys()):
             self._do_abort_request(request_id)
@@ -7823,6 +7920,12 @@ class Scheduler:
         # Async store_cache bookkeeping. shutdown() drains these before us,
         # but clear here too so reset() is safe to call standalone (e.g. tests
         # or recovery paths) without leaking Request refs through stale futures.
+        # fork: account for any straggler entries the drain above couldn't
+        # finalize (a future that timed out) so the bare clear() doesn't leak
+        # the store gate counter (which would wedge admission backpressure).
+        if self._pending_async_removes and self._store_cache_gate is not None:
+            for _uid, _rid, _future in self._pending_async_removes:
+                self._store_cache_gate.note_done()
         self._pending_async_removes.clear()
         self._inflight_store_futures.clear()
         self.batch_generator = None
