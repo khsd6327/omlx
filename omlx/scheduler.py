@@ -61,25 +61,6 @@ from .utils.tokenizer import create_streaming_detokenizer
 _default_generation_stream = generation_stream
 
 
-def _apply_suppress_token_ids(logits: Any, suppress_token_ids: tuple[int, ...]) -> Any:
-    if suppress_token_ids:
-        logits[..., list(suppress_token_ids)] = mx.array(float("-inf"))
-    return logits
-
-
-def _make_suppress_logits_processor(
-    suppress_token_ids: set[int],
-) -> Callable[[Any, Any], Any] | None:
-    suppress_tuple = tuple(sorted(int(t) for t in suppress_token_ids))
-    if not suppress_tuple:
-        return None
-
-    def _suppress_logits(tokens: Any, logits: Any) -> Any:
-        return _apply_suppress_token_ids(logits, suppress_tuple)
-
-    return _suppress_logits
-
-
 def _make_suppressing_sampler(
     sampler: Callable[[Any], Any],
     suppress_token_ids: set[int],
@@ -88,8 +69,13 @@ def _make_suppressing_sampler(
     if not suppress_tuple:
         return sampler
 
+    # fork: hoist the index list and -inf scalar out of the per-token call.
+    suppress_list = list(suppress_tuple)
+    neg_inf = mx.array(float("-inf"))
+
     def _sample(logits: Any) -> Any:
-        return sampler(_apply_suppress_token_ids(logits, suppress_tuple))
+        logits[..., suppress_list] = neg_inf
+        return sampler(logits)
 
     return _sample
 
@@ -159,6 +145,15 @@ class _VLMMTPResponse:
 # inference thread concurrently issues a reclaim-triggering mx op.
 # See: https://github.com/jundot/omlx/issues/1106
 _mx_buffer_access_lock = threading.RLock()
+
+# fork: install the lock at the actual mx-buffer access site (per-block
+# tensor extraction in the SSD save path) so the store worker no longer has
+# to hold it across an entire multi-GB store_cache call — which froze
+# step()'s _sync_and_clear_cache (and thus ALL decode) for seconds after
+# every long-context completion.
+from .cache import paged_ssd_cache as _paged_ssd_cache_mod  # noqa: E402
+
+_paged_ssd_cache_mod.set_mx_buffer_access_lock(_mx_buffer_access_lock)
 
 
 def _sync_and_clear_cache(stream=None):
@@ -1241,6 +1236,9 @@ class Scheduler:
         # BatchGenerator - the actual batching engine
         self.batch_generator: BatchGenerator | None = None
         self._current_sampler_params: tuple | None = None
+        # fork: sampling-param key of the fallback sampler baked into the
+        # current batch_generator (see _sampler_for_insert).
+        self._fallback_sampler_key: tuple | None = None
         # Boundary cache snapshots for stateful non-sliceable caches (e.g., ArraysCache).
         # request_id -> {token_count -> snapshot_cache_or_None}
         # Multiple snapshots per request to support per-block ArraysCache state storage.
@@ -1349,6 +1347,10 @@ class Scheduler:
         self._request_detokenizers: dict[str, Any] = (
             {}
         )  # request_id → active detokenizer
+        # fork: per-scheduler template; per-request instances are shallow
+        # copies + reset() to skip the O(vocab) tokenmap rebuild (see
+        # _get_detokenizer).
+        self._detokenizer_template: Any = None
 
         # Protocol-specific output parser support (e.g. Harmony, Gemma 4)
         self._output_parser_factory: OutputParserFactory | None = None
@@ -1560,25 +1562,25 @@ class Scheduler:
         threading.RLock so concurrent access from main and worker is safe.
         """
         try:
-            # Hold _mx_buffer_access_lock across the worker's mx-buffer
-            # access. store_cache eventually drives _extract_tensor_bytes,
-            # which reads raw bytes via the buffer protocol; serializing
-            # against inference-thread mx.clear_cache / mx.synchronize calls
-            # prevents a SIGABRT when those reclaim the underlying Metal
-            # buffer pool mid-read (#1106).
-            with _mx_buffer_access_lock:
-                with self._phase_timer("store_cache_worker_sync"):
-                    _safe_sync_stream(self._stream)
-                block_table = self.block_aware_cache.store_cache(
-                    request_id,
-                    token_sequence_to_store,
-                    cache_to_store,
-                    model_cache_config=model_cache_config,
-                    boundary_snapshots=intermediate_snapshots,
-                    extra_keys=extra_keys,
-                    extra_key_token_start=extra_key_token_start,
-                    extra_key_ranges=extra_key_ranges,
-                )
+            # fork: _mx_buffer_access_lock is no longer held across the
+            # whole store. The #1106 invariant (no buffer-protocol read /
+            # bf16 view+eval concurrent with mx.clear_cache) is enforced at
+            # the per-block extraction site inside paged_ssd_cache
+            # (_extract_tensors_batch via set_mx_buffer_access_lock), so a
+            # deferred clear in step() can interleave between blocks instead
+            # of blocking all decode for the duration of a multi-GB store.
+            with self._phase_timer("store_cache_worker_sync"):
+                _safe_sync_stream(self._stream)
+            block_table = self.block_aware_cache.store_cache(
+                request_id,
+                token_sequence_to_store,
+                cache_to_store,
+                model_cache_config=model_cache_config,
+                boundary_snapshots=intermediate_snapshots,
+                extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+            )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -1970,16 +1972,29 @@ class Scheduler:
         because internal state (byte buffers) can leak between requests even after
         finalize()/reset(), causing text corruption (e.g., spaces inserted in paths,
         character swaps like 'features' -> 'featurse').
+
+        fork: "fresh instance" no longer means a full construction.
+        SPM/BPEStreamingDetokenizer.__init__ iterates the entire vocab
+        (~150k entries) to build `tokenmap`, and this used to run lazily on
+        the request's FIRST decode token inside _process_batch_responses —
+        stalling that step for the whole batch. tokenmap is immutable after
+        init and reset() rebinds every per-stream mutable attribute (offset,
+        text, tokens, _unflushed), so a shallow copy of a per-scheduler
+        template plus reset() is state-equivalent to a fresh instance while
+        skipping the O(vocab) rebuild.
         """
         if request_id not in self._request_detokenizers:
-            # Always create a fresh detokenizer - no pooling to prevent state contamination
-            detok = create_streaming_detokenizer(
-                self.tokenizer,
-                model_path=self.config.model_name,
-            )
-            if detok is None:
-                # Fallback: return None, we'll use decode([token])
-                return None
+            template = self._detokenizer_template
+            if template is None:
+                template = create_streaming_detokenizer(
+                    self.tokenizer,
+                    model_path=self.config.model_name,
+                )
+                if template is None:
+                    # Fallback: return None, we'll use decode([token])
+                    return None
+                self._detokenizer_template = template
+            detok = copy.copy(template)
             detok.reset()
             self._request_detokenizers[request_id] = detok
         return self._request_detokenizers[request_id]
@@ -2056,11 +2071,14 @@ class Scheduler:
             ),
         )
 
-        suppress_processor = _make_suppress_logits_processor(
-            self._model_suppress_tokens
-        )
-        if suppress_processor is not None:
-            logits_processors.append(suppress_processor)
+        # fork: fold suppress_tokens into the sampler instead of a logits
+        # processor. A suppress processor made any(logits_processors) true
+        # for EVERY row, forcing mlx-lm's per-row Python loop (plus growing
+        # token-history materialization the suppressor never reads) on every
+        # token of every request for the whole model family (Gemma 4).
+        # Suppression is token-history-independent, so sampler-side is
+        # equivalent (same approach as the vlm_mtp path).
+        sampler = _make_suppressing_sampler(sampler, self._model_suppress_tokens)
 
         # Convert stop tokens from Set[int] to Sequence[Sequence[int]]
         # for the new BatchGenerator API (each stop token is a sequence).
@@ -2080,6 +2098,12 @@ class Scheduler:
             prefill_step_size=self.config.prefill_step_size,
             stream=self._stream,
         )
+
+        # fork: remember which sampling params the fallback sampler encodes.
+        # Requests whose params match can pass samplers=[None] at insert so
+        # mlx-lm's GenerationBatch._step takes the single batched
+        # fallback_sampler path (see _sampler_for_insert).
+        self._fallback_sampler_key = self._sampler_param_key(sampling_params)
 
         return bg
 
@@ -3322,7 +3346,9 @@ class Scheduler:
             max_tokens=[request.sampling_params.max_tokens],
             caches=[state.cache] if state.cache else None,
             all_tokens=[_batch_generator_all_tokens(request)],
-            samplers=[state.sampler],
+            # fork: None when params match the fallback sampler (batched
+            # sampling fast path; see _sampler_for_insert).
+            samplers=[self._sampler_for_insert(request, state.sampler)],
             logits_processors=[per_row_lps],
             state_machines=[state.sm],
         )
@@ -3570,11 +3596,11 @@ class Scheduler:
             ),
         )
 
-        suppress_processor = _make_suppress_logits_processor(
-            self._model_suppress_tokens
-        )
-        if suppress_processor is not None:
-            logits_processors.append(suppress_processor)
+        # fork: suppress_tokens folded into the sampler (see
+        # _create_batch_generator). Both the fallback and per-request
+        # samplers get the identical wrapper, so the batched-sampling fast
+        # path (_sampler_for_insert) stays sound for suppress-token models.
+        sampler = _make_suppressing_sampler(sampler, self._model_suppress_tokens)
 
         # Add thinking budget processor for reasoning models
         if (
@@ -3886,6 +3912,45 @@ class Scheduler:
                 return False
 
         return True
+
+    @staticmethod
+    def _sampler_param_key(sampling_params: SamplingParams) -> tuple:
+        """fork: hashable key over every input of omlx_make_sampler.
+
+        xtc_special_tokens is scheduler-constant, so two requests with equal
+        keys get behaviorally identical samplers.
+        """
+        return (
+            sampling_params.temperature,
+            sampling_params.top_p,
+            sampling_params.min_p,
+            sampling_params.top_k,
+            sampling_params.xtc_probability,
+            sampling_params.xtc_threshold,
+        )
+
+    def _sampler_for_insert(self, request: "Request", sampler: Callable | None):
+        """fork: batched-sampling fast path.
+
+        When this request's sampling params match the BatchGenerator's
+        fallback sampler, pass None so mlx-lm's GenerationBatch._step keeps
+        the single batched fallback_sampler(logprobs) call instead of a
+        per-row Python loop with one kernel dispatch per request per token.
+        A per-request seed keeps the per-row sampler (best-effort OpenAI
+        seed semantics depend on the row-local RNG draw order).
+        """
+        if sampler is None:
+            return None
+        if request.sampling_params.seed is not None:
+            return sampler
+        if (
+            self.batch_generator is not None
+            and self._fallback_sampler_key is not None
+            and self._sampler_param_key(request.sampling_params)
+            == self._fallback_sampler_key
+        ):
+            return None
+        return sampler
 
     def _ensure_batch_generator(self, sampling_params: SamplingParams) -> None:
         """Ensure BatchGenerator exists with compatible settings."""
@@ -6665,7 +6730,9 @@ class Scheduler:
                 max_tokens=[request.sampling_params.max_tokens],
                 caches=[cache_to_use] if cache_to_use else None,
                 all_tokens=[_batch_generator_all_tokens(request)],
-                samplers=[sampler],
+                # fork: None when params match the fallback sampler (batched
+                # sampling fast path; see _sampler_for_insert).
+                samplers=[self._sampler_for_insert(request, sampler)],
                 logits_processors=[per_row_lps],
                 state_machines=[sm],
             )

@@ -291,6 +291,29 @@ _ST_DTYPE_TO_NP = {
 }
 
 
+# fork: optional lock serializing mx-buffer access (view+eval and
+# buffer-protocol reads) against buffer-pool clears. The scheduler injects
+# its module-level _mx_buffer_access_lock at import time. Previously the
+# async store-cache worker held that lock across the ENTIRE multi-block
+# store (seconds for long contexts), so any step() needing
+# _sync_and_clear_cache froze token generation for all running requests
+# until the store finished. Holding it only around the per-block extraction
+# preserves the #1106 invariant (no buffer-protocol read concurrent with
+# mx.clear_cache) while letting clears interleave between blocks.
+_mx_buffer_access_lock: Any = None
+
+
+def set_mx_buffer_access_lock(lock: Any) -> None:
+    """Install the lock used to serialize tensor-byte extraction."""
+    global _mx_buffer_access_lock
+    _mx_buffer_access_lock = lock
+
+
+def _buffer_access_guard():
+    lock = _mx_buffer_access_lock
+    return lock if lock is not None else contextlib.nullcontext()
+
+
 def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     """Extract raw bytes from an mx.array.
 
@@ -310,16 +333,18 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     Returns:
         Tuple of (raw_bytes, safetensors_dtype_string, shape_list).
     """
-    mx.eval(arr)
-    dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
-    shape = list(arr.shape)
-    if arr.dtype == mx.bfloat16:
-        u16 = arr.view(mx.uint16)
-        mx.eval(u16)
-        raw = bytes(memoryview(u16))
-    else:
-        raw = bytes(memoryview(arr))
-    return raw, dtype_str, shape
+    # fork: guarded per-call so callers no longer wrap whole stores.
+    with _buffer_access_guard():
+        mx.eval(arr)
+        dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
+        shape = list(arr.shape)
+        if arr.dtype == mx.bfloat16:
+            u16 = arr.view(mx.uint16)
+            mx.eval(u16)
+            raw = bytes(memoryview(u16))
+        else:
+            raw = bytes(memoryview(arr))
+        return raw, dtype_str, shape
 
 
 def _extract_tensors_batch(
@@ -335,21 +360,24 @@ def _extract_tensors_batch(
     """
     if not arrays:
         return {}
-    mx.eval(*arrays.values())
-    views: dict[str, mx.array] = {}
-    for name, arr in arrays.items():
-        if arr.dtype == mx.bfloat16:
-            views[name] = arr.view(mx.uint16)
-    if views:
-        mx.eval(*views.values())
-    extracted: dict[str, tuple[bytes, str, list[int]]] = {}
-    for name, arr in arrays.items():
-        dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
-        shape = list(arr.shape)
-        view = views.get(name)
-        raw = bytes(memoryview(view if view is not None else arr))
-        extracted[name] = (raw, dtype_str, shape)
-    return extracted
+    # fork: the lock is held per BLOCK (one batch), not per store — clears
+    # can interleave between blocks of a long-context store.
+    with _buffer_access_guard():
+        mx.eval(*arrays.values())
+        views: dict[str, mx.array] = {}
+        for name, arr in arrays.items():
+            if arr.dtype == mx.bfloat16:
+                views[name] = arr.view(mx.uint16)
+        if views:
+            mx.eval(*views.values())
+        extracted: dict[str, tuple[bytes, str, list[int]]] = {}
+        for name, arr in arrays.items():
+            dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
+            shape = list(arr.shape)
+            view = views.get(name)
+            raw = bytes(memoryview(view if view is not None else arr))
+            extracted[name] = (raw, dtype_str, shape)
+        return extracted
 
 
 def _restore_tensor_from_bytes(

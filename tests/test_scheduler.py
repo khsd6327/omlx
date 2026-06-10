@@ -1097,21 +1097,26 @@ class TestSchedulerSuppressTokens:
 
         assert scheduler._model_suppress_tokens == {258883, 258882}
 
-    def test_suppress_logits_processor_masks_configured_ids(
+    def test_suppress_tokens_folded_into_sampler(
         self, mock_model, mock_tokenizer
     ):
+        """fork: suppression is sampler-side so the per-row logits-processor
+        path (and its growing token-history materialization) stays off."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         scheduler._model_suppress_tokens = {2}
 
-        _, processors = scheduler._build_sampler_and_processors(SamplingParams())
+        sampler, processors = scheduler._build_sampler_and_processors(
+            SamplingParams(temperature=0.0)
+        )
 
-        assert processors
+        # No suppress logits processor any more.
+        assert processors == []
+
+        # Greedy argmax would pick id 2 (100.0) without suppression.
         logits = mx.array([[0.0, 4.0, 100.0, 2.0]])
-        masked = processors[-1](mx.array([1]), logits)
-        mx.eval(masked)
-
-        assert float(masked[0, 2].item()) == float("-inf")
-        assert float(masked[0, 1].item()) == 4.0
+        token = sampler(logits)
+        mx.eval(token)
+        assert int(token.item()) == 1
 
     def test_vlm_mtp_first_bonus_uses_suppressing_sampler(
         self, mock_model, mock_tokenizer
@@ -3407,3 +3412,38 @@ class TestTurboQuantMLAGuard:
         assert scheduler._model_uses_mla() is False
         assert scheduler._model_uses_mla() is False
         assert calls["n"] == 1  # walked once, then cached
+
+
+class TestDetokenizerTemplate:
+    """fork regression: per-request detokenizers are shallow copies of a
+    per-scheduler template (skips the O(vocab) tokenmap rebuild) with
+    independent per-stream state."""
+
+    def test_template_built_once_and_copied(self, mock_model, mock_tokenizer):
+        from unittest.mock import patch
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        class FakeDetok:
+            def __init__(self):
+                self.tokenmap = ["a", "b"]
+
+            def reset(self):
+                self.tokens = []
+                self.text = ""
+
+        template = FakeDetok()
+        with patch(
+            "omlx.scheduler.create_streaming_detokenizer", return_value=template
+        ) as factory:
+            d1 = scheduler._get_detokenizer("r1")
+            d2 = scheduler._get_detokenizer("r2")
+
+        assert factory.call_count == 1  # O(vocab) build happens once
+        assert d1 is not template and d2 is not template
+        assert d1 is not d2
+        # Immutable tokenmap is shared; per-stream state is independent.
+        assert d1.tokenmap is d2.tokenmap
+        d1.tokens.append(7)
+        d1.text = "x"
+        assert d2.tokens == [] and d2.text == ""
