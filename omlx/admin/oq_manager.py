@@ -317,21 +317,26 @@ class OQManager:
         # the duration), and the streaming path calls bare mx.eval /
         # mx.clear_cache from a non-executor thread — both race in-flight
         # Metal command buffers of serving models (#300/#888/#1106 class).
-        # Refuse while any model is loaded, and refuse when the job's own
-        # memory estimate exceeds what is currently available.
+        # Refuse while any model is loaded or loading, and refuse when the
+        # job's own memory estimate exceeds what is currently available.
         pool = self._engine_pool_getter() if self._engine_pool_getter else None
         if pool is not None:
             try:
-                loaded = pool.get_loaded_model_ids()
+                busy_getter = getattr(pool, "get_loaded_or_loading_model_ids", None)
+                if callable(busy_getter):
+                    busy = busy_getter()
+                else:
+                    busy = pool.get_loaded_model_ids()
             except Exception:  # noqa: BLE001 - gate must never crash start
-                loaded = []
-            if loaded:
+                busy = []
+            if busy:
                 raise ValueError(
-                    "Cannot start quantization while models are loaded "
-                    f"({', '.join(sorted(loaded))}). In-process quantization "
-                    "patches global MLX evaluation and performs "
+                    "Cannot start quantization while models are loaded or "
+                    f"loading ({', '.join(sorted(busy))}). In-process "
+                    "quantization patches global MLX evaluation and performs "
                     "unsynchronized cache clears that corrupt concurrent "
-                    "inference. Unload all models first (Models tab)."
+                    "inference. Unload all models first and wait for any "
+                    "in-progress loads to finish (Models tab)."
                 )
         try:
             import psutil

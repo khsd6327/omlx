@@ -324,6 +324,14 @@ class EnginePool:
         """Get list of currently loaded model IDs."""
         return [mid for mid, e in self._entries.items() if e.engine is not None]
 
+    def get_loaded_or_loading_model_ids(self) -> list[str]:
+        """Get model IDs that are loaded or currently loading."""
+        return [
+            mid
+            for mid, e in self._entries.items()
+            if e.engine is not None or e.is_loading
+        ]
+
     def get_entry(self, model_id: str) -> EngineEntry | None:
         """Get entry for a specific model, or None if not found."""
         return self._entries.get(model_id)

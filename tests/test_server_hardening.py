@@ -239,11 +239,15 @@ def quant_source(tmp_path):
 
 
 class _FakePool:
-    def __init__(self, loaded):
-        self._loaded = loaded
+    def __init__(self, loaded=(), loading=()):
+        self._loaded = list(loaded)
+        self._loading = list(loading)
 
     def get_loaded_model_ids(self):
         return list(self._loaded)
+
+    def get_loaded_or_loading_model_ids(self):
+        return [*self._loaded, *self._loading]
 
 
 class TestOQGating:
@@ -254,6 +258,18 @@ class TestOQGating:
             engine_pool_getter=lambda: _FakePool(["gemma-4"]),
         )
         with pytest.raises(ValueError, match="while models are loaded"):
+            await mgr.start_quantization(
+                model_path=str(quant_source / "Llama-3B"), oq_level=4
+        )
+        assert not mgr._active_tasks
+
+    @pytest.mark.asyncio
+    async def test_refuses_while_models_loading(self, quant_source):
+        mgr = OQManager(
+            model_dirs=[str(quant_source)],
+            engine_pool_getter=lambda: _FakePool(loading=["qwen-loading"]),
+        )
+        with pytest.raises(ValueError, match="loaded or loading"):
             await mgr.start_quantization(
                 model_path=str(quant_source / "Llama-3B"), oq_level=4
             )
