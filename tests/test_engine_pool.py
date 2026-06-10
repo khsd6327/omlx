@@ -1866,6 +1866,12 @@ class TestMemorySettleBarrier:
             patch("omlx.engine_pool.mx") as mock_mx,
             patch("omlx.engine_pool.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", side_effect=record_sleep),
+            # fork: reclaim is routed through _reclaim_mlx_cache ->
+            # scheduler._sync_and_clear_cache (Metal-panic safety, not bare
+            # engine_pool.mx calls), so count reclaim cycles on that method.
+            patch.object(
+                pool, "_reclaim_mlx_cache", new_callable=AsyncMock
+            ) as mock_reclaim,
             caplog.at_level(logging.DEBUG, logger="omlx.engine_pool"),
         ):
             mock_mx.get_active_memory = rising_gauge
@@ -1879,9 +1885,8 @@ class TestMemorySettleBarrier:
         assert sleep_calls.count(0.5) == 0
         assert "Settle barrier timed out" not in caplog.text
         assert "Emergency reclaim" not in caplog.text
-        # Only the initial pre-barrier release cycle touched the executor.
-        assert mock_mx.synchronize.call_count == 1
-        assert mock_mx.clear_cache.call_count == 1
+        # Only the initial pre-barrier reclaim cycle ran.
+        assert mock_reclaim.call_count == 1
         # The unload itself still completes and is accounted.
         assert pool._entries["model-a"].engine is None
         assert pool._current_model_memory == 0
@@ -1907,6 +1912,11 @@ class TestMemorySettleBarrier:
             patch("omlx.engine_pool.mx") as mock_mx,
             patch("omlx.engine_pool.get_mlx_executor", return_value=None),
             patch("asyncio.sleep", new_callable=AsyncMock),
+            # fork: count reclaim cycles via _reclaim_mlx_cache (see the
+            # bail-out test above for why).
+            patch.object(
+                pool, "_reclaim_mlx_cache", new_callable=AsyncMock
+            ) as mock_reclaim,
             caplog.at_level(logging.DEBUG, logger="omlx.engine_pool"),
         ):
             mock_mx.get_active_memory = rising_gauge
@@ -1917,10 +1927,9 @@ class TestMemorySettleBarrier:
 
         assert "indeterminate under concurrent activity" not in caplog.text
         assert "Settle barrier timed out" in caplog.text
-        # Full barrier behavior preserved: 1 initial release cycle + 10 settle
-        # rounds + 3 emergency-reclaim rounds on the executor.
-        assert mock_mx.synchronize.call_count == 14
-        assert mock_mx.clear_cache.call_count == 14
+        # Full barrier behavior preserved: 1 initial reclaim cycle + 10 settle
+        # rounds + 3 emergency-reclaim rounds = 14 reclaim cycles.
+        assert mock_reclaim.call_count == 14
 
     def test_other_entries_serving_in_use_lease_counts(
         self, pool_with_loaded_model
