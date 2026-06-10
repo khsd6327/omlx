@@ -52,6 +52,12 @@ from ..utils.model_loading import materialize_lazy_state
 logger = logging.getLogger(__name__)
 
 
+def _default_clear_cache() -> None:
+    from ..scheduler import _sync_and_clear_cache
+
+    _sync_and_clear_cache()
+
+
 # What model_type strings count as a gemma4 assistant drafter. Kept as a
 # tuple so we can extend if upstream adds related drafter kinds later.
 GEMMA4_ASSISTANT_MODEL_TYPES: tuple[str, ...] = (
@@ -154,6 +160,7 @@ def run_vlm_mtp_decode(
     token_dtype: mx.Dtype = mx.int32,
     eos_token_ids: Optional[Set[int]] = None,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    clear_cache: Optional[Callable[[], None]] = None,
 ) -> Generator[Union[int, List[Optional[int]]], None, None]:
     """Stream decoded tokens via mlx-vlm's MTP rounds.
 
@@ -167,6 +174,7 @@ def run_vlm_mtp_decode(
     already emitted the bonus token before the round loop starts
     (``emitted = 1`` baked in at the top of both helpers).
     """
+    clear_cache_fn = clear_cache or _default_clear_cache
     is_batch = isinstance(first_bonus, mx.array) and first_bonus.size > 1
 
     if is_batch:
@@ -191,7 +199,7 @@ def run_vlm_mtp_decode(
             # _mtp_rounds_batch in mlx_vlm/speculative/utils.py). On large
             # targets like Gemma 4 31B the buffer pool balloons between
             # those flushes (issue #1416). Clearing per round bounds it.
-            mx.clear_cache()
+            clear_cache_fn()
             yield tokens
         return
 
@@ -214,5 +222,5 @@ def run_vlm_mtp_decode(
         draft_block_size=draft_block_size,
         token_dtype=token_dtype,
     ):
-        mx.clear_cache()
+        clear_cache_fn()
         yield tok

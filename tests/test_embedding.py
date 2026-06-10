@@ -950,7 +950,7 @@ class TestEmbeddingEngine:
         engine = EmbeddingEngine("test-model")
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx") as mock_mx:
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear_cache:
             mock_model = MagicMock()
             mock_model.embed.return_value = EmbeddingOutput(
                 embeddings=[[0.1, 0.2]],
@@ -962,8 +962,7 @@ class TestEmbeddingEngine:
             asyncio.run(engine.start())
             asyncio.run(engine.embed(["Hello"]))
 
-            mock_mx.synchronize.assert_called_once()
-            mock_mx.clear_cache.assert_called_once()
+            clear_cache.assert_called_once()
 
     def test_engine_clears_metal_cache_per_concurrent_request(self):
         """Cache clear must fire per request even under concurrency (#684 regression).
@@ -976,7 +975,7 @@ class TestEmbeddingEngine:
         concurrency = 4
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx") as mock_mx:
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear_cache:
             mock_model = MagicMock()
             mock_model.embed.return_value = EmbeddingOutput(
                 embeddings=[[0.1, 0.2]],
@@ -993,8 +992,7 @@ class TestEmbeddingEngine:
 
             asyncio.run(run_concurrent())
 
-            assert mock_mx.synchronize.call_count == concurrency
-            assert mock_mx.clear_cache.call_count == concurrency
+            assert clear_cache.call_count == concurrency
 
     def test_engine_chunks_large_embedding_requests_and_clears_each_chunk(self):
         """Large embedding requests should not hold the whole batch in MLX memory."""
@@ -1008,7 +1006,7 @@ class TestEmbeddingEngine:
             )
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx") as mock_mx:
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear_cache:
             mock_model = MagicMock()
             mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model
@@ -1028,8 +1026,7 @@ class TestEmbeddingEngine:
                 ["text-2", "text-3"],
                 ["text-4"],
             ]
-            assert mock_mx.synchronize.call_count == 3
-            assert mock_mx.clear_cache.call_count == 3
+            assert clear_cache.call_count == 3
 
     def test_engine_snapshots_batch_size_per_request(self):
         """Live batch-size updates must not skip or duplicate active request inputs."""
@@ -1047,7 +1044,7 @@ class TestEmbeddingEngine:
             )
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx"):
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache"):
             mock_model = MagicMock()
             mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model
@@ -1081,7 +1078,7 @@ class TestEmbeddingEngine:
             )
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx"):
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache"):
             mock_model = MagicMock()
             mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model

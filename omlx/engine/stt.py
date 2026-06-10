@@ -13,10 +13,8 @@ import gc
 import logging
 from typing import Any
 
-import mlx.core as mx
-
 from ..engine_core import get_mlx_executor
-from .base import BaseNonStreamingEngine
+from .base import BaseNonStreamingEngine, sync_and_clear_mlx_cache
 
 logger = logging.getLogger(__name__)
 
@@ -212,9 +210,7 @@ class STTEngine(BaseNonStreamingEngine):
 
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+        await loop.run_in_executor(get_mlx_executor(), sync_and_clear_mlx_cache)
         logger.info(f"STT engine stopped: {self._model_name}")
 
     async def transcribe(

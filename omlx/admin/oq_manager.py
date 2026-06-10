@@ -16,12 +16,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
-    import mlx.core as mx
+    import mlx.core  # noqa: F401
 
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
+from ..engine.base import sync_and_clear_mlx_cache
 from ..model_discovery import _has_vision_subconfig
 
 logger = logging.getLogger(__name__)
@@ -392,8 +393,7 @@ class OQManager:
         if HAS_MLX:
             for _attempt in range(3):
                 try:
-                    mx.synchronize()
-                    mx.clear_cache()
+                    sync_and_clear_mlx_cache()
                     break
                 except Exception:
                     await asyncio.sleep(1.0)
@@ -439,8 +439,7 @@ class OQManager:
                 if HAS_MLX:
                     for _ in range(3):
                         try:
-                            mx.synchronize()
-                            mx.clear_cache()
+                            sync_and_clear_mlx_cache()
                             break
                         except Exception:
                             await asyncio.sleep(1.0)
