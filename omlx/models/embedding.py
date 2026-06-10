@@ -33,6 +33,65 @@ _CONTEXT_LENGTH_ATTRS = (
     "n_positions",
 )
 
+# sentence-transformers Pooling boolean keys (in `1_Pooling/config.json`),
+# mapped to the pooling_mode strings consumed by xlm_roberta.ModelArgs. Only
+# "cls" changes behavior in the native XLM-RoBERTa model (CLS-token pooling);
+# every other value falls back to mean pooling there. bge-m3 sets
+# pooling_mode_cls_token=true, so without this resolution its dense vectors are
+# silently mean-pooled and degraded.
+_POOLING_MODE_KEY_TO_NAME = (
+    ("pooling_mode_cls_token", "cls"),
+    ("pooling_mode_mean_tokens", "mean"),
+    ("pooling_mode_max_tokens", "max"),
+    ("pooling_mode_mean_sqrt_len_tokens", "mean_sqrt_len_tokens"),
+)
+
+
+def _resolve_pooling_mode(model_path: Path) -> Optional[str]:
+    """
+    Resolve the sentence-transformers pooling mode for an embedding model.
+
+    bge-m3 (and other sentence-transformers checkpoints) keep their pooling
+    config in `1_Pooling/config.json`, NOT the top-level `config.json`. Read it
+    so the native XLM-RoBERTa model can honor CLS pooling instead of always
+    mean-pooling.
+
+    Returns a pooling_mode string ("cls"/"mean"/"max"/"mean_sqrt_len_tokens")
+    or None when no usable config is found (caller defaults to mean). All file
+    access is best-effort: a missing/malformed config never aborts model load.
+    """
+    pooling_config_path = model_path / "1_Pooling" / "config.json"
+    try:
+        if pooling_config_path.exists():
+            with open(pooling_config_path) as f:
+                pooling_cfg = json.load(f)
+            for key, name in _POOLING_MODE_KEY_TO_NAME:
+                if pooling_cfg.get(key):
+                    return name
+    except (json.JSONDecodeError, IOError, OSError, TypeError):
+        logger.debug(
+            "Failed to read 1_Pooling/config.json at %s, falling back",
+            pooling_config_path,
+        )
+
+    # Fall back to sentence_bert_config.json's referenced pooling module path,
+    # if present. sentence-transformers checkpoints that omit `1_Pooling` are
+    # rare; treat any failure as "no resolution" (mean default).
+    sbert_path = model_path / "sentence_bert_config.json"
+    try:
+        if sbert_path.exists():
+            with open(sbert_path) as f:
+                json.load(f)
+            # sentence_bert_config.json itself only carries max_seq_length /
+            # do_lower_case; it does not name the pooling mode. Presence alone
+            # tells us nothing actionable, so leave None (mean default).
+    except (json.JSONDecodeError, IOError, OSError):
+        logger.debug(
+            "Failed to read sentence_bert_config.json at %s", sbert_path
+        )
+
+    return None
+
 
 @dataclass
 class EmbeddingOutput:
@@ -127,6 +186,21 @@ class MLXEmbeddingModel:
                 k: v for k, v in config_dict.items() if k in known_fields
             }
             model_config["architectures"] = architectures
+
+            # bge-m3 (and other sentence-transformers models) keep their pooling
+            # mode in 1_Pooling/config.json, not config.json. Resolve it here so
+            # the native model can honor CLS pooling; without this, pooling_config
+            # stays None and bge-m3 dense vectors are silently mean-pooled.
+            resolved_pooling_mode = _resolve_pooling_mode(model_path)
+            if resolved_pooling_mode is not None:
+                model_config["pooling_config"] = {
+                    "pooling_mode": resolved_pooling_mode
+                }
+                logger.info(
+                    "Resolved pooling_mode='%s' for %s from 1_Pooling/config.json",
+                    resolved_pooling_mode,
+                    self.model_name,
+                )
 
             config = ModelArgs(**model_config)
             model_instance = Model(config)

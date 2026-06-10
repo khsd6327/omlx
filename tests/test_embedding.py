@@ -1497,6 +1497,89 @@ class TestNativeEmbeddingLoading:
         assert result is False
         assert model._loaded is False
 
+    def test_resolve_pooling_mode_from_1_pooling_config(self, tmp_path):
+        """1_Pooling/config.json maps boolean keys to pooling_mode strings."""
+        from omlx.models.embedding import _resolve_pooling_mode
+
+        # bge-m3 style: CLS pooling.
+        (tmp_path / "1_Pooling").mkdir()
+        (tmp_path / "1_Pooling" / "config.json").write_text(
+            json.dumps(
+                {
+                    "pooling_mode_cls_token": True,
+                    "pooling_mode_mean_tokens": False,
+                    "pooling_mode_max_tokens": False,
+                    "pooling_mode_mean_sqrt_len_tokens": False,
+                }
+            )
+        )
+        assert _resolve_pooling_mode(tmp_path) == "cls"
+
+    def test_resolve_pooling_mode_mean_and_missing_and_malformed(self, tmp_path):
+        """Mean keys resolve to 'mean'; missing/malformed configs return None."""
+        from omlx.models.embedding import _resolve_pooling_mode
+
+        # Missing dir -> None (mean default).
+        assert _resolve_pooling_mode(tmp_path) is None
+
+        # Mean pooling.
+        (tmp_path / "1_Pooling").mkdir()
+        cfg = tmp_path / "1_Pooling" / "config.json"
+        cfg.write_text(
+            json.dumps(
+                {"pooling_mode_cls_token": False, "pooling_mode_mean_tokens": True}
+            )
+        )
+        assert _resolve_pooling_mode(tmp_path) == "mean"
+
+        # Malformed -> None, must not raise.
+        cfg.write_text("{not valid json")
+        assert _resolve_pooling_mode(tmp_path) is None
+
+    def test_load_native_passes_cls_pooling_to_model_args(self, tmp_path):
+        """bge-m3's 1_Pooling/config.json must populate pooling_config=cls."""
+        from safetensors.numpy import save_file
+
+        config = {
+            "model_type": "xlm-roberta",
+            "architectures": ["XLMRobertaModel"],
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "vocab_size": 250002,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "max_position_embeddings": 514,
+            "pad_token_id": 1,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "1_Pooling").mkdir()
+        (tmp_path / "1_Pooling" / "config.json").write_text(
+            json.dumps({"pooling_mode_cls_token": True})
+        )
+        save_file(
+            {"embeddings.word_embeddings.weight": np.zeros((1, 1), dtype=np.float32)},
+            str(tmp_path / "model.safetensors"),
+        )
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockNativeTokenizer(vocab_size=250002)
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=tokenizer,
+        ), patch(
+            "omlx.models.embedding.MLXEmbeddingModel._validate_native_weights",
+            return_value=None,
+        ), patch(
+            "omlx.models.xlm_roberta.Model.load_weights",
+            return_value=None,
+        ):
+            result = model._load_native()
+
+        assert result is True
+        assert model.model.config.pooling_config == {"pooling_mode": "cls"}
+
     def test_embed_produces_normalized_vectors(self, tmp_path):
         """Test that embed produces L2-normalized embedding vectors."""
         import sys, math
