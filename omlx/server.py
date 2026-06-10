@@ -864,7 +864,8 @@ async def get_engine(
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except EnginePoolError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Engine pool error for model '%s'", model_id)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
     # Validate engine type. If a lease was taken above but validation fails,
     # release it before raising so a rejected request never leaks an in_use
@@ -1999,7 +2000,8 @@ async def _preprocess_markitdown_files_for_llm(
     except MarkItDownRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        logger.exception("MarkItDown preprocessing failed")
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
     return request.model_copy(update={"messages": messages})
 
 
@@ -2132,7 +2134,8 @@ async def _create_markitdown_chat_completion(
         except MarkItDownRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            logger.exception("MarkItDown preprocessing failed")
+            raise HTTPException(status_code=500, detail="Internal server error") from exc
 
         if not markdown:
             raise HTTPException(
@@ -2244,7 +2247,8 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     try:
         await _server_state.engine_pool.get_engine(model_id)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Failed to load model '%s'", model_id)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
