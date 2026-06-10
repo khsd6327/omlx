@@ -957,6 +957,9 @@ class PagedSSDCacheManager(CacheManager):
             "preload_time_ms": 0.0,
             "ssd_write_drops": 0,
             "ssd_inline_write_fallbacks": 0,
+            "ssd_write_attempts": 0,
+            "ssd_write_latency_total_ms": 0.0,
+            "ssd_write_latency_max_ms": 0.0,
         }
 
         # --- Hot cache (in-memory raw-bytes tier) ---
@@ -1444,6 +1447,7 @@ class PagedSSDCacheManager(CacheManager):
     ) -> bool:
         """Write one serialized block to disk from raw tensor bytes."""
         temp_path = None
+        write_start = time.perf_counter()
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
@@ -1532,6 +1536,14 @@ class PagedSSDCacheManager(CacheManager):
                     if p is not None and isinstance(p, Path) and p.exists():
                         p.unlink()
             return False
+        finally:
+            elapsed_ms = (time.perf_counter() - write_start) * 1000.0
+            self._stats["ssd_write_attempts"] += 1
+            self._stats["ssd_write_latency_total_ms"] += elapsed_ms
+            self._stats["ssd_write_latency_max_ms"] = max(
+                self._stats["ssd_write_latency_max_ms"],
+                elapsed_ms,
+            )
 
     def _clear_pending_write(
         self, block_hash: bytes, *, remove_hot_cache: bool = False
@@ -2906,6 +2918,11 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
+                ssd_write_attempts=self._stats["ssd_write_attempts"],
+                ssd_write_latency_total_ms=self._stats[
+                    "ssd_write_latency_total_ms"
+                ],
+                ssd_write_latency_max_ms=self._stats["ssd_write_latency_max_ms"],
             )
 
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
@@ -2968,6 +2985,11 @@ class PagedSSDCacheManager(CacheManager):
                 hot_cache_promotions=self._stats["hot_cache_promotions"],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
+                ssd_write_attempts=self._stats["ssd_write_attempts"],
+                ssd_write_latency_total_ms=self._stats[
+                    "ssd_write_latency_total_ms"
+                ],
+                ssd_write_latency_max_ms=self._stats["ssd_write_latency_max_ms"],
             )
 
     def get_stats_dict(self) -> dict[str, Any]:

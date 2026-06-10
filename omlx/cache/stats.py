@@ -202,6 +202,9 @@ class PagedSSDCacheStats(BaseCacheStats):
     ssd_write_drops: int = 0
     ssd_inline_write_fallbacks: int = 0
     evict_unlink_failures: int = 0
+    ssd_write_attempts: int = 0
+    ssd_write_latency_total_ms: float = 0.0
+    ssd_write_latency_max_ms: float = 0.0
 
     # Storage capacity
     total_size_bytes: int = 0
@@ -224,6 +227,13 @@ class PagedSSDCacheStats(BaseCacheStats):
         if total == 0:
             return 0.0
         return self.saves / total
+
+    @property
+    def ssd_write_latency_avg_ms(self) -> float:
+        """Average wall time spent in SSD block writes."""
+        if self.ssd_write_attempts == 0:
+            return 0.0
+        return self.ssd_write_latency_total_ms / self.ssd_write_attempts
 
     def record_save(self) -> None:
         """Record a successful save operation."""
@@ -248,9 +258,13 @@ class PagedSSDCacheStats(BaseCacheStats):
         self.ssd_write_drops = 0
         self.ssd_inline_write_fallbacks = 0
         self.evict_unlink_failures = 0
+        self.ssd_write_attempts = 0
+        self.ssd_write_latency_total_ms = 0.0
+        self.ssd_write_latency_max_ms = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert stats to dictionary."""
         d = super().to_dict()
         d["save_rate"] = self.save_rate
+        d["ssd_write_latency_avg_ms"] = self.ssd_write_latency_avg_ms
         return d
