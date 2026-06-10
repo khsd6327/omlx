@@ -395,6 +395,13 @@ def _write_safetensors_no_mx(
         f.write(header_json)
         for d in all_data:
             f.write(d)
+        # Force the temp file's bytes to stable storage before it is closed
+        # (and later atomically renamed). os.rename gives atomic visibility but
+        # NOT crash durability: without this fsync a post-crash reader can see
+        # the renamed name pointing at zero/truncated content while the index
+        # trusts the block (issue #1777, "preserved dirty writes").
+        f.flush()
+        os.fsync(f.fileno())
 
     return 8 + len(header_json) + offset
 
@@ -1446,11 +1453,35 @@ class PagedSSDCacheManager(CacheManager):
 
             os.rename(str(temp_path), str(file_path))
 
+            # Fsync the parent directory so the rename itself is durable: after
+            # a crash the directory entry must survive, not just the file data
+            # (which _write_safetensors_no_mx already fsynced). Best-effort:
+            # some filesystems don't support directory fsync.
+            with contextlib.suppress(Exception):
+                dir_fd = os.open(str(file_path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+
             # The block is now durable on disk; bump the persist counter
             # before any cleanup so ``saves_persisted`` reflects rename
             # success even if the post-rename eviction check below unlinks it.
             self._stats["saves_persisted"] += 1
             self._index.update_file_size(block_hash, actual_size)
+
+            # The bytes we just persisted are now clean. If the live hot-cache
+            # entry still holds *these exact* bytes (identity match on the
+            # tensors_raw dict we wrote), clear its dirty flag so a later
+            # evict spill won't re-write already-persisted content (write
+            # amplification, issue noted alongside #1777). If the entry is gone
+            # or has been superseded by a newer save_block (different
+            # tensors_raw object), leave it untouched. Only the hot-cache lock
+            # is taken here, preserving the _hot_cache_lock -> *_lock ordering.
+            with self._hot_cache_lock:
+                live = self._hot_cache.get(block_hash)
+                if live is not None and live.get("tensors_raw") is tensors_raw:
+                    live["dirty"] = False
 
             # Check if block was evicted while write was pending.
             if not self._index.contains(block_hash):
