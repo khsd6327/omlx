@@ -264,6 +264,34 @@ class EngineCore:
     async def stop(self) -> None:
         """Stop the engine loop."""
         self._running = False
+        # fork: fail outstanding waiters before tearing the loop down.
+        # generate() awaits its finished event with no timeout and
+        # stream_outputs() awaits collector.get(timeout=None); stopping an
+        # engine with requests in flight otherwise left those HTTP requests
+        # hung until the client gave up (close() clears the dicts but the
+        # waiters hold their own references).
+        pending = list(self._output_collectors.keys())
+        for rid in pending:
+            collector = self._output_collectors.get(rid)
+            if collector is not None:
+                collector.put(
+                    RequestOutput(
+                        request_id=rid,
+                        finished=True,
+                        finish_reason="error",
+                        error=(
+                            "Request aborted: the engine was stopped "
+                            "(model unloaded or server shutting down)."
+                        ),
+                    )
+                )
+            event = self._finished_events.get(rid)
+            if event is not None:
+                event.set()
+        if pending:
+            logger.warning(
+                "Engine stop: failed %d in-flight request(s)", len(pending)
+            )
         if self._wake_event is not None:
             self._wake_event.set()
         if self._task:

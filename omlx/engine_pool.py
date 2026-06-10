@@ -73,6 +73,9 @@ class EngineEntry:
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
+    # fork: future concurrent get_engine callers await (outside the pool
+    # lock) while this entry is loading; resolved by the loading caller.
+    load_future: object | None = None
 
 
 class EnginePool:
@@ -104,6 +107,10 @@ class EnginePool:
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
         self._current_model_memory = 0
+        # fork: estimated bytes of loads currently running OUTSIDE the pool
+        # lock (see get_engine). Counted into admission so two concurrent
+        # large loads can't both pass the ceiling check.
+        self._loading_reserved_bytes = 0
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
@@ -230,7 +237,14 @@ class EnginePool:
 
         for model_id, info in discovered.items():
             existing = self._entries.get(model_id)
-            if existing is not None and existing.engine is not None:
+            # fork: also preserve entries that are mid-load (is_loading with
+            # engine still None). Replacing the entry object would orphan the
+            # in-flight _load_engine's mutations — the loaded engine ends up
+            # on an object no longer in _entries (leak + double load), and
+            # get_engine's post-load lookup can KeyError.
+            if existing is not None and (
+                existing.engine is not None or existing.is_loading
+            ):
                 # Loaded model: preserve runtime state, only update pinned flag
                 existing.is_pinned = model_id in pinned_set
             else:
@@ -256,11 +270,14 @@ class EnginePool:
                 logger.info(f"Pinned model: {model_id}")
 
         # Remove entries no longer discovered and not loaded
+        # fork: never delete an entry that is mid-load (see above).
         discovered_ids = set(discovered.keys())
         stale = [
             mid
             for mid in self._entries
-            if mid not in discovered_ids and self._entries[mid].engine is None
+            if mid not in discovered_ids
+            and self._entries[mid].engine is None
+            and not self._entries[mid].is_loading
         ]
         for mid in stale:
             del self._entries[mid]
@@ -397,96 +414,209 @@ class EnginePool:
             InsufficientMemoryError: If can't free enough memory (all pinned)
             ModelLoadingError: If model is already being loaded
         """
-        async with self._lock:
-            entry = self._entries.get(model_id)
-            if not entry:
-                raise ModelNotFoundError(model_id, list(self._entries.keys()))
+        # fork: the pool lock used to be held across the ENTIRE cold load
+        # (await engine.start(), tens of seconds to minutes) and the unload
+        # settle barriers, so every request to every model — including
+        # already-loaded ones — queued behind any load. Now the lock covers
+        # only entry-state transitions and admission/eviction bookkeeping;
+        # the actual load runs outside it. Concurrent requesters of the same
+        # model await a per-entry future instead of the global lock.
+        while True:
+            wait_future = None
+            reserved = 0
+            async with self._lock:
+                entry = self._entries.get(model_id)
+                if not entry:
+                    raise ModelNotFoundError(model_id, list(self._entries.keys()))
 
-            # Already loaded - just update access time
-            if entry.engine is not None:
-                # If force_lm requested but current engine is VLM, unload and reload
-                if force_lm and isinstance(entry.engine, VLMBatchedEngine):
-                    logger.info(
-                        f"Unloading VLM engine for {model_id} "
-                        f"(force_lm=True, reloading as LM)"
-                    )
-                    await self._unload_engine(model_id)
-                else:
-                    entry.last_access = time.time()
-                    if _lease:
-                        entry.in_use += 1
-                    return entry.engine
-
-            # Pre-load admission against the memory ceiling from the
-            # process memory enforcer (min of static and dynamic). Try
-            # evicting LRU non-pinned models first; if the model still
-            # cannot fit after evicting everything available, raise.
-            #
-            # ceiling == 0 means the enforcer is off (guard disabled or
-            # not yet wired up), so we admit unconditionally.
-            model_settings = None
-            if self._settings_manager is not None:
-                model_settings = self._settings_manager.get_settings(model_id)
-            load_estimated_size = entry.estimated_size + self._estimate_auxiliary_size(
-                model_settings
-            )
-            ceiling = self._current_ceiling()
-            if ceiling > 0:
-                while True:
-                    # Consult the tracked accumulator alongside live memory:
-                    # after a model settles or idles, mx.get_active_memory() and
-                    # the process footprint can read well below the model's true
-                    # resident size, while _current_model_memory still reflects
-                    # the committed total. Using only live memory lets a second
-                    # large model load without evicting the first, over-
-                    # committing past the ceiling (#1623).
-                    current = max(
-                        mx.get_active_memory(),
-                        get_phys_footprint(),
-                        self._current_model_memory,
-                    )
-                    projected = current + load_estimated_size
-                    if projected <= ceiling:
-                        break
-                    victim = self._find_lru_victim()
-                    if victim is not None:
+                # Already loaded - just update access time
+                if entry.engine is not None:
+                    # If force_lm requested but current engine is VLM, unload
+                    # and reload
+                    if force_lm and isinstance(entry.engine, VLMBatchedEngine):
+                        # fork: refuse instead of tearing the model down
+                        # under in-flight requests (previously unconditional).
+                        busy = entry.in_use > 0
+                        if not busy:
+                            try:
+                                busy = entry.engine.has_active_requests()
+                            except AttributeError:
+                                busy = False
+                        if busy:
+                            raise ModelLoadingError(
+                                f"Cannot reload '{model_id}' as LM "
+                                "(force_lm): engine has in-flight requests"
+                            )
                         logger.info(
-                            f"Evicting '{victim}' to fit '{model_id}' "
-                            f"under memory ceiling "
-                            f"({format_size(projected)} > "
-                            f"{format_size(ceiling)})"
+                            f"Unloading VLM engine for {model_id} "
+                            f"(force_lm=True, reloading as LM)"
                         )
-                        await self._unload_engine(victim)
-                        continue
-                    # Nothing else to evict -- model cannot fit. Use
-                    # ModelTooLargeError when the model alone exceeds the
-                    # ceiling (no chance of fitting), InsufficientMemoryError
-                    # when the model would fit on a clean process but the
-                    # current usage leaves no room.
-                    if load_estimated_size > ceiling:
-                        raise ModelTooLargeError(
-                            model_id, load_estimated_size, ceiling
+                        await self._unload_engine(model_id)
+                    else:
+                        entry.last_access = time.time()
+                        if _lease:
+                            entry.in_use += 1
+                        return entry.engine
+
+                if entry.is_loading:
+                    # fork: someone else owns the load — await its future
+                    # outside the lock, then re-check from the top.
+                    wait_future = entry.load_future
+                    if wait_future is None:
+                        # Legacy path (load marked without a future).
+                        raise ModelLoadingError(model_id)
+                else:
+                    # Pre-load admission against the memory ceiling from the
+                    # process memory enforcer (min of static and dynamic). Try
+                    # evicting LRU non-pinned models first; if the model still
+                    # cannot fit after evicting everything available, raise.
+                    #
+                    # ceiling == 0 means the enforcer is off (guard disabled
+                    # or not yet wired up), so we admit unconditionally.
+                    model_settings = None
+                    if self._settings_manager is not None:
+                        model_settings = self._settings_manager.get_settings(
+                            model_id
                         )
-                    raise InsufficientMemoryError(
-                        required=load_estimated_size,
-                        current=current,
-                        message=(
-                            f"Cannot load {model_id}: projected memory "
-                            f"{format_size(projected)} would exceed the memory "
-                            f"ceiling {format_size(ceiling)} "
-                            f"(current: {format_size(current)}, "
-                            f"model: {format_size(load_estimated_size)}). "
-                            "Free system memory or lower memory_guard_tier."
-                        ),
+                    load_estimated_size = (
+                        entry.estimated_size
+                        + self._estimate_auxiliary_size(model_settings)
                     )
+                    ceiling = self._current_ceiling()
+                    if ceiling > 0:
+                        # fork: when other models stay resident, evict down to
+                        # the enforcer's SOFT watermark before loading instead
+                        # of admitting at the full ceiling. Admission-at-
+                        # ceiling + enforcer-eviction-to-soft made the band
+                        # between them a no-coexistence zone: a load would
+                        # succeed and the enforcer's next poll evicted the
+                        # idle LRU model anyway — alternating traffic
+                        # re-loaded ~90 GB of weights per switch. If nothing
+                        # more is evictable, the load is still admitted up to
+                        # the full ceiling rather than failing.
+                        soft_target = 0
+                        enforcer = self._process_memory_enforcer
+                        if enforcer is not None:
+                            soft_fraction = float(
+                                getattr(enforcer, "_soft_threshold", 0) or 0
+                            )
+                            if 0 < soft_fraction < 1:
+                                soft_target = int(ceiling * soft_fraction)
+                        others_resident = any(
+                            (e.engine is not None or e.is_loading)
+                            and mid != model_id
+                            for mid, e in self._entries.items()
+                        )
+                        target = (
+                            soft_target
+                            if (others_resident and 0 < soft_target < ceiling)
+                            else ceiling
+                        )
+                        while True:
+                            # Consult the tracked accumulator alongside live
+                            # memory: after a model settles or idles,
+                            # mx.get_active_memory() and the process footprint
+                            # can read well below the model's true resident
+                            # size, while _current_model_memory still reflects
+                            # the committed total. Using only live memory lets
+                            # a second large model load without evicting the
+                            # first, over-committing past the ceiling (#1623).
+                            # fork: loads in flight outside the lock are
+                            # counted via _loading_reserved_bytes.
+                            current = max(
+                                mx.get_active_memory(),
+                                get_phys_footprint(),
+                                self._current_model_memory
+                                + self._loading_reserved_bytes,
+                            )
+                            projected = current + load_estimated_size
+                            if projected <= target:
+                                break
+                            victim = self._find_lru_victim()
+                            if victim is not None:
+                                logger.info(
+                                    f"Evicting '{victim}' to fit '{model_id}' "
+                                    f"under memory target "
+                                    f"({format_size(projected)} > "
+                                    f"{format_size(target)})"
+                                )
+                                await self._unload_engine(victim)
+                                continue
+                            if target < ceiling and projected <= ceiling:
+                                # fork: nothing left to evict but the load
+                                # fits under the hard ceiling — admit.
+                                break
+                            # Nothing else to evict -- model cannot fit. Use
+                            # ModelTooLargeError when the model alone exceeds
+                            # the ceiling (no chance of fitting),
+                            # InsufficientMemoryError when the model would fit
+                            # on a clean process but the current usage leaves
+                            # no room.
+                            if load_estimated_size > ceiling:
+                                raise ModelTooLargeError(
+                                    model_id, load_estimated_size, ceiling
+                                )
+                            raise InsufficientMemoryError(
+                                required=load_estimated_size,
+                                current=current,
+                                message=(
+                                    f"Cannot load {model_id}: projected memory "
+                                    f"{format_size(projected)} would exceed the "
+                                    f"memory ceiling {format_size(ceiling)} "
+                                    f"(current: {format_size(current)}, "
+                                    f"model: {format_size(load_estimated_size)}). "
+                                    "Free system memory or lower "
+                                    "memory_guard_tier."
+                                ),
+                            )
 
-            # Now load the model
-            await self._load_engine(model_id, force_lm=force_lm)
+                    # fork: mark the load and reserve its memory BEFORE
+                    # releasing the lock so concurrent admission/eviction and
+                    # discovery see a consistent loading entry.
+                    entry.is_loading = True
+                    entry.loading_started_at = time.monotonic()
+                    entry.abort_loading = False
+                    entry.load_future = asyncio.get_running_loop().create_future()
+                    self._loading_reserved_bytes += load_estimated_size
+                    reserved = load_estimated_size
 
-            loaded = self._entries[model_id]
-            if _lease:
-                loaded.in_use += 1
-            return loaded.engine
+            if wait_future is not None:
+                # Propagates the loader's exception to waiters as well.
+                await wait_future
+                continue
+
+            # fork: we own the load — run it OUTSIDE the pool lock.
+            try:
+                await self._load_engine(model_id, force_lm=force_lm)
+            except BaseException as exc:
+                async with self._lock:
+                    self._loading_reserved_bytes = max(
+                        0, self._loading_reserved_bytes - reserved
+                    )
+                    fut = entry.load_future
+                    entry.load_future = None
+                    if fut is not None and not fut.done():
+                        fut.set_exception(exc)
+                        # Mark retrieved so a waiter-less future doesn't log
+                        # "exception was never retrieved" at GC.
+                        fut.exception()
+                raise
+
+            async with self._lock:
+                self._loading_reserved_bytes = max(
+                    0, self._loading_reserved_bytes - reserved
+                )
+                fut = entry.load_future
+                entry.load_future = None
+                if fut is not None and not fut.done():
+                    fut.set_result(True)
+                loaded = self._entries.get(model_id)
+                if loaded is None or loaded.engine is None:
+                    raise ModelLoadingError(model_id)
+                loaded.last_access = time.time()
+                if _lease:
+                    loaded.in_use += 1
+                return loaded.engine
 
     async def release_engine(self, model_id: str) -> None:
         """Release one in-use lease previously taken via get_engine(_lease=True)."""
@@ -924,15 +1054,18 @@ class EnginePool:
             ModelLoadingError: If model is already being loaded
         """
         entry = self._entries[model_id]
-        if entry.is_loading:
-            raise ModelLoadingError(model_id)
-
-        entry.is_loading = True
-        entry.loading_started_at = time.monotonic()
+        # fork: get_engine marks is_loading / loading_started_at /
+        # abort_loading and publishes entry.load_future under the pool lock
+        # BEFORE calling this method, which now runs WITHOUT the pool lock
+        # (loads no longer block requests to other models). Defensive set for
+        # any direct caller (tests).
+        if not entry.is_loading:
+            entry.is_loading = True
+            entry.loading_started_at = time.monotonic()
+            entry.abort_loading = False
         self._wake_process_memory_enforcer(active=True)
         load_started_at = entry.loading_started_at
         load_completed = False
-        entry.abort_loading = False
         pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
@@ -1067,7 +1200,10 @@ class EnginePool:
                 engine is not None and type(engine).__name__ == "DFlashEngine"
             )
             if _is_dflash_engine:
-                await self._unload_other_dflash_engines(model_id)
+                # fork: entry-mutating path — must take the pool lock now
+                # that _load_engine itself runs outside it.
+                async with self._lock:
+                    await self._unload_other_dflash_engines(model_id)
 
             try:
                 await engine.start()

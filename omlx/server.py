@@ -2461,7 +2461,19 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await _server_state.engine_pool._unload_engine(model_id)
+    # fork: the old direct _unload_engine call bypassed BOTH the pool lock
+    # and every active-request guard — any caller with an inference key
+    # could tear down in-flight generations. Route through the guarded
+    # helper and surface a 409 when the model is busy or pinned.
+    unloaded = await _server_state.engine_pool.unload_if_idle_unpinned(model_id)
+    if not unloaded:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Model busy or pinned: {model_id} "
+                "(has in-flight requests, an active lease, or is pinned)"
+            ),
+        )
     return {"status": "ok", "model_id": model_id}
 
 
