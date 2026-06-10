@@ -442,9 +442,20 @@ class DFlashEngine(BaseEngine):
         from dflash_mlx.cache.manager import shutdown_runtime_cache_manager
 
         from ..engine_core import get_mlx_executor
+        # fork: route Metal buffer reclaim through the scheduler helper (runs
+        # under _mx_buffer_access_lock + syncs target/default stream) instead of
+        # bare mx.synchronize()/mx.clear_cache(). DFlash has no per-engine stream
+        # (it delegates to dflash-mlx on the global executor/default stream), so
+        # we use the documented global helper path (stream=None -> default).
+        from ..scheduler import _sync_and_clear_cache
 
         loop = asyncio.get_running_loop()
-        pre_active = mx.get_active_memory()
+        # fork: sample mx.get_active_memory() on the executor thread, not the
+        # event loop (scheduler.py requires off-loop callers to avoid touching
+        # mx active-memory on the loop thread). reclaim + sample in one hop.
+        pre_active = await loop.run_in_executor(
+            get_mlx_executor(), mx.get_active_memory
+        )
 
         # Release dflash model and cache references
         shutdown_runtime_cache_manager()
@@ -475,14 +486,17 @@ class DFlashEngine(BaseEngine):
 
         # Force memory reclaim with settle barrier
         gc.collect()
-        await loop.run_in_executor(
-            get_mlx_executor(),
-            lambda: (mx.synchronize(), mx.clear_cache()),
-        )
+        # fork: reclaim via scheduler._sync_and_clear_cache() (lock + stream
+        # sync) instead of bare reclaim; still offloaded to the executor thread.
+        await loop.run_in_executor(get_mlx_executor(), _sync_and_clear_cache)
 
         # Poll for actual memory release (same pattern as engine_pool._unload_engine)
         for settle_round in range(10):
-            active_now = mx.get_active_memory()
+            # fork: reclaim + sample active memory in one executor hop so the
+            # mx.get_active_memory() read happens off the event-loop thread.
+            active_now = await loop.run_in_executor(
+                get_mlx_executor(), mx.get_active_memory
+            )
             freed = pre_active - active_now
             if freed > 0:
                 logger.info(
@@ -492,9 +506,9 @@ class DFlashEngine(BaseEngine):
                 break
             await asyncio.sleep(0.5)
             gc.collect()
+            # fork: reclaim via scheduler helper (see above), offloaded.
             await loop.run_in_executor(
-                get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
+                get_mlx_executor(), _sync_and_clear_cache
             )
         else:
             logger.warning("DFlash model eviction: memory settle timed out")
@@ -662,11 +676,22 @@ class DFlashEngine(BaseEngine):
             )
             return
         try:
-            num_tokens = self.count_chat_tokens(
-                messages,
-                tools,
-                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
-                is_partial=kwargs.get("is_partial"),
+            # fork: render template + encode on the executor thread, not the
+            # event loop. The generate path re-tokenizes the same prompt (the
+            # HTTP layer issues preflight + generate as two separate calls, so
+            # the ids can't be threaded through without a per-request cache),
+            # but at least this preflight tokenization no longer blocks the loop.
+            loop = asyncio.get_running_loop()
+            ct_kwargs = kwargs.get("chat_template_kwargs")
+            is_partial = kwargs.get("is_partial")
+            num_tokens = await loop.run_in_executor(
+                None,
+                lambda: self.count_chat_tokens(
+                    messages,
+                    tools,
+                    chat_template_kwargs=ct_kwargs,
+                    is_partial=is_partial,
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -707,7 +732,13 @@ class DFlashEngine(BaseEngine):
             )
             return
         try:
-            num_tokens = len(self._tokenizer_obj.encode(prompt))
+            # fork: encode on the executor thread, not the event loop (the
+            # generate path re-encodes the same prompt — see preflight_chat
+            # for why ids can't be threaded across the two HTTP-level calls).
+            loop = asyncio.get_running_loop()
+            num_tokens = await loop.run_in_executor(
+                None, lambda: len(self._tokenizer_obj.encode(prompt))
+            )
         except Exception as e:
             logger.warning(
                 "DFlashEngine.preflight_completion: tokenizer.encode raised %s; "
