@@ -1422,6 +1422,26 @@ class TestUnresolvableSchedulerWarning:
             f"got {len(warnings)}"
         )
 
+    def test_diffusion_engine_without_scheduler_does_not_warn(
+        self, enforcer, caplog
+    ):
+        """Diffusion VLMs intentionally bypass AsyncEngineCore schedulers."""
+        engine = MagicMock(spec=["is_diffusion_model"])
+        engine.is_diffusion_model = True
+        entry = _make_entry("model-diffusion", engine=engine)
+        enforcer._engine_pool._entries = {"model-diffusion": entry}
+
+        with caplog.at_level(
+            "WARNING", logger="omlx.process_memory_enforcer"
+        ):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
+
     def test_unresolvable_does_not_block_other_engines(self, enforcer):
         """If engine A is unresolvable but engine B has a real scheduler,
         B must still receive the propagation."""
@@ -1474,6 +1494,25 @@ class TestUnresolvableSchedulerWarning:
         assert warnings == [], (
             f"Unloaded engine must not warn, got {len(warnings)} warning(s)"
         )
+
+    def test_no_warning_for_stopped_engine_during_unload(self, enforcer, caplog):
+        """During EnginePool unload there is a short window where the engine
+        object still sits on the entry but its scheduler has already been
+        released. That is teardown, not a broken wrapper chain.
+        """
+        engine = MagicMock(spec=["_loaded"])
+        engine._loaded = False
+        entry = _make_entry("model-stopped", engine=engine)
+        enforcer._engine_pool._entries = {"model-stopped": entry}
+
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            enforcer._propagate_memory_limit()
+
+        warnings = [
+            r for r in caplog.records
+            if "could not resolve scheduler" in r.getMessage()
+        ]
+        assert warnings == []
 
     def test_no_warning_for_dflash_without_fallback(self, enforcer, caplog):
         """DFlash normal mode has no scheduler until fallback is started."""

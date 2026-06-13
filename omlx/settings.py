@@ -146,6 +146,7 @@ class ServerSettings:
     sse_keepalive_mode: str = "chunk"
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
+    preserve_mid_system_cache: bool = True
     # fork: request body size cap (MB). 0 or None disables the limit.
     max_request_body_mb: int | None = 256
 
@@ -166,6 +167,7 @@ class ServerSettings:
             sse_keepalive_mode=data.get("sse_keepalive_mode", "chunk"),
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
+            preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
             # fork: request body size cap (MB). 0 or None disables the limit.
             max_request_body_mb=data.get("max_request_body_mb", 256),
         )
@@ -903,6 +905,10 @@ class GlobalSettings:
                 logger.warning(f"Invalid OMLX_PORT value: {port}")
         if log_level := os.getenv("OMLX_LOG_LEVEL"):
             self.server.log_level = log_level
+        if preserve_mid_system_cache := os.getenv("OMLX_PRESERVE_MID_SYSTEM_CACHE"):
+            self.server.preserve_mid_system_cache = (
+                preserve_mid_system_cache.strip().lower() in {"1", "true", "yes", "on"}
+            )
 
         # Model settings
         if model_dir := os.getenv("OMLX_MODEL_DIR"):
