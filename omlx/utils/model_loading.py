@@ -80,8 +80,8 @@ def maybe_apply_pre_load_patches(
 
     Dispatches:
 
-    - DeepSeek V4 patch (PR 1192) when ``config.json`` declares
-      ``model_type == "deepseek_v4"``.
+    - DeepSeek V4 patch (PR 1192) when ``config.json`` declares a
+      ``deepseek_v4*`` model_type.
     - Step 3.7 Flash text-only wrapper (PR 1325) when ``config.json``
       declares ``model_type == "step3p7"``.
     - Llama 4 attention offset patch when ``config.json`` declares
@@ -131,7 +131,7 @@ def maybe_apply_pre_load_patches(
         return
 
     model_type = config.get("model_type")
-    if model_type == "deepseek_v4":
+    if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
 
         if apply_deepseek_v4_patch():
@@ -158,6 +158,20 @@ def maybe_apply_pre_load_patches(
 
         if apply_mlx_vlm_diffusion_patch():
             logger.info("mlx-vlm diffusion patch applied for %s", model_name)
+
+    minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
+    if for_vlm and (
+        model_type in minimax_m3_types or text_model_type in minimax_m3_types
+    ):
+        from ..patches.minimax_m3_sparse_attention import (
+            apply_minimax_m3_sparse_attention_patch,
+        )
+
+        if apply_minimax_m3_sparse_attention_patch():
+            logger.info(
+                "MiniMax M3 sparse attention patch applied for %s",
+                model_name,
+            )
 
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
@@ -420,6 +434,26 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         model_type.startswith("qwen3_5")
         or model_type.startswith("qwen3_6")
         or model_type.startswith("deepseek_v4")
+    )
+
+def load_text_model(
+    model_name: str,
+    tokenizer_config: dict[str, Any] | None = None,
+    model_settings: Any | None = None,
+):
+    """Load an LLM model/tokenizer pair via mlx-lm."""
+    maybe_apply_pre_load_patches(model_name, model_settings=model_settings)
+    from mlx_lm import load
+
+    trust_remote_code = (
+        bool(getattr(model_settings, "trust_remote_code", False))
+        if model_settings is not None
+        else False
+    )
+    return load(
+        model_name,
+        tokenizer_config=tokenizer_config,
+        trust_remote_code=trust_remote_code,
     )
 
 
