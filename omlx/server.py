@@ -1028,14 +1028,34 @@ async def get_engine(
             status_code=400, detail="No model specified and no default model set"
         )
 
-    # Resolve alias to real model_id
-    model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    # Resolve alias/profile request to the physical model. Exposed profiles
+    # may carry engine-construction settings (MTP/DFlash/etc.); pass those
+    # transient settings to the pool so the loaded variant can switch without
+    # mutating the base model's persisted settings.
+    requested_model_id = model_id
+    runtime_settings = None
+    sm = _server_state.settings_manager
+    if (
+        engine_type == EngineType.LLM
+        and sm is not None
+        and hasattr(sm, "get_exposed_profile_runtime_settings_for_request")
+    ):
+        runtime = sm.get_exposed_profile_runtime_settings_for_request(
+            requested_model_id
+        )
+        if runtime is not None:
+            model_id, runtime_settings = runtime
+        else:
+            model_id = pool.resolve_model_id(model_id, sm)
+    else:
+        model_id = pool.resolve_model_id(model_id, sm)
     _wake_process_memory_enforcer(active=True)
 
-    # Only thread the _lease kwarg through when a lease is actually requested,
-    # so the common non-lease path keeps the original pool.get_engine(model_id)
-    # call contract (LLM/STT/TTS/STS handlers, and pool mocks, never lease).
+    # Only thread optional kwargs through when they are needed, so the common
+    # path keeps the original pool.get_engine(model_id) call shape.
     _lease_kwargs = {"_lease": True} if _lease else {}
+    if runtime_settings is not None:
+        _lease_kwargs["runtime_settings"] = runtime_settings
     try:
         engine = await pool.get_engine(model_id, **_lease_kwargs)
         if _lease and _leased_out is not None:
@@ -1054,8 +1074,9 @@ async def get_engine(
             )
             try:
                 _wake_process_memory_enforcer(active=True)
+                _fallback_kwargs = {"_lease": True} if _lease else {}
                 fb_engine = await pool.get_engine(
-                    _server_state.default_model, **_lease_kwargs
+                    _server_state.default_model, **_fallback_kwargs
                 )
                 if _lease and _leased_out is not None:
                     _leased_out.append(_server_state.default_model)
@@ -1277,13 +1298,11 @@ def get_sampling_params(
     """
     global_sampling = _server_state.sampling
 
-    # Resolve alias so per-model settings are found by real model ID
-    model_id = resolve_model_id(model_id)
+    # Get per-model (or exposed-profile) settings if available
+    model_settings = get_model_settings_for_request(model_id)
 
-    # Get per-model settings if available
-    model_settings = None
-    if model_id and _server_state.settings_manager:
-        model_settings = _server_state.settings_manager.get_settings(model_id)
+    # Resolve alias so physical-model defaults can still be found by real model ID
+    model_id = resolve_model_id(model_id)
 
     # Resolve OCR defaults if not provided by caller
     if ocr_defaults is None and model_id:
@@ -1440,13 +1459,26 @@ def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
         req_budget = getattr(request.thinking, "budget_tokens", None)
     if req_budget is not None:
         return req_budget
-    # Check model settings
-    resolved = resolve_model_id(model_id)
-    if resolved and _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved)
-        if ms.thinking_budget_enabled and ms.thinking_budget_tokens:
-            return ms.thinking_budget_tokens
+    ms = get_model_settings_for_request(model_id)
+    if ms and ms.thinking_budget_enabled and ms.thinking_budget_tokens:
+        return ms.thinking_budget_tokens
     return None
+
+
+def get_model_settings_for_request(model_id: str | None):
+    """Return settings for the requested API model name via ModelSettingsManager."""
+    sm = _server_state.settings_manager
+    if not model_id or sm is None:
+        return None
+
+    resolved_model_id = resolve_model_id(model_id)
+    if not hasattr(sm, "get_settings_for_request"):
+        return sm.get_settings(resolved_model_id or model_id)
+
+    return sm.get_settings_for_request(
+        model_id,
+        resolved_model_id=resolved_model_id,
+    )
 
 
 def resolve_model_id(model_id: str | None) -> str | None:
@@ -1579,12 +1611,10 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
         (only possible when neither the model nor the global default
         provides a value, which shouldn't happen in practice).
     """
-    # Resolve alias so per-model settings are found by real model ID
+    # Resolve alias for physical model metadata, but keep requested alias settings.
+    requested_model_id = model_id
+    model_settings = get_model_settings_for_request(requested_model_id)
     model_id = resolve_model_id(model_id)
-
-    model_settings = None
-    if model_id and _server_state.settings_manager:
-        model_settings = _server_state.settings_manager.get_settings(model_id)
 
     # Priority 1: explicit per-model override (not capped by policy)
     if model_settings and model_settings.max_context_window is not None:
@@ -2411,6 +2441,48 @@ def _with_markitdown_status(status: dict) -> dict:
     return augmented
 
 
+def _with_exposed_profile_status(status: dict) -> dict:
+    settings_manager = _server_state.settings_manager
+    if settings_manager is None:
+        return status
+
+    list_profiles = getattr(settings_manager, "list_exposed_profile_models", None)
+    if not callable(list_profiles):
+        return status
+
+    augmented = dict(status)
+    models = [dict(m) for m in augmented.get("models", [])]
+    by_id = {m.get("id"): m for m in models}
+    existing_ids = set(by_id)
+    for profile in list_profiles():
+        source_model_id = profile.get("source_model_id")
+        profile_model_id = profile.get("model_id")
+        if (
+            not source_model_id
+            or not profile_model_id
+            or source_model_id not in by_id
+            or profile_model_id in existing_ids
+        ):
+            continue
+        profile_status = dict(by_id[source_model_id])
+        profile_status.update(
+            {
+                "id": profile_model_id,
+                "source_model_id": source_model_id,
+                "profile_name": profile.get("name"),
+                "profile_api_name": profile.get("api_name"),
+                "profile_display_name": profile.get("display_name"),
+            }
+        )
+        models.append(profile_status)
+        existing_ids.add(profile_model_id)
+
+    augmented["models"] = models
+    augmented["model_count"] = len(models)
+    augmented["loaded_count"] = sum(1 for m in models if m.get("loaded"))
+    return augmented
+
+
 async def _preprocess_markitdown_files_for_llm(
     request: ChatCompletionRequest,
 ) -> ChatCompletionRequest:
@@ -2607,6 +2679,25 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
                     max_model_len=get_max_context_window(model_id),
                 )
             )
+        if settings_manager:
+            physical_ids = {m["id"] for m in status["models"]}
+            existing_ids = {m.id for m in models}
+            for profile in settings_manager.list_exposed_profile_models():
+                source_model_id = profile["source_model_id"]
+                profile_model_id = profile["model_id"]
+                if (
+                    source_model_id not in physical_ids
+                    or profile_model_id in existing_ids
+                ):
+                    continue
+                models.append(
+                    ModelInfo(
+                        id=profile_model_id,
+                        owned_by="omlx",
+                        max_model_len=get_max_context_window(profile_model_id),
+                    )
+                )
+                existing_ids.add(profile_model_id)
 
     if _markitdown_is_visible() and not any(
         m.id == MARKITDOWN_MODEL_ID for m in models
@@ -2626,7 +2717,9 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    status = _with_markitdown_status(_server_state.engine_pool.get_status())
+    status = _with_exposed_profile_status(
+        _with_markitdown_status(_server_state.engine_pool.get_status())
+    )
     for m in status["models"]:
         model_id = m["id"]
         if is_markitdown_model(model_id):
@@ -2635,13 +2728,22 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             continue
 
         m["max_context_window"] = get_max_context_window(model_id)
+        source_model_id = m.get("source_model_id") or model_id
 
         # Resolve effective max_tokens: model setting > global default
         max_tokens = _server_state.sampling.max_tokens
         if _server_state.settings_manager:
-            ms = _server_state.settings_manager.get_settings(model_id)
-            if ms and ms.model_alias:
-                m["model_alias"] = ms.model_alias
+            sm = _server_state.settings_manager
+            if hasattr(sm, "get_settings_for_request"):
+                ms = sm.get_settings_for_request(
+                    model_id,
+                    resolved_model_id=source_model_id,
+                )
+            else:
+                ms = sm.get_settings(source_model_id)
+            base_ms = sm.get_settings(source_model_id)
+            if base_ms and base_ms.model_alias and source_model_id == model_id:
+                m["model_alias"] = base_ms.model_alias
             if ms and ms.max_tokens is not None:
                 max_tokens = ms.max_tokens
         m["max_tokens"] = max_tokens
@@ -3156,8 +3258,8 @@ async def create_chat_completion(
     forced_keys: set[str] = set()
     reasoning_parser = None
     settings_guided_grammar = None
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
+    ms = get_model_settings_for_request(request.model)
+    if ms:
         max_tool_result_tokens = ms.max_tool_result_tokens
         reasoning_parser = ms.reasoning_parser
         settings_guided_grammar = _settings_guided_grammar(ms)
@@ -5030,8 +5132,8 @@ async def create_anthropic_message(
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
     forced_keys: set[str] = set()
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
+    ms = get_model_settings_for_request(request.model)
+    if ms:
         max_tool_result_tokens = ms.max_tool_result_tokens
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
@@ -5519,8 +5621,8 @@ async def create_response(
     # Get per-model settings
     merged_ct_kwargs = {}
     reasoning_parser = None
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
+    ms = get_model_settings_for_request(request.model)
+    if ms:
         reasoning_parser = ms.reasoning_parser
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)

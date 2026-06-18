@@ -267,13 +267,14 @@ class _StoreCacheGate:
 try:
     from .cache.boundary_snapshot_store import BoundarySnapshotSSDStore
     from .cache.paged_ssd_cache import PagedSSDCacheManager
-    from .memory_monitor import MemoryMonitor
+    from .memory_monitor import MemoryMonitor, estimate_mla_kv_bytes_per_token
 
     HAS_TIERED_CACHE = True
 except ImportError:
     PagedSSDCacheManager = None
     BoundarySnapshotSSDStore = None
     MemoryMonitor = None
+    estimate_mla_kv_bytes_per_token = None
     HAS_TIERED_CACHE = False
 
 # Import cache type handlers for hybrid cache support
@@ -394,6 +395,23 @@ class _PrefillState:
     sampler: Any = None
     sm: Any = None
     per_row_lps: Any = None
+
+
+@dataclass
+class _InflightStoreInfo:
+    tokens: list[int]
+    extra_keys: tuple[Any, ...] | None = None
+    extra_key_token_start: int | None = None
+    extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None
+
+
+@dataclass
+class _CacheFreshnessWait:
+    store_request_id: str
+    future: concurrent.futures.Future
+    common_prefix: int
+    prompt_len: int
+    deadline_s: float
 
 
 # ---------------------------------------------------------------------------
@@ -1495,6 +1513,8 @@ class Scheduler:
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
         self._memory_admission_blocked_request_id: str | None = None
         self._memory_admission_blocked_since: float = 0.0
+        self._store_cache_admission_blocked_request_id: str | None = None
+        self._store_cache_admission_blocked_since: float = 0.0
         # EWMA estimator of per-token chunk transient bytes, used by
         # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
         _tracker_model_id = ""
@@ -1550,6 +1570,12 @@ class Scheduler:
         # fork: count async store-cache submit failures so silent cache-store
         # loss is observable (bumped where the submit except-handler logs).
         self._async_store_submit_failures: int = 0
+        self._inflight_store_info: dict[str, _InflightStoreInfo] = {}
+        # Admission-only cache freshness waits. A waiting request can pause at
+        # the front of the queue for a relevant in-flight store without
+        # blocking the scheduler step that continues existing decode/prefill.
+        self._cache_freshness_waits: dict[str, _CacheFreshnessWait] = {}
+        self._prefix_cache_prepared: set[str] = set()
 
         # Mapping between our request IDs and BatchGenerator UIDs
         self.request_id_to_uid: dict[str, int] = {}
@@ -1968,6 +1994,8 @@ class Scheduler:
                 if request_id in self.request_id_to_uid:
                     del self.request_id_to_uid[request_id]
                 self._inflight_store_futures.pop(request_id, None)
+                self._inflight_store_info.pop(request_id, None)
+                self._clear_request_admission_bookkeeping(request_id)
                 # Boundary snapshots were kept on disk for the worker; safe to
                 # delete now that the future has completed. Cleanup was
                 # deferred from _cleanup_finished to avoid racing the worker's
@@ -3098,6 +3126,7 @@ class Scheduler:
     # length; this covers one chunk's worth of growth + measurement noise.
     _PREFILL_TRANSIENT_SAFETY: float = 1.3
     _MEMORY_ADMISSION_STALL_TIMEOUT_S: float = 60.0
+    _STORE_CACHE_ADMISSION_STALL_TIMEOUT_S: float = 60.0
 
     def _predicted_chunk_transient(self, n_tokens: int, kv_len: int) -> float:
         """Conservative predicted Metal peak growth for one prefill chunk.
@@ -3503,6 +3532,23 @@ class Scheduler:
         self._memory_admission_blocked_request_id = None
         self._memory_admission_blocked_since = 0.0
 
+    def _clear_store_cache_admission_blocker(
+        self, request_id: str | None = None
+    ) -> None:
+        if (
+            request_id is not None
+            and request_id != self._store_cache_admission_blocked_request_id
+        ):
+            return
+        self._store_cache_admission_blocked_request_id = None
+        self._store_cache_admission_blocked_since = 0.0
+
+    def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
+        self._cache_freshness_waits.pop(request_id, None)
+        self._prefix_cache_prepared.discard(request_id)
+        self._clear_memory_admission_blocker(request_id)
+        self._clear_store_cache_admission_blocker(request_id)
+
     def _memory_admission_stall_output(self, reason: str) -> RequestOutput | None:
         """Fail one head-of-line request after persistent memory admission stall."""
         if not self.waiting:
@@ -3529,6 +3575,7 @@ class Scheduler:
         self.waiting.popleft()
         self._release_paged_cache_for_request(request_id)
         self.requests.pop(request_id, None)
+        self._clear_request_admission_bookkeeping(request_id)
         get_prefill_tracker().remove(request_id)
         self._clear_memory_admission_blocker(request_id)
 
@@ -3548,6 +3595,73 @@ class Scheduler:
                 "request_id": request_id,
                 "reason": reason,
                 "stalled_seconds": int(stalled_for),
+            },
+        )
+
+    def _store_cache_admission_stall_output(
+        self,
+        reason: str,
+        *,
+        gate_in_flight: int,
+        gate_cap: int,
+        pending_cleanups: int,
+    ) -> RequestOutput | None:
+        """Fail one head-of-line request after persistent store-cache stall."""
+        if not self.waiting:
+            self._clear_store_cache_admission_blocker()
+            return None
+
+        request = self.waiting[0]
+        request_id = request.request_id
+        now = time.monotonic()
+        if request_id != self._store_cache_admission_blocked_request_id:
+            self._store_cache_admission_blocked_request_id = request_id
+            self._store_cache_admission_blocked_since = now
+            return None
+
+        timeout = getattr(
+            self,
+            "_STORE_CACHE_ADMISSION_STALL_TIMEOUT_S",
+            Scheduler._STORE_CACHE_ADMISSION_STALL_TIMEOUT_S,
+        )
+        if now - self._store_cache_admission_blocked_since < timeout:
+            return None
+
+        stalled_for = now - self._store_cache_admission_blocked_since
+        self.waiting.popleft()
+        self._release_paged_cache_for_request(request_id)
+        self.requests.pop(request_id, None)
+        self._clear_request_admission_bookkeeping(request_id)
+        get_prefill_tracker().remove(request_id)
+
+        message = (
+            "Request could not be admitted because store-cache cleanup stayed "
+            f"full for {stalled_for:.1f}s ({reason}). The previous response "
+            "cache is still being persisted; retry after the cache writer drains "
+            "or reduce cache/write pressure."
+        )
+        logger.warning(
+            "Store-cache admission stalled for %s: %s "
+            "(in_flight=%d pending_cleanups=%d cap=%d)",
+            request_id,
+            message,
+            gate_in_flight,
+            pending_cleanups,
+            gate_cap,
+        )
+        return RequestOutput(
+            request_id=request_id,
+            finished=True,
+            finish_reason="error",
+            error=message,
+            error_code="store_cache_admission_stalled",
+            error_metadata={
+                "request_id": request_id,
+                "reason": reason,
+                "stalled_seconds": int(stalled_for),
+                "store_cache_in_flight": gate_in_flight,
+                "pending_store_cleanups": pending_cleanups,
+                "store_cache_cap": gate_cap,
             },
         )
 
@@ -4010,6 +4124,7 @@ class Scheduler:
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
                 self.requests.pop(rid, None)
+                self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
                 _sync_and_clear_cache()
                 rejected.append(_prefill_memory_exception_output(rid, e))
@@ -4019,6 +4134,7 @@ class Scheduler:
                 self._prefill_states.pop(rid, None)
                 self._release_paged_cache_for_request(rid)
                 self.requests.pop(rid, None)
+                self._clear_request_admission_bookkeeping(rid)
                 get_prefill_tracker().remove(rid)
                 # Drop Metal cache pool buffers held by the aborted chunk's
                 # forward / mx.eval transients. Without this, enforcer keeps
@@ -5450,38 +5566,147 @@ class Scheduler:
                 f"{best_p}: stored=...{stored_ctx!r} vs prompt=...{prompt_ctx!r}"
             )
 
-    def add_request(self, request: Request) -> None:
+    _CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS = 8192
+    _CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS = 8192
+    _CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO = 0.30
+    _CACHE_FRESHNESS_WAIT_TIMEOUT_S = 4.0
+
+    @staticmethod
+    def _store_extra_keys_match(
+        info: _InflightStoreInfo,
+        request: Request,
+    ) -> bool:
+        return (
+            info.extra_keys == request.vlm_extra_keys_for_cache
+            and info.extra_key_token_start
+            == request.vlm_extra_key_token_start_for_cache
+            and info.extra_key_ranges == request.vlm_extra_key_ranges_for_cache
+        )
+
+    def _find_relevant_inflight_store(
+        self,
+        request: Request,
+    ) -> tuple[str, concurrent.futures.Future, int] | None:
+        """Find a pending store_cache job worth waiting for before lookup."""
+        if not self._inflight_store_futures:
+            return None
+
+        prompt = request.prompt_token_ids or []
+        if len(prompt) < self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_TOKENS:
+            return None
+
+        best_rid: str | None = None
+        best_future: concurrent.futures.Future | None = None
+        best_common = 0
+        for rid, future in list(self._inflight_store_futures.items()):
+            if future.done():
+                continue
+            info = self._inflight_store_info.get(rid)
+            if info is None or not self._store_extra_keys_match(info, request):
+                continue
+
+            common = self._common_prefix_len(prompt, info.tokens)
+            if common > best_common:
+                best_rid = rid
+                best_future = future
+                best_common = common
+
+        if best_future is None or best_rid is None:
+            return None
+        if not (
+            best_common >= self._CACHE_FRESHNESS_WAIT_MIN_COMMON_TOKENS
+            or best_common / len(prompt)
+            >= self._CACHE_FRESHNESS_WAIT_MIN_PROMPT_RATIO
+        ):
+            return None
+
+        return best_rid, best_future, best_common
+
+    def _should_defer_for_cache_freshness(self, request: Request) -> bool:
+        """Defer only this waiting request until a relevant store is visible.
+
+        This intentionally does not call Future.result(). The scheduler step can
+        return immediately, so running decode rows and chunked prefills continue
+        on subsequent steps while the waiting head holds admission order.
         """
-        Add a new request to the scheduler.
+        if self.block_aware_cache is None:
+            return False
 
-        Raises SchedulerQueueFullError when the waiting queue is at or above
-        the configured cap (max(max_num_seqs * 4, 32)). Server layer maps
-        this to HTTP 503 + Retry-After.
+        now = time.monotonic()
+        wait = self._cache_freshness_waits.get(request.request_id)
+        if wait is not None:
+            if wait.future.done():
+                self._cache_freshness_waits.pop(request.request_id, None)
+                try:
+                    exc = wait.future.exception()
+                except concurrent.futures.CancelledError:
+                    logger.debug(
+                        "Cache freshness deferral saw cancelled store_cache %s "
+                        "before prefix lookup for %s",
+                        wait.store_request_id,
+                        request.request_id,
+                    )
+                else:
+                    if exc is None:
+                        logger.debug(
+                            "Completed cache freshness deferral for store_cache %s "
+                            "before prefix lookup for %s",
+                            wait.store_request_id,
+                            request.request_id,
+                        )
+                    else:
+                        logger.debug(
+                            "Cache freshness deferral saw failed store_cache %s "
+                            "before prefix lookup for %s: %s",
+                            wait.store_request_id,
+                            request.request_id,
+                            exc,
+                        )
+                return False
+            if now >= wait.deadline_s:
+                self._cache_freshness_waits.pop(request.request_id, None)
+                logger.debug(
+                    "Timed out cache freshness deferral for store_cache %s before "
+                    "prefix lookup for %s (common_prefix=%d/%d)",
+                    wait.store_request_id,
+                    request.request_id,
+                    wait.common_prefix,
+                    wait.prompt_len,
+                )
+                return False
+            return True
 
-        Args:
-            request: The request to add
-        """
-        if request.request_id in self.requests:
-            raise ValueError(f"Request {request.request_id} already exists")
+        match = self._find_relevant_inflight_store(request)
+        if match is None:
+            return False
 
-        # Cap the waiting queue so client-side polling can't accumulate
-        # unbounded work and the scheduler can apply backpressure via 503.
-        max_waiting = max(self.config.max_num_seqs * 4, 32)
-        if len(self.waiting) >= max_waiting:
-            from .exceptions import SchedulerQueueFullError
+        store_request_id, future, common_prefix = match
+        prompt_len = len(request.prompt_token_ids or [])
+        timeout = self._CACHE_FRESHNESS_WAIT_TIMEOUT_S
+        self._cache_freshness_waits[request.request_id] = _CacheFreshnessWait(
+            store_request_id=store_request_id,
+            future=future,
+            common_prefix=common_prefix,
+            prompt_len=prompt_len,
+            deadline_s=now + timeout,
+        )
 
-            raise SchedulerQueueFullError(
-                current_depth=len(self.waiting),
-                max_depth=max_waiting,
-            )
+        logger.debug(
+            "Deferring admission up to %.1fs for in-flight store_cache %s before "
+            "prefix lookup for %s (common_prefix=%d/%d running=%d prefilling=%d)",
+            timeout,
+            store_request_id,
+            request.request_id,
+            common_prefix,
+            prompt_len,
+            len(self.running),
+            len(self.prefilling),
+        )
+        return True
 
-        # Tokenize if needed
-        if request.prompt_token_ids is None:
-            if isinstance(request.prompt, str):
-                request.prompt_token_ids = self.tokenizer.encode(request.prompt)
-            else:
-                request.prompt_token_ids = list(request.prompt)
-            request.num_prompt_tokens = len(request.prompt_token_ids)
+    def _prepare_prefix_cache_for_request(self, request: Request) -> None:
+        if request.request_id in self._prefix_cache_prepared:
+            return
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
@@ -5524,6 +5749,12 @@ class Scheduler:
                     request.remaining_tokens = request.prompt_token_ids[
                         block_table.num_tokens :
                     ]
+                    if self._align_minimax_m3_partial_cache_to_prefill_step(request):
+                        request.cached_tokens = block_table.num_tokens
+                        request.shared_prefix_blocks = len(block_table.block_ids)
+                        request.remaining_tokens = request.prompt_token_ids[
+                            block_table.num_tokens :
+                        ]
                     # For exact prefix hits we need cache state at (N-1) and the
                     # last prompt token as input to produce the first decode logit.
                     # Reusing cache state at N and feeding the last token again
@@ -5613,22 +5844,59 @@ class Scheduler:
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
+        self._prefix_cache_prepared.add(request.request_id)
 
-        # Front-door preflight: reject obviously-too-large requests at
-        # ``add_request`` rather than letting them sit in the waiting
-        # queue and trip the in-stream re-check later. The cache lookup
-        # above may have already attached a ``block_table`` whose ref
-        # counts must be released before re-raising — otherwise a
-        # sustained rejection stream leaks one block table per call.
-        try:
-            self.preflight_or_raise(
-                num_prompt_tokens=request.num_prompt_tokens,
-                cached_tokens=request.cached_tokens or 0,
-                request_id=request.request_id,
+    def add_request(self, request: Request) -> None:
+        """
+        Add a new request to the scheduler.
+
+        Raises SchedulerQueueFullError when the waiting queue is at or above
+        the configured cap (max(max_num_seqs * 4, 32)). Server layer maps
+        this to HTTP 503 + Retry-After.
+
+        Args:
+            request: The request to add
+        """
+        if request.request_id in self.requests:
+            raise ValueError(f"Request {request.request_id} already exists")
+
+        # Cap the waiting queue so client-side polling can't accumulate
+        # unbounded work and the scheduler can apply backpressure via 503.
+        max_waiting = max(self.config.max_num_seqs * 4, 32)
+        if len(self.waiting) >= max_waiting:
+            from .exceptions import SchedulerQueueFullError
+
+            raise SchedulerQueueFullError(
+                current_depth=len(self.waiting),
+                max_depth=max_waiting,
             )
-        except Exception:
-            self._release_paged_cache_for_request(request.request_id)
-            raise
+
+        # Tokenize if needed
+        if request.prompt_token_ids is None:
+            if isinstance(request.prompt, str):
+                request.prompt_token_ids = self.tokenizer.encode(request.prompt)
+            else:
+                request.prompt_token_ids = list(request.prompt)
+            request.num_prompt_tokens = len(request.prompt_token_ids)
+
+        # Prefix-cache lookup is intentionally delayed until admission. That
+        # lets a same-prefix request wait for a relevant in-flight store_cache
+        # without blocking the scheduler lane that continues decode/prefill.
+        #
+        # Keep the immediate preflight only when no prefix cache lookup can
+        # change cached_tokens. With a block-aware cache, the in-stream
+        # _preflight_memory_check runs after lookup with the final cache state.
+        if self.block_aware_cache is None:
+            request.remaining_tokens = request.prompt_token_ids
+            try:
+                self.preflight_or_raise(
+                    num_prompt_tokens=request.num_prompt_tokens,
+                    cached_tokens=request.cached_tokens or 0,
+                    request_id=request.request_id,
+                )
+            except Exception:
+                self._release_paged_cache_for_request(request.request_id)
+                raise
 
         # Add to tracking
         self.requests[request.request_id] = request
@@ -5790,8 +6058,8 @@ class Scheduler:
             )
             return None
 
-        # Handle both LanguageModelOutput (dense models) and 3-tuple
-        # (logits, hidden, gdn_states) returned by the MoE MTP runtime patch.
+        # Handle current LanguageModelOutput and legacy tuple
+        # (logits, hidden, gdn_states) MTP runtime patch returns.
         if isinstance(out, tuple):
             logits = out[0][:, -1, :]
             hidden_raw = out[1]
@@ -6192,20 +6460,31 @@ class Scheduler:
 
     def _trim_prompt_cache_for_generation(self, cache_list: list[Any]) -> bool:
         """Trim each cache layer by one token for exact-hit generation kickoff."""
+        return self._trim_prompt_cache_by_tokens(cache_list, 1)
+
+    def _trim_prompt_cache_by_tokens(self, cache_list: list[Any], n: int) -> bool:
+        """Trim each cache layer by n tokens."""
         if not cache_list:
             return False
+        if n <= 0:
+            return True
 
         for cache_obj in cache_list:
-            if not self._trim_cache_tree_by_one(cache_obj):
+            if not self._trim_cache_tree_by_tokens(cache_obj, n):
                 return False
         return True
 
     def _trim_cache_tree_by_one(self, cache_obj: Any) -> bool:
         """Trim one token from cache object (recursively for CacheList)."""
+        return self._trim_cache_tree_by_tokens(cache_obj, 1)
+
+    def _trim_cache_tree_by_tokens(self, cache_obj: Any, n: int) -> bool:
+        """Trim n tokens from cache object (recursively for CacheList)."""
         sub_caches = getattr(cache_obj, "caches", None)
         if isinstance(sub_caches, (list, tuple)):
             return all(
-                self._trim_cache_tree_by_one(sub_cache) for sub_cache in sub_caches
+                self._trim_cache_tree_by_tokens(sub_cache, n)
+                for sub_cache in sub_caches
             )
 
         trim_fn = getattr(cache_obj, "trim", None)
@@ -6213,12 +6492,113 @@ class Scheduler:
             return False
 
         try:
-            trimmed = trim_fn(1)
+            trimmed = trim_fn(n)
             if trimmed is None:
                 return True
-            return int(trimmed) >= 1
+            return int(trimmed) >= n
         except Exception:
             return False
+
+    def _cache_tree_has_class_name(
+        self,
+        cache_obj: Any,
+        class_names: frozenset[str],
+    ) -> bool:
+        """Return True when a cache tree contains one of the named cache classes."""
+        if type(cache_obj).__name__ in class_names:
+            return True
+        sub_caches = getattr(cache_obj, "caches", None)
+        if isinstance(sub_caches, (list, tuple)):
+            return any(
+                self._cache_tree_has_class_name(sub_cache, class_names)
+                for sub_cache in sub_caches
+            )
+        return False
+
+    def _align_minimax_m3_partial_cache_to_prefill_step(
+        self,
+        request: "Request",
+    ) -> bool:
+        """Align MiniMax M3 partial hits to external prefill chunk boundaries."""
+        cache_list = request.prompt_cache
+        block_table = request.block_table
+        prompt_tokens = request.prompt_token_ids or []
+        if not cache_list or block_table is None or not block_table.block_ids:
+            return False
+        if (
+            block_table.num_tokens <= 0
+            or block_table.num_tokens >= len(prompt_tokens)
+        ):
+            return False
+
+        minimax_m3_names = frozenset({"MiniMaxM3KVCache"})
+        has_minimax_m3 = any(
+            self._cache_tree_has_class_name(cache_obj, minimax_m3_names)
+            for cache_obj in cache_list
+        )
+        if not has_minimax_m3:
+            return False
+
+        block_size = int(getattr(self.config, "paged_cache_block_size", 0) or 0)
+        prefill_step = int(getattr(self.config, "prefill_step_size", 0) or 0)
+        if block_size <= 0 or prefill_step <= block_size:
+            return False
+
+        aligned_tokens = (block_table.num_tokens // prefill_step) * prefill_step
+        aligned_tokens = (aligned_tokens // block_size) * block_size
+        if aligned_tokens <= 0 or aligned_tokens >= block_table.num_tokens:
+            return False
+
+        target_block_count = 0
+        target_tokens = 0
+        for block_id in block_table.block_ids:
+            block = (
+                self.paged_cache_manager.allocated_blocks.get(block_id)
+                if self.paged_cache_manager is not None
+                else None
+            )
+            token_count = int(getattr(block, "token_count", block_size) or block_size)
+            if target_tokens + token_count > aligned_tokens:
+                break
+            target_tokens += token_count
+            target_block_count += 1
+
+        if target_tokens != aligned_tokens:
+            logger.debug(
+                "MiniMax M3 partial cache alignment skipped for %s: cannot align "
+                "block table from %d to %d tokens",
+                request.request_id,
+                block_table.num_tokens,
+                aligned_tokens,
+            )
+            return False
+
+        trim_tokens = block_table.num_tokens - aligned_tokens
+        if not self._trim_prompt_cache_by_tokens(cache_list, trim_tokens):
+            logger.debug(
+                "MiniMax M3 partial cache alignment skipped for %s: cache trim "
+                "by %d tokens failed",
+                request.request_id,
+                trim_tokens,
+            )
+            return False
+
+        dropped_block_ids = block_table.block_ids[target_block_count:]
+        if self.paged_cache_manager is not None:
+            for block_id in dropped_block_ids:
+                self.paged_cache_manager.free_block(block_id)
+        block_table.block_ids = block_table.block_ids[:target_block_count]
+        block_table.num_tokens = aligned_tokens
+
+        logger.info(
+            "MiniMax M3 partial cache aligned to prefill step for %s: "
+            "%d -> %d tokens, dropped %d block(s)",
+            request.request_id,
+            aligned_tokens + trim_tokens,
+            aligned_tokens,
+            len(dropped_block_ids),
+        )
+        return True
 
     def _remove_uid_from_active_batch(self, uid: int) -> None:
         """Remove UID from BatchGenerator safely.
@@ -6341,6 +6721,8 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return False
+
+        self._clear_request_admission_bookkeeping(request_id)
 
         # Remove from waiting queue
         if request.status == RequestStatus.WAITING:
@@ -6530,6 +6912,7 @@ class Scheduler:
         for request_id in list(self.running):
             failed_ids.append(request_id)
             req = self.requests.pop(request_id, None)
+            self._clear_request_admission_bookkeeping(request_id)
             if req is not None:
                 req._extracted_cache = None
                 req.prompt_cache = None
@@ -6537,6 +6920,7 @@ class Scheduler:
         for request in list(self.prefilling):
             failed_ids.append(request.request_id)
             req = self.requests.pop(request.request_id, None)
+            self._clear_request_admission_bookkeeping(request.request_id)
             if req is not None:
                 req._extracted_cache = None
                 req.prompt_cache = None
@@ -6545,6 +6929,7 @@ class Scheduler:
         for request in list(self.waiting):
             failed_ids.append(request.request_id)
             req = self.requests.pop(request.request_id, None)
+            self._clear_request_admission_bookkeeping(request.request_id)
             if req is not None:
                 req._extracted_cache = None
                 req.prompt_cache = None
@@ -6570,6 +6955,7 @@ class Scheduler:
                 continue
             failed_ids.append(request_id)
             req = self.requests.pop(request_id, None)
+            self._clear_request_admission_bookkeeping(request_id)
             if req is not None:
                 req._extracted_cache = None
                 req.prompt_cache = None
@@ -7086,8 +7472,25 @@ class Scheduler:
                     except Exception:
                         memory_related_gate = False
                 if memory_related_gate:
+                    if self.waiting:
+                        self._clear_store_cache_admission_blocker(
+                            self.waiting[0].request_id
+                        )
                     stalled = self._memory_admission_stall_output(
                         "store_cache_backpressure"
+                    )
+                    if stalled is not None:
+                        rejected_outputs.append(stalled)
+                else:
+                    if self.waiting:
+                        self._clear_memory_admission_blocker(
+                            self.waiting[0].request_id
+                        )
+                    stalled = self._store_cache_admission_stall_output(
+                        "store_cache_backpressure",
+                        gate_in_flight=gate.in_flight,
+                        gate_cap=gate.cap,
+                        pending_cleanups=pending_store_cleanups,
                     )
                     if stalled is not None:
                         rejected_outputs.append(stalled)
@@ -7114,8 +7517,16 @@ class Scheduler:
                         rejected_outputs.append(stalled)
                     break
 
-            request = self.waiting.popleft()
+            request = self.waiting[0]
             self._clear_memory_admission_blocker(request.request_id)
+            self._clear_store_cache_admission_blocker(request.request_id)
+            if self._should_defer_for_cache_freshness(request):
+                break
+
+            request = self.waiting.popleft()
+            self._cache_freshness_waits.pop(request.request_id, None)
+            self._clear_memory_admission_blocker(request.request_id)
+            self._clear_store_cache_admission_blocker(request.request_id)
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
@@ -7124,6 +7535,8 @@ class Scheduler:
                 # Put back and try again later
                 self.waiting.appendleft(request)
                 break
+
+            self._prepare_prefix_cache_for_request(request)
 
             # Determine tokens to process and cache to use
             # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
@@ -7234,6 +7647,7 @@ class Scheduler:
                 )
                 self._release_paged_cache_for_request(request.request_id)
                 self.requests.pop(request.request_id, None)
+                self._clear_request_admission_bookkeeping(request.request_id)
                 rejected_outputs.append(
                     _prefill_memory_error_output(
                         request.request_id,
@@ -7527,6 +7941,7 @@ class Scheduler:
                         )
                         self._release_paged_cache_for_request(request.request_id)
                         self.requests.pop(request.request_id, None)
+                        self._clear_request_admission_bookkeeping(request.request_id)
                         get_prefill_tracker().remove(request.request_id)
                         _sync_and_clear_cache()
                         rejected_outputs.append(
@@ -7547,6 +7962,7 @@ class Scheduler:
                         )
                         self._release_paged_cache_for_request(request.request_id)
                         self.requests.pop(request.request_id, None)
+                        self._clear_request_admission_bookkeeping(request.request_id)
                         get_prefill_tracker().remove(request.request_id)
                         # Drop Metal cache pool buffers held by the aborted
                         # first chunk's forward / mx.eval transients.
@@ -7628,6 +8044,7 @@ class Scheduler:
                     self.request_id_to_uid.pop(request.request_id, None)
                     self._release_paged_cache_for_request(request.request_id)
                     self.requests.pop(request.request_id, None)
+                    self._clear_request_admission_bookkeeping(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
                     _sync_and_clear_cache()
                     rejected_outputs.append(
@@ -7647,6 +8064,7 @@ class Scheduler:
                     self.request_id_to_uid.pop(request.request_id, None)
                     self._release_paged_cache_for_request(request.request_id)
                     self.requests.pop(request.request_id, None)
+                    self._clear_request_admission_bookkeeping(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
                     # Drop Metal cache pool buffers held by the aborted
                     # chunk's forward / mx.eval transients.
@@ -8262,6 +8680,18 @@ class Scheduler:
                                         gate.note_done()
                                     raise
                                 self._inflight_store_futures[request_id] = store_future
+                                self._inflight_store_info[request_id] = (
+                                    _InflightStoreInfo(
+                                        tokens=list(token_sequence_to_store),
+                                        extra_keys=request.vlm_extra_keys_for_cache,
+                                        extra_key_token_start=(
+                                            request.vlm_extra_key_token_start_for_cache
+                                        ),
+                                        extra_key_ranges=(
+                                            request.vlm_extra_key_ranges_for_cache
+                                        ),
+                                    )
+                                )
                             else:
                                 # Executor unavailable — synchronous fallback.
                                 self._async_store_cache_worker(
@@ -8375,6 +8805,7 @@ class Scheduler:
             # _drain_pending_async_removes) clears the request later.
             if store_future is None:
                 req_to_remove = self.requests.pop(request_id, None)
+                self._clear_request_admission_bookkeeping(request_id)
                 if req_to_remove is not None:
                     req_to_remove._extracted_cache = None
                     req_to_remove.prompt_cache = None
@@ -8547,6 +8978,7 @@ class Scheduler:
                     del self.running[request_id]
                     # Clean up from requests dict (prevent memory leak)
                     req = self.requests.pop(request_id, None)
+                    self._clear_request_admission_bookkeeping(request_id)
                     if req is not None:
                         req._extracted_cache = None
                         req.prompt_cache = None
@@ -8619,6 +9051,7 @@ class Scheduler:
             if request.generation_overflow_retries > max_generation_overflow_retries:
                 failed_ids.append(request_id)
                 req = self.requests.pop(request_id, None)
+                self._clear_request_admission_bookkeeping(request_id)
                 if req is not None:
                     req._extracted_cache = None
                     req.prompt_cache = None
@@ -8996,7 +9429,9 @@ class Scheduler:
 
     def remove_finished_request(self, request_id: str) -> Request | None:
         """Remove a finished request from tracking."""
-        return self.requests.pop(request_id, None)
+        request = self.requests.pop(request_id, None)
+        self._clear_request_admission_bookkeeping(request_id)
+        return request
 
     def get_stats(self) -> dict[str, Any]:
         """Get scheduler statistics."""
@@ -9080,6 +9515,9 @@ class Scheduler:
                 self._store_cache_gate.note_done()
         self._pending_async_removes.clear()
         self._inflight_store_futures.clear()
+        self._inflight_store_info.clear()
+        self._cache_freshness_waits.clear()
+        self._prefix_cache_prepared.clear()
         self.batch_generator = None
         self._current_sampler_params = None
         self._boundary_cache_snapshots.clear()
@@ -9183,6 +9621,10 @@ class Scheduler:
                 logger.warning(f"Async store_cache shutdown error: {e}")
             self._store_cache_executor = None
             self._store_cache_gate = None
+            self._inflight_store_futures.clear()
+            self._inflight_store_info.clear()
+            self._cache_freshness_waits.clear()
+            self._prefix_cache_prepared.clear()
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
@@ -9349,6 +9791,16 @@ class Scheduler:
                 else:
                     dtype_size = tq_dtype_size
 
+            kv_bytes_per_token = (
+                estimate_mla_kv_bytes_per_token(
+                    config,
+                    cache_list_for_tq,
+                    base_dtype_size,
+                )
+                if estimate_mla_kv_bytes_per_token is not None
+                else None
+            )
+
             # Truthiness alone isn't enough — MagicMock proxies leaking
             # through the descent (test scaffolds that don't fully spec
             # ``model.config``) are truthy but fail any later numeric
@@ -9368,6 +9820,7 @@ class Scheduler:
                     # SDPA scores are materialized at the compute/activation
                     # dtype, not the (possibly fractional TurboQuant) KV width.
                     compute_dtype_size=base_dtype_size,
+                    kv_bytes_per_token=kv_bytes_per_token,
                 )
                 logger.debug(
                     f"Model info for memory estimation: "
