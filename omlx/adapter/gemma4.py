@@ -19,6 +19,9 @@ _TOOL_RESPONSE_OPEN = "<|tool_response>"
 _TOOL_RESPONSE_CLOSE = "<tool_response|>"
 _THINK_OPEN = "<think>\n"
 _THINK_CLOSE = "</think>\n"
+# fork: headless thought marker seen at the START of a continuation response
+# when the template failed to prime the channel (see _consume_text).
+_OPEN_MARKER_HEAD = "thought\n"
 
 _LEADING_THOUGHT_RE = re.compile(
     r"\A\s*(?:(?:<think>.*?</think>|<\|channel>.*?<channel\|>)\s*)+",
@@ -309,6 +312,9 @@ class Gemma4OutputParserSession:
         self._buffer = ""
         self._in_thought = False
         self._text_mode = False
+        # fork: have we processed the head of the response yet? Used to catch a
+        # HEADLESS thought marker (see _consume_text) only at the very start.
+        self._started = False
 
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
@@ -369,6 +375,33 @@ class Gemma4OutputParserSession:
         stream_parts: list[str] = []
         visible_parts: list[str] = []
         pos = 0
+
+        # fork: headless thought marker. On a tool-CONTINUATION turn the chat
+        # template stops priming `<|channel>thought`, so gemma-4 emits a HEADLESS
+        # "thought\n…<channel|>" — the channel name + close, with the leading
+        # `<|channel>` OPEN token absent. The marker scan below keys on `<...>`
+        # spellings, so without an open token the reasoning prose streams as
+        # visible content (and the orphan `<channel|>` is dropped) — the
+        # reasoning leaks into the answer. Treat a leading "thought\n" at the
+        # very START of the response as an implicit thought-open. Gated to the
+        # response head (not started, not in thought) so it can NEVER fire
+        # mid-content; "thoughts about X" etc. are not matched (need exact
+        # "thought\n").
+        if not self._started and not self._in_thought:
+            head = source.lstrip()
+            lead_ws = len(source) - len(head)
+            if head.startswith("thought\n"):
+                stream_parts.append(_THINK_OPEN)
+                visible_parts.append(_THINK_OPEN)
+                self._in_thought = True
+                self._started = True
+                pos = lead_ws + len("thought\n")
+            elif not final and _OPEN_MARKER_HEAD.startswith(head):
+                # Could still grow into "thought\n" — buffer and re-decide.
+                self._buffer = source
+                return OutputParserTokenResult(stream_text="", visible_text="")
+            else:
+                self._started = True
 
         while pos < len(source):
             markers = self._active_markers()
