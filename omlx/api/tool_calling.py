@@ -1105,6 +1105,85 @@ def parse_tool_calls(
     return cleaned_text, tool_calls
 
 
+# fork: gemma-4 MoE degrades the tool-call OPEN envelope under agentic load on
+# continuation turns. Observed spellings that the exact paired regex
+# `<|tool_call>(.*?)<tool_call|>` in _parse_tool_calls_impl misses: "<| tool_call>"
+# (space), "<|tool_call|>" (double-pipe open), and an UNPAIRED open (no close
+# token at all, from truncation/degradation). When missed, the markup leaks into
+# delta.content with finish_reason="stop" and the call is dropped. This recovers
+# it by routing the marker-delimited body through the robust gemma-4 fallback
+# parser. HARD INVARIANT (do not relax): only ever parse text that is bounded by a
+# recognized OPEN marker. The fallback's _GEMMA4_CALL_HEAD makes the "call:" prefix
+# optional, so on raw prose it would fabricate calls from "config{x: 1}" or
+# "def f():"; requiring the open marker is what keeps it safe.
+_GEMMA4_TOLERANT_OPEN = re.compile(r"<\|\s*tool_call\s*\|?>")
+_GEMMA4_TOLERANT_CLOSE = "<tool_call|>"
+
+
+def _recover_gemma4_degraded_tool_calls(
+    text: str, cleaned_text: str
+) -> Tuple[Optional[List[ToolCall]], str]:
+    """Recover gemma-4 tool calls from a degraded/unpaired open envelope that the
+    canonical paired regex missed. GATE this on the gemma marker at the call site.
+    Returns (tool_calls or None, cleaned_text with the markup removed)."""
+    recovered: List[ToolCall] = []
+    for match in _GEMMA4_TOLERANT_OPEN.finditer(text):
+        body_start = match.end()
+        close_idx = text.find(_GEMMA4_TOLERANT_CLOSE, body_start)
+        body = (
+            text[body_start:close_idx]
+            if close_idx != -1
+            else text[body_start:]
+        ).strip()
+        if not body:
+            continue
+        try:
+            parsed = _parse_gemma4_tool_call_fallback(body)
+        except (
+            ValueError,
+            json.JSONDecodeError,
+            KeyError,
+            SyntaxError,
+            TypeError,
+        ):
+            continue
+        for item in parsed if isinstance(parsed, list) else [parsed]:
+            name = item.get("name", "")
+            if not name:
+                continue
+            recovered.append(
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:8]}",
+                    type="function",
+                    function=FunctionCall(
+                        name=name,
+                        arguments=_serialize_tool_call_arguments(
+                            item.get("arguments", {})
+                        ),
+                    ),
+                )
+            )
+    if not recovered:
+        return None, cleaned_text
+    # Drop the recovered markup from the visible text: paired spans first, then a
+    # dangling unpaired open (open-to-end). Both begin at a recognized open marker.
+    cleaned_text = re.sub(
+        r"<\|\s*tool_call\s*\|?>.*?<tool_call\|>",
+        "",
+        cleaned_text,
+        flags=re.DOTALL,
+    )
+    cleaned_text = re.sub(
+        r"<\|\s*tool_call\s*\|?>.*$", "", cleaned_text, flags=re.DOTALL
+    )
+    logger.warning(
+        "Recovered %d gemma-4 tool call(s) from a degraded/unpaired streaming "
+        "envelope that the canonical paired regex missed",
+        len(recovered),
+    )
+    return recovered, cleaned_text.strip()
+
+
 def _parse_tool_calls_impl(
     text: str,
     tokenizer: Any,
@@ -1231,6 +1310,15 @@ def _parse_tool_calls_impl(
                             match[:200],
                         )
                     continue
+
+            # fork: the exact paired regex above misses gemma-4's degraded/unpaired
+            # open envelopes on continuation turns — recover them before giving up.
+            if not tool_calls and tool_call_start == "<|tool_call>":
+                recovered, cleaned_text = _recover_gemma4_degraded_tool_calls(
+                    text, cleaned_text
+                )
+                if recovered:
+                    return cleaned_text, recovered
 
             if tool_calls:
                 if tool_call_end:
