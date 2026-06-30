@@ -583,6 +583,28 @@ class EnginePool:
         if self._entry_is_busy(entry):
             raise ModelBusyError(entry.model_id, operation)
 
+    @staticmethod
+    def _engine_has_usable_tokenizer(engine: object) -> bool:
+        tokenizer = getattr(engine, "tokenizer", None)
+        return tokenizer is not None and callable(getattr(tokenizer, "encode", None))
+
+    def _validate_llm_engine_ready(self, model_id: str, engine: object | None) -> None:
+        if engine is None:
+            raise ModelLoadingError(
+                model_id,
+                f"Model '{model_id}' did not return a loaded engine.",
+            )
+        llm_engine_types = [BaseEngine]
+        if isinstance(VLMBatchedEngine, type):
+            llm_engine_types.append(VLMBatchedEngine)
+        if isinstance(engine, tuple(llm_engine_types)) and not (
+            self._engine_has_usable_tokenizer(engine)
+        ):
+            raise ModelLoadingError(
+                model_id,
+                f"Model '{model_id}' loaded without a usable tokenizer.",
+            )
+
     def _mark_pending_unload_locked(
         self,
         model_id: str,
@@ -752,6 +774,7 @@ class EnginePool:
                         )
                         await self._unload_engine(model_id)
                     elif entry.engine is not None:
+                        self._validate_llm_engine_ready(model_id, entry.engine)
                         if entry.runtime_settings_signature is None:
                             entry.runtime_settings_signature = expected_signature
                         entry.last_access = time.time()
@@ -917,8 +940,8 @@ class EnginePool:
                 if fut is not None and not fut.done():
                     fut.set_result(True)
                 loaded = self._entries.get(model_id)
-                if loaded is None or loaded.engine is None:
-                    raise ModelLoadingError(model_id)
+                loaded_engine = loaded.engine if loaded is not None else None
+                self._validate_llm_engine_ready(model_id, loaded_engine)
                 loaded.last_access = time.time()
                 if _lease:
                     loaded.in_use += 1
@@ -1708,9 +1731,11 @@ class EnginePool:
                 # already-loaded engines may still have in-flight work.
                 await self._reclaim_mlx_cache(loop, exclude_model_id=model_id)
                 raise ModelLoadingError(
-                    f"Model {model_id} load aborted: " f"process memory limit exceeded"
+                    model_id,
+                    f"Model '{model_id}' load aborted: process memory limit exceeded",
                 )
 
+            self._validate_llm_engine_ready(model_id, engine)
             entry.engine = engine
             entry.last_access = time.time()
             entry.resident_size = entry.estimated_size
