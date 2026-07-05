@@ -281,6 +281,11 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
+        # Drop transient aliases after ownership moves to the engine/scheduler
+        # graph, so close()/deep_reset() can make that graph unreachable.
+        model = None
+        tokenizer = None
+
         logger.debug(f"Engine {self._engine_id} initialized")
 
     async def start(self) -> None:
@@ -1173,6 +1178,9 @@ class AsyncEngineCore:
         # fork: hold the fire-and-forget start task so it isn't GC'd mid-flight
         # and its exceptions aren't silently dropped (see start()).
         self._start_task: Optional[asyncio.Task] = None
+        # Drop wrapper-local aliases after EngineCore takes ownership.
+        model = None
+        tokenizer = None
 
     @property
     def _mlx_executor(self):

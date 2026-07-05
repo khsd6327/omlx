@@ -99,6 +99,9 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping embedding engine: {self._model_name}")
+        model = self._model
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(get_mlx_executor(), model.close)
         self._model = None
 
         gc.collect()

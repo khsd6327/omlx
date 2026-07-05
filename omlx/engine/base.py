@@ -37,6 +37,19 @@ def sync_and_clear_mlx_cache(stream=None) -> None:
     _sync_and_clear_cache(stream)
 
 
+def _clear_teardown_references(
+    engine: object,
+    *,
+    none_attrs: tuple[str, ...],
+    false_attrs: tuple[str, ...] = (),
+) -> None:
+    """Clear wrapper-side references in a consistent stop() teardown pass."""
+    for attr in none_attrs:
+        setattr(engine, attr, None)
+    for attr in false_attrs:
+        setattr(engine, attr, False)
+
+
 def _warn_scheduler_unreachable_once(
     engine: object, method: str, detail: str = ""
 ) -> None:
