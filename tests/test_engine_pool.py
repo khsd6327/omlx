@@ -309,7 +309,7 @@ class TestEnginePoolErrors:
         assert pool.get_entry("model-a") is None
 
 
-class TestEnginePoolStatus:
+class TestEnginePoolStatusReporting:
     """Tests for EnginePool status reporting."""
 
     def test_get_status(self, small_mock_model_dir):
@@ -333,6 +333,25 @@ class TestEnginePoolStatus:
         model_a_status = next(m for m in status["models"] if m["id"] == "model-a")
         assert model_a_status["pinned"] is True
         assert model_a_status["loaded"] is False
+
+    def test_get_status_reports_untracked_native_memory(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """No loaded engine should not hide residual MLX/Metal memory."""
+        gb = 1024**3
+        pool = _make_pool(ceiling=64 * gb)
+        pool.discover_models(str(small_mock_model_dir))
+
+        monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 47 * gb)
+        monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+
+        status = pool.get_status()
+
+        assert status["loaded_count"] == 0
+        assert status["current_model_memory"] == 0
+        assert status["observed_native_memory"] == 47 * gb
+        assert status["untracked_native_memory"] == 47 * gb
+        assert status["effective_model_memory"] == 47 * gb
 
     def test_get_model_ids(self, small_mock_model_dir):
         """Test get_model_ids returns all model IDs."""

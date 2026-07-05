@@ -11,16 +11,17 @@ Covers:
 """
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
 from omlx.engine_pool import EnginePool, EngineEntry
 
 
-def _entry(model_id: str, **kw) -> EngineEntry:
+def _entry(model_id: str, model_path: str | None = None, **kw) -> EngineEntry:
     return EngineEntry(
         model_id=model_id,
-        model_path=f"/tmp/{model_id}",
+        model_path=model_path or f"/tmp/{model_id}",
         model_type="llm",
         engine_type="batched",
         estimated_size=1024,
@@ -28,17 +29,23 @@ def _entry(model_id: str, **kw) -> EngineEntry:
     )
 
 
-def _make_pool(*model_ids: str) -> EnginePool:
+def _make_pool(*model_ids: str, model_root: Path | None = None) -> EnginePool:
     pool = EnginePool()
     for mid in model_ids:
-        pool._entries[mid] = _entry(mid)
+        model_path = None
+        if model_root is not None:
+            model_dir = model_root / mid
+            model_dir.mkdir(parents=True, exist_ok=True)
+            (model_dir / "config.json").write_text("{}")
+            model_path = str(model_dir)
+        pool._entries[mid] = _entry(mid, model_path=model_path)
     return pool
 
 
 class TestPoolLockRestructure:
     @pytest.mark.asyncio
-    async def test_concurrent_get_engine_single_load(self, monkeypatch):
-        pool = _make_pool("m1")
+    async def test_concurrent_get_engine_single_load(self, monkeypatch, tmp_path):
+        pool = _make_pool("m1", model_root=tmp_path)
         started = asyncio.Event()
         release = asyncio.Event()
         loads: list[str] = []
@@ -65,10 +72,12 @@ class TestPoolLockRestructure:
         assert loads == ["m1"]  # the waiter rode the first load
 
     @pytest.mark.asyncio
-    async def test_loaded_model_not_blocked_by_other_load(self, monkeypatch):
+    async def test_loaded_model_not_blocked_by_other_load(
+        self, monkeypatch, tmp_path
+    ):
         """The core head-of-line fix: a request to an already-loaded model
         must not queue behind another model's cold load."""
-        pool = _make_pool("slow", "fast")
+        pool = _make_pool("slow", "fast", model_root=tmp_path)
         fast_engine = object()
         pool._entries["fast"].engine = fast_engine
         started = asyncio.Event()
@@ -95,8 +104,10 @@ class TestPoolLockRestructure:
         await t_slow
 
     @pytest.mark.asyncio
-    async def test_load_failure_propagates_to_waiters(self, monkeypatch):
-        pool = _make_pool("m1")
+    async def test_load_failure_propagates_to_waiters(
+        self, monkeypatch, tmp_path
+    ):
+        pool = _make_pool("m1", model_root=tmp_path)
         started = asyncio.Event()
         release = asyncio.Event()
 
@@ -123,8 +134,8 @@ class TestPoolLockRestructure:
         assert pool._entries["m1"].load_future is None
 
     @pytest.mark.asyncio
-    async def test_lease_taken_after_load(self, monkeypatch):
-        pool = _make_pool("m1")
+    async def test_lease_taken_after_load(self, monkeypatch, tmp_path):
+        pool = _make_pool("m1", model_root=tmp_path)
 
         async def fake_load(model_id, force_lm=False):
             entry = pool._entries[model_id]
