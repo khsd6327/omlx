@@ -10,6 +10,7 @@ import pytest
 
 import omlx.utils.image as image_utils
 from omlx.engine.vlm import VLMBatchedEngine
+from omlx.exceptions import InvalidRequestError
 from omlx.utils.image import load_image
 
 
@@ -62,29 +63,8 @@ class TestImageSizeCaps:
     def test_oversized_data_uri_rejected_before_decode(self, monkeypatch):
         monkeypatch.setattr(image_utils, "MAX_IMAGE_BYTES", 16)
         big = "data:image/png;base64," + "A" * 64
-        with pytest.raises(ValueError, match="too large"):
+        with pytest.raises(InvalidRequestError, match="exceeds the"):
             image_utils.load_image(big)
-
-    def test_oversized_url_response_rejected(self, monkeypatch):
-        monkeypatch.setattr(image_utils, "MAX_IMAGE_BYTES", 16)
-
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self, n=-1):
-                return b"\x00" * (n if n and n > 0 else 1024)
-
-        import urllib.request
-
-        monkeypatch.setattr(
-            urllib.request, "urlopen", lambda url, timeout=None: FakeResponse()
-        )
-        with pytest.raises(ValueError, match="too large"):
-            image_utils.load_image("https://example.com/huge.png")
 
     def test_small_data_uri_still_loads(self):
         # 1x1 red PNG

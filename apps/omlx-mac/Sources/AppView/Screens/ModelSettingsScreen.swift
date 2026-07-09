@@ -764,6 +764,17 @@ private struct AdvancedTab: View {
                 }))
                 .labelsHidden().toggleStyle(.switch)
             }
+            Row(label: String(localized: "settings.advanced.favorite.label",
+                              defaultValue: "Favorite",
+                              comment: "Row label for the favorite toggle"),
+                sublabel: String(localized: "settings.advanced.favorite.sub",
+                                 defaultValue: "List this model first in model lists",
+                                 comment: "Sublabel for the favorite toggle")) {
+                Toggle("", isOn: vm.bind($vm.isFavorite, save: {
+                    Task { await vm.save(.isFavorite, client: client) }
+                }))
+                .labelsHidden().toggleStyle(.switch)
+            }
             // Security-sensitive row — flagged red to match the HTML
             // editor's visual treatment. HF custom-code execution gives
             // the model author the ability to run arbitrary Python in
@@ -824,8 +835,8 @@ private struct ChatTemplateKwargsEditor: View {
                                   defaultValue: "No chat-template kwargs.",
                                   comment: "Placeholder text shown when no chat-template kwargs are configured")
                          : String(localized: "settings.advanced.chat_template.count",
-                                  defaultValue: "\(vm.chatTemplateEntries.count) kwarg\(vm.chatTemplateEntries.count == 1 ? "" : "s")",
-                                  comment: "Count summary in the chat-template editor; placeholders are the entry count and an optional plural 's'"))
+                                  defaultValue: "kwargs: \(vm.chatTemplateEntries.count)",
+                                  comment: "Count summary in the chat-template editor; placeholder is the entry count"))
                         .font(.omlxText(12))
                         .foregroundStyle(theme.textSecondary)
                     Spacer()
