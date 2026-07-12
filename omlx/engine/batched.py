@@ -390,11 +390,14 @@ class BatchedEngine(BaseEngine):
 
         # head_dim=256 long-context prefill: route to an O(L) tiled SDPA kernel
         # so models like Qwen3.6-27B stop OOMing / getting prefill-guard-rejected
-        # below their context window. Installed after TurboQuant so it is the
-        # outer wrapper and only grabs non-quantized 256 prefill; all other
-        # cases (incl. TurboQuant caches, other head dims, decode, short
-        # prefill) fall through to the prior SDPA unchanged. Passthrough-safe to
-        # install unconditionally — the route is strictly gated. Disable via
+        # below their context window. The route is memory-aware: it defers to
+        # the faster unfused fallback whenever the scheduler-provided guard
+        # headroom fits its O(L^2) transient (#2204). Installed after
+        # TurboQuant so it is the outer wrapper and only grabs non-quantized
+        # 256 prefill; all other cases (incl. TurboQuant caches, other head
+        # dims, decode, short prefill) fall through to the prior SDPA
+        # unchanged. Passthrough-safe to install unconditionally — the route
+        # is strictly gated. Disable via
         # model_settings.sdpa256_prefill_enabled = False.
         if getattr(self._model_settings, "sdpa256_prefill_enabled", True) is not False:
             try:
@@ -460,15 +463,25 @@ class BatchedEngine(BaseEngine):
                     "Qwen MoE weighted-sum patch not applied", exc_info=True
                 )
 
+        if (
+            getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_ragged_decode import (
+                    apply_qwen35_ragged_decode_patch,
+                )
+
+                apply_qwen35_ragged_decode_patch()
+            except Exception:
+                logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
+
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
             copy.copy(self._scheduler_config)
             if self._scheduler_config
             else SchedulerConfig()
         )
-        scheduler_config.model_name = (
-            self._model_name
-        )  # Ensure cache isolation per model
         engine_config = EngineConfig(
             model_name=self._model_name,
             scheduler_config=scheduler_config,

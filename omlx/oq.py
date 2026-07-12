@@ -1349,7 +1349,17 @@ _FP8_WEIGHT_DTYPES = frozenset(("F8_E4M3", "F8_E5M2", "I8"))
 
 def _block_dequant_fp8(weight_raw, scale_raw, w_dtype, s_dtype):
     """Block-scaled dequant of a single FP8/I8 weight+scale pair to BF16."""
-    if s_dtype == "F8_E8M0":
+    # MXFP8 checkpoints (e.g. MiniMax-M3) save the e8m0 shared exponents
+    # with safetensors dtype U8: fp8 weight, one scale byte per 32 columns.
+    # Those bytes are exponents, not linear scales. Float-typed scales
+    # (DeepSeek block-128 weight_scale_inv) stay linear.
+    e8m0 = s_dtype == "F8_E8M0" or (
+        s_dtype in ("U8", "UINT8")
+        and w_dtype in ("F8_E4M3", "F8_E5M2")
+        and scale_raw.ndim == 2
+        and weight_raw.shape[-1] == scale_raw.shape[-1] * 32
+    )
+    if e8m0:
         scale = mx.power(mx.array(2.0), scale_raw.astype(mx.float32) - 127.0)
     else:
         scale = scale_raw
@@ -3929,7 +3939,7 @@ def quantize_oq_streaming(
             faster prefill on M1/M2 Apple Silicon (native fp16 support), but
             is unsupported for DeepSeek V4.
         preserve_mtp: Keep mtp.* tensors and config fields in the output so
-            the Native MTP toggle works after quantization. Stashes mtp.*
+            the Lightning MTP toggle works after quantization. Stashes mtp.*
             keys around the model.sanitize() call (which would otherwise
             strip them) and re-merges. When False (default), mtp.* tensors
             are stripped *and* the output config's mtp_num_hidden_layers /

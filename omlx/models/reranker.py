@@ -300,30 +300,7 @@ class MLXRerankerModel:
             )
 
         # Pre-compute prefix and suffix tokens for the prompt template.
-        # Use apply_chat_template() for portability across tokenizer formats,
-        # then split on a sentinel to extract prefix/suffix boundaries.
-        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
-        messages = [
-            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
-            {"role": "user", "content": _SENTINEL},
-        ]
-        template_str = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        parts = template_str.split(_SENTINEL)
-        if len(parts) == 2:
-            prefix = parts[0]
-            # Append <think> block for models that use thinking-then-answering format
-            suffix = parts[1] + "<think>\n\n</think>\n\n"
-        else:
-            # Qwen3 reranker tokenizers ship a task-specific chat template that
-            # ignores arbitrary user content and renders an empty Query/Document
-            # scaffold. Use the official fixed prefix/suffix format instead.
-            prefix = (
-                f"<|im_start|>system\n{self._CAUSAL_LM_SYSTEM_PROMPT}<|im_end|>\n"
-                "<|im_start|>user\n"
-            )
-            suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        prefix, suffix = self._extract_causal_lm_affixes(tokenizer)
 
         self._prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
         self._suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False)
@@ -336,6 +313,145 @@ class MLXRerankerModel:
         )
 
         return model, tokenizer
+
+    def _extract_causal_lm_affixes(self, tokenizer: Any) -> Tuple[str, str]:
+        """Extract the static prompt prefix/suffix around the rerank content.
+
+        Handles two chat template shapes:
+
+        1. Standard chat template (system/user roles): render with a sentinel
+           as the user content and split around it.
+        2. Reranker-native template (Qwen/Qwen3-Reranker ships one as
+           chat_template.jinja since its 2026-04 sentence-transformers
+           update, and MLX conversions made after that inherit it): the
+           template only understands system/query/document roles and silently
+           drops user messages, so the sentinel never appears in the output.
+           Render with per-slot sentinels instead and split around the
+           combined "<Instruct>/<Query>/<Document>" block — the exact content
+           that _rerank_causal_lm reconstructs at scoring time.
+        """
+        # Fail fast with a clear error when the tokenizer has no chat template
+        # at all — rendering would only produce an opaque downstream failure.
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template is None:
+            raise ValueError(
+                f"Tokenizer for {self.model_name} has no chat template; "
+                f"cannot derive the CausalLM reranker prompt prefix/suffix."
+            )
+
+        _SENTINEL = "<<__CONTENT_SENTINEL__>>"
+        messages = [
+            {"role": "system", "content": self._CAUSAL_LM_SYSTEM_PROMPT},
+            {"role": "user", "content": _SENTINEL},
+        ]
+        standard_rendered = ""
+        standard_error: Exception | None = None
+        try:
+            standard_rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            standard_error = e
+            logger.warning(
+                f"system/user chat template rendering failed for "
+                f"{self.model_name}: {e}"
+            )
+
+        parts = standard_rendered.split(_SENTINEL)
+        if len(parts) == 2:
+            suffix = parts[1]
+            # Append <think> block for models that use the
+            # thinking-then-answering format, unless the template already
+            # emitted a think prefill of its own.
+            if "<think>" not in suffix:
+                suffix += "<think>\n\n</think>\n\n"
+            return parts[0], suffix
+
+        native_affixes, native_rendered, native_error = (
+            self._extract_reranker_native_affixes(tokenizer)
+        )
+        if native_affixes is not None:
+            logger.info(
+                "Using reranker-native chat template (query/document roles) "
+                f"for {self.model_name}"
+            )
+            return native_affixes
+
+        # Older Qwen reranker conversions may ignore every supplied content
+        # slot and render an empty reranker scaffold. The scaffold still gives
+        # us exact affix boundaries, so recover them without tying the fallback
+        # to a model name or repository layout.
+        empty_content_block = (
+            f"<Instruct>: {self._CAUSAL_LM_SYSTEM_PROMPT}\n"
+            "<Query>: \n<Document>: "
+        )
+        legacy_parts = standard_rendered.split(empty_content_block)
+        if len(legacy_parts) == 2:
+            suffix = legacy_parts[1]
+            if "<think>" not in suffix:
+                suffix += "<think>\n\n</think>\n\n"
+            logger.info(
+                "Using empty reranker-scaffold chat template fallback for "
+                f"{self.model_name}"
+            )
+            return legacy_parts[0], suffix
+
+        raise ValueError(
+            f"Could not extract CausalLM reranker prompt affixes for "
+            f"{self.model_name}. "
+            f"Standard system/user attempt: {standard_rendered!r} "
+            f"(error: {standard_error!r}). "
+            f"Reranker-native query/document attempt: {native_rendered!r} "
+            f"(error: {native_error!r})."
+        ) from (standard_error or native_error)
+
+    def _extract_reranker_native_affixes(
+        self, tokenizer: Any
+    ) -> "Tuple[Tuple[str, str] | None, str, Exception | None]":
+        """Extract affixes from a reranker-native chat template, if present.
+
+        Returns (affixes, rendered, error). Affixes is None when the template
+        raises or does not render the expected "<Instruct>/<Query>/<Document>"
+        content block; the rendered string and the exception (if any) are
+        returned for diagnostics.
+        """
+        instruct_sentinel = "<<__INSTRUCT_SENTINEL__>>"
+        query_sentinel = "<<__QUERY_SENTINEL__>>"
+        document_sentinel = "<<__DOCUMENT_SENTINEL__>>"
+        # The native template maps the system role to the <Instruct> slot; its
+        # judge system prompt is hardcoded inside the template itself.
+        messages = [
+            {"role": "system", "content": instruct_sentinel},
+            {"role": "query", "content": query_sentinel},
+            {"role": "document", "content": document_sentinel},
+        ]
+        try:
+            rendered = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            logger.warning(
+                f"reranker-native chat template rendering failed for "
+                f"{self.model_name}: {e}"
+            )
+            return None, "", e
+
+        # Intentionally strict, byte-exact match against the content block the
+        # upstream Qwen/Qwen3-Reranker template renders. _rerank_causal_lm
+        # reconstructs this exact block at scoring time, so tolerating
+        # formatting drift here would silently produce prompts that differ
+        # from what the template intends; failing detection loudly is safer.
+        content_block = (
+            f"<Instruct>: {instruct_sentinel}\n"
+            f"<Query>: {query_sentinel}\n"
+            f"<Document>: {document_sentinel}"
+        )
+        parts = rendered.split(content_block)
+        if len(parts) != 2:
+            return None, rendered, None
+
+        # The native template already emits the trailing <think> block, so the
+        # suffix is used as-is.
+        return (parts[0], parts[1]), rendered, None
 
     def _load_jina_reranker(self) -> Tuple[Any, Any]:
         """

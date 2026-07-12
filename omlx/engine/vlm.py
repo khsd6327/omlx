@@ -1573,7 +1573,6 @@ class VLMBatchedEngine(BaseEngine):
             if self._scheduler_config
             else SchedulerConfig()
         )
-        scheduler_config.model_name = self._model_name
 
         engine_config = EngineConfig(
             model_name=self._model_name,
@@ -1688,6 +1687,19 @@ class VLMBatchedEngine(BaseEngine):
                 logger.debug(
                     "Qwen MoE weighted-sum patch not applied", exc_info=True
                 )
+
+        if (
+            getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.qwen35_ragged_decode import (
+                    apply_qwen35_ragged_decode_patch,
+                )
+
+                apply_qwen35_ragged_decode_patch()
+            except Exception:
+                logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
