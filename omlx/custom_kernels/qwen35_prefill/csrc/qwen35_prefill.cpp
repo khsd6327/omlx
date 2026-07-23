@@ -1,6 +1,7 @@
 #include "qwen35_prefill.h"
 
 #include <dlfcn.h>
+#include <algorithm>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -69,7 +70,7 @@ struct QwenQAffineNaxVariant {
 };
 
 bool qwen_q_affine_bits_supported(int bits) {
-  return bits == 4 || bits == 5 || bits == 6 || bits == 8;
+  return bits == 2 || bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
 
 bool qwen_q_affine_packed_shape_matches(int packed_dim, int K, int bits) {
@@ -147,12 +148,14 @@ class Qwen35Fa256AttentionPrimitive : public Primitive {
       float scale,
       bool causal,
       int q_block,
-      int k_block)
+      int k_block,
+      int64_t dispatch_budget)
       : Primitive(stream),
         scale_(scale),
         causal_(causal),
         q_block_(q_block),
-        k_block_(k_block) {}
+        k_block_(k_block),
+        dispatch_budget_(dispatch_budget) {}
 
   static bool unsupported(
       const array& q,
@@ -295,43 +298,202 @@ class Qwen35Fa256AttentionPrimitive : public Primitive {
 
     auto lib = d.get_library("omlx_qwen35_prefill_kernels", current_binary_dir());
     auto& compute_encoder = metal::get_command_encoder(s);
-    auto kernel = d.get_kernel(base_name, lib, hash_name, func_consts);
-    compute_encoder.set_compute_pipeline_state(kernel);
 
     const int NQ = (qL + bq - 1) / bq;
-    const int NK = (kL + bk - 1) / bk;
     const int NQ_aligned = qL / bq;
-    const int NK_aligned = kL / bk;
-
-    AttnParams params{
-        /* int B = */ B,
-        /* int H = */ H,
-        /* int D = */ bd,
-        /* int qL = */ qL,
-        /* int kL = */ kL,
-        /* int gqa_factor = */ gqa_factor,
-        /* float scale = */ scale_,
-        /* int NQ = */ NQ,
-        /* int NK = */ NK,
-        /* int NQ_aligned = */ NQ_aligned,
-        /* int NK_aligned = */ NK_aligned,
-        /* int qL_rem = */ (qL - NQ_aligned * bq),
-        /* int kL_rem = */ (kL - NK_aligned * bk),
-        /* int qL_off = */ (kL - qL),
-        /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
-        /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
-        /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
-        /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
-
-    compute_encoder.set_input_array(q, 0);
-    compute_encoder.set_input_array(k, 1);
-    compute_encoder.set_input_array(v, 2);
-    compute_encoder.set_output_array(o, 3);
-    compute_encoder.set_bytes(params, 4);
 
     MTL::Size grid_dims = MTL::Size(NQ, H, B);
     MTL::Size group_dims = MTL::Size(32, wm, wn);
-    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+
+    // The kernel scans its whole key range inside one Metal dispatch, so the
+    // per-dispatch wallclock grows linearly with kL. Past the macOS IOGPU
+    // interactivity threshold the OS demotes (or kills) the command buffer
+    // and long-context prefill collapses on pre-NAX GPUs (issue #2225,
+    // mlx#3302). Bound the per-dispatch work by splitting the keys into
+    // chunks of at most chunk_keys, each its own preemptible dispatch, and
+    // fold the partials with logsumexp weights afterwards (mlx#3307).
+    int64_t chunk_keys = kL;
+    if (dispatch_budget_ > 0) {
+      const int64_t work = int64_t(B) * H * qL * kL;
+      if (work > dispatch_budget_) {
+        // Very short chunks would re-dispatch the full query grid per sliver
+        // of keys; 4 * bq keys is plenty to amortize the dead threadgroups.
+        const int64_t min_chunk_keys = 4LL * bq;
+        // The partial slab costs B*H*qL*D per chunk, so huge-qL calls (one
+        // shot square prefill) cap the chunk count on memory instead of
+        // honoring the dispatch budget exactly.
+        const int64_t max_slab_bytes = 2LL << 30;
+        const int64_t chunk_bytes = int64_t(B) * H * qL * bd * q.itemsize();
+        const int64_t n_mem_cap =
+            std::max<int64_t>(1, max_slab_bytes / std::max<int64_t>(chunk_bytes, 1));
+        int64_t n_target = (work + dispatch_budget_ - 1) / dispatch_budget_;
+        n_target = std::min(n_target, n_mem_cap);
+        chunk_keys = (kL + n_target - 1) / n_target;
+        chunk_keys = ((chunk_keys + bk - 1) / bk) * bk; // align to K tile
+        chunk_keys = std::max(chunk_keys, min_chunk_keys);
+      }
+    }
+
+    const int n_chunks = int((kL + chunk_keys - 1) / chunk_keys);
+
+    if (n_chunks <= 1) {
+      const int NK = (kL + bk - 1) / bk;
+      const int NK_aligned = kL / bk;
+
+      auto kernel = d.get_kernel(base_name, lib, hash_name, func_consts);
+      compute_encoder.set_compute_pipeline_state(kernel);
+
+      AttnParams params{
+          /* int B = */ B,
+          /* int H = */ H,
+          /* int D = */ bd,
+          /* int qL = */ qL,
+          /* int kL = */ kL,
+          /* int gqa_factor = */ gqa_factor,
+          /* float scale = */ scale_,
+          /* int NQ = */ NQ,
+          /* int NK = */ NK,
+          /* int NQ_aligned = */ NQ_aligned,
+          /* int NK_aligned = */ NK_aligned,
+          /* int qL_rem = */ (qL - NQ_aligned * bq),
+          /* int kL_rem = */ (kL - NK_aligned * bk),
+          /* int qL_off = */ (kL - qL),
+          /* int64_t Q_strides[3] = */
+          {q.strides(0), q.strides(1), q.strides(2)},
+          /* int64_t K_strides[3] = */
+          {k.strides(0), k.strides(1), k.strides(2)},
+          /* int64_t V_strides[3] = */
+          {v.strides(0), v.strides(1), v.strides(2)},
+          /* int64_t O_strides[3] = */
+          {o.strides(0), o.strides(1), o.strides(2)}};
+
+      compute_encoder.set_input_array(q, 0);
+      compute_encoder.set_input_array(k, 1);
+      compute_encoder.set_input_array(v, 2);
+      compute_encoder.set_output_array(o, 3);
+      compute_encoder.set_bytes(params, 4);
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+      return;
+    }
+
+    // Chunked path: per-chunk normalized partials (input dtype) plus fp32
+    // logsumexp rows, folded by the reduce kernel below.
+    const int64_t o_chunk_stride = int64_t(B) * H * qL * bd;
+    const int64_t lse_chunk_stride = int64_t(B) * H * qL;
+
+    array o_part(
+        {n_chunks, B, H, qL, bd}, o.dtype(), nullptr, std::vector<array>{});
+    o_part.set_data(allocator::malloc(o_part.nbytes()));
+    array lse_part(
+        {n_chunks, B, H, qL}, float32, nullptr, std::vector<array>{});
+    lse_part.set_data(allocator::malloc(lse_part.nbytes()));
+    compute_encoder.add_temporary(o_part);
+    compute_encoder.add_temporary(lse_part);
+
+    const bool partials_true = true;
+    for (int c = 0; c < n_chunks; ++c) {
+      const int64_t k_start = int64_t(c) * chunk_keys;
+      const int kL_c = int(std::min<int64_t>(chunk_keys, kL - k_start));
+      const int NK_c = (kL_c + bk - 1) / bk;
+      const int NK_aligned_c = kL_c / bk;
+      const bool align_K_c = (kL_c % bk) == 0;
+
+      metal::MTLFCList chunk_consts = {
+          {&align_Q, MTL::DataType::DataTypeBool, 200},
+          {&align_K_c, MTL::DataType::DataTypeBool, 201},
+          {&has_mask, MTL::DataType::DataTypeBool, 300},
+          {&do_causal, MTL::DataType::DataTypeBool, 301},
+          {&has_sinks, MTL::DataType::DataTypeBool, 302},
+          {&has_block_mask, MTL::DataType::DataTypeBool, 303},
+          {&has_block_token_mask, MTL::DataType::DataTypeBool, 304},
+          {&has_block_indices, MTL::DataType::DataTypeBool, 305},
+          {&partials_true, MTL::DataType::DataTypeBool, 306}};
+
+      std::string chunk_hash;
+      concatenate(
+          chunk_hash,
+          "omlx_qwen35_fa256_part_",
+          type_to_name(q),
+          "_bq",
+          bq,
+          "_bk",
+          bk,
+          "_bd",
+          bd,
+          "_align_Q_",
+          (align_Q ? 't' : 'n'),
+          "_align_K_",
+          (align_K_c ? 't' : 'n'),
+          "_causal_",
+          (do_causal ? 't' : 'n'));
+
+      auto kernel = d.get_kernel(base_name, lib, chunk_hash, chunk_consts);
+      compute_encoder.set_compute_pipeline_state(kernel);
+
+      AttnParams params{
+          /* int B = */ B,
+          /* int H = */ H,
+          /* int D = */ bd,
+          /* int qL = */ qL,
+          /* int kL = */ kL_c,
+          /* int gqa_factor = */ gqa_factor,
+          /* float scale = */ scale_,
+          /* int NQ = */ NQ,
+          /* int NK = */ NK_c,
+          /* int NQ_aligned = */ NQ_aligned,
+          /* int NK_aligned = */ NK_aligned_c,
+          /* int qL_rem = */ (qL - NQ_aligned * bq),
+          /* int kL_rem = */ (kL_c - NK_aligned_c * bk),
+          // Global position of local query row 0 relative to this chunk's
+          // first key; negative once the chunk starts past early rows.
+          /* int qL_off = */ int((int64_t(kL) - qL) - k_start),
+          /* int64_t Q_strides[3] = */
+          {q.strides(0), q.strides(1), q.strides(2)},
+          /* int64_t K_strides[3] = */
+          {k.strides(0), k.strides(1), k.strides(2)},
+          /* int64_t V_strides[3] = */
+          {v.strides(0), v.strides(1), v.strides(2)},
+          // Partial slab is contiguous (B, H, qL, D) per chunk.
+          /* int64_t O_strides[3] = */
+          {int64_t(H) * qL * bd, int64_t(qL) * bd, int64_t(bd)}};
+
+      compute_encoder.set_input_array(q, 0);
+      compute_encoder.set_input_array(
+          k, 1, k_start * k.strides(2) * k.itemsize());
+      compute_encoder.set_input_array(
+          v, 2, k_start * v.strides(2) * v.itemsize());
+      compute_encoder.set_output_array(o, 3);
+      compute_encoder.set_bytes(params, 4);
+      compute_encoder.set_output_array(
+          o_part, 14, c * o_chunk_stride * o_part.itemsize());
+      compute_encoder.set_output_array(
+          lse_part, 15, c * lse_chunk_stride * lse_part.itemsize());
+      compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+    }
+
+    std::string reduce_name;
+    concatenate(
+        reduce_name, "omlx_qwen35_fa256_chunk_reduce_", type_to_name(q));
+    auto reduce_kernel = d.get_kernel(reduce_name, lib);
+    compute_encoder.set_compute_pipeline_state(reduce_kernel);
+
+    AttnChunkReduceParams reduce_params{
+        /* int C = */ n_chunks,
+        /* int H = */ H,
+        /* int qL = */ qL,
+        /* int D = */ bd,
+        /* int64_t o_chunk_stride = */ o_chunk_stride,
+        /* int64_t lse_chunk_stride = */ lse_chunk_stride,
+        /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
+
+    compute_encoder.set_input_array(o_part, 0);
+    compute_encoder.set_input_array(lse_part, 1);
+    compute_encoder.set_output_array(o, 2);
+    compute_encoder.set_bytes(reduce_params, 3);
+
+    MTL::Size reduce_grid = MTL::Size(bd / 4, qL, int64_t(B) * H);
+    MTL::Size reduce_group = MTL::Size(bd / 4, std::max(1, 256 / (bd / 4)), 1);
+    compute_encoder.dispatch_threads(reduce_grid, reduce_group);
   }
 
   DEFINE_NAME(OMLXQwen35Fa256Attention)
@@ -339,10 +501,12 @@ class Qwen35Fa256AttentionPrimitive : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto& rhs = static_cast<const Qwen35Fa256AttentionPrimitive&>(other);
     return scale_ == rhs.scale_ && causal_ == rhs.causal_ &&
-        q_block_ == rhs.q_block_ && k_block_ == rhs.k_block_;
+        q_block_ == rhs.q_block_ && k_block_ == rhs.k_block_ &&
+        dispatch_budget_ == rhs.dispatch_budget_;
   }
   auto state() const {
-    return std::make_tuple(nullptr, scale_, causal_, q_block_, k_block_);
+    return std::make_tuple(
+        nullptr, scale_, causal_, q_block_, k_block_, dispatch_budget_);
   }
 
  private:
@@ -350,6 +514,7 @@ class Qwen35Fa256AttentionPrimitive : public Primitive {
   bool causal_;
   int q_block_;
   int k_block_;
+  int64_t dispatch_budget_;
 };
 
 class Qwen35QAffineQmmTPrimitive : public Primitive {
@@ -359,15 +524,22 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
       int bits,
       int variant,
       bool use_nax,
-      int nax_variant)
+      int nax_variant,
+      int group_size)
       : Primitive(stream),
         bits_(bits),
         variant_(variant),
         use_nax_(use_nax),
-        nax_variant_(nax_variant) {
+        nax_variant_(nax_variant),
+        group_size_(group_size) {
     if (!qwen_q_affine_bits_supported(bits_)) {
       std::ostringstream msg;
       msg << "Unsupported Qwen affine qmm bits " << bits_ << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (group_size_ != 64 && group_size_ != 128) {
+      std::ostringstream msg;
+      msg << "Unsupported Qwen affine qmm group_size " << group_size_ << ".";
       throw std::invalid_argument(msg.str());
     }
     (void)qwen_q_affine_variant(variant_);
@@ -383,11 +555,15 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
       const array& biases,
       int bits,
       int variant,
+      int group_size,
       Stream s) {
     if (s.device == Device::cpu) {
       return true;
     }
     if (!qwen_q_affine_bits_supported(bits)) {
+      return true;
+    }
+    if (group_size != 64 && group_size != 128) {
       return true;
     }
     if (x.dtype() != float16 && x.dtype() != bfloat16) {
@@ -406,7 +582,6 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
       return true;
     }
 
-    constexpr int group_size = 64;
     const auto cfg = qwen_q_affine_variant(variant);
     const int K = x.shape(-1);
     const int N = weight.shape(0);
@@ -506,7 +681,7 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
         kname,
         "qwen35_q",
         bits_,
-        "_affine_qmm_t_",
+        group_size_ == 128 ? "_affine_qmm128_t_" : "_affine_qmm_t_",
         qwen_type_name(x.dtype()),
         "_bm_",
         cfg.bm,
@@ -526,10 +701,11 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
     const auto& rhs =
         static_cast<const Qwen35QAffineQmmTPrimitive&>(other);
     return bits_ == rhs.bits_ && variant_ == rhs.variant_ &&
-        use_nax_ == rhs.use_nax_ && nax_variant_ == rhs.nax_variant_;
+        use_nax_ == rhs.use_nax_ && nax_variant_ == rhs.nax_variant_ &&
+        group_size_ == rhs.group_size_;
   }
   auto state() const {
-    return std::make_tuple(bits_, variant_, use_nax_, nax_variant_);
+    return std::make_tuple(bits_, variant_, use_nax_, nax_variant_, group_size_);
   }
 
  private:
@@ -537,6 +713,7 @@ class Qwen35QAffineQmmTPrimitive : public Primitive {
   int variant_;
   bool use_nax_;
   int nax_variant_;
+  int group_size_;
 };
 
 class Qwen35MoeWeightedSumPrimitive : public Primitive {
@@ -702,6 +879,7 @@ array qwen35_fa256_attention(
     bool causal,
     int q_block,
     int k_block,
+    int64_t dispatch_budget,
     StreamOrDevice s) {
   for (const auto& tensor : {q, k, v}) {
     if (tensor.ndim() != 4) {
@@ -736,7 +914,7 @@ array qwen35_fa256_attention(
       std::move(out_shape),
       final_type,
       std::make_shared<Qwen35Fa256AttentionPrimitive>(
-          stream, scale, causal, q_block, k_block),
+          stream, scale, causal, q_block, k_block, dispatch_budget),
       std::move(inputs));
 }
 
@@ -749,6 +927,7 @@ array qwen35_q_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   (void)qwen_q_affine_variant(variant);
   if (!qwen_q_affine_bits_supported(bits)) {
@@ -757,19 +936,24 @@ array qwen35_q_affine_qmm_t(
         << "_affine_qmm_t] unsupported bits.";
     throw std::invalid_argument(msg.str());
   }
+  if (group_size != 64 && group_size != 128) {
+    std::ostringstream msg;
+    msg << "[omlx_qwen35_prefill.qwen35_q" << bits
+        << "_affine_qmm_t] unsupported group_size " << group_size << ".";
+    throw std::invalid_argument(msg.str());
+  }
 
   if (x.ndim() < 2 || weight.ndim() != 2 || scales.ndim() != 2 ||
       biases.ndim() != 2) {
     std::ostringstream msg;
     msg << "[omlx_qwen35_prefill.qwen35_q" << bits
         << "_affine_qmm_t] expected x [...,K], packed weight, "
-        << "scales/biases [N,K/64], got " << x.shape() << ", "
-        << weight.shape() << ", " << scales.shape() << ", "
+        << "scales/biases [N,K/" << group_size << "], got " << x.shape()
+        << ", " << weight.shape() << ", " << scales.shape() << ", "
         << biases.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
 
-  constexpr int group_size = 64;
   const int K = x.shape(-1);
   const int N = weight.shape(0);
   if (K <= 0 || N <= 0 || K % group_size != 0 ||
@@ -802,15 +986,15 @@ array qwen35_q_affine_qmm_t(
 
   auto stream = to_stream(s);
   if (Qwen35QAffineQmmTPrimitive::unsupported(
-          x, weight, scales, biases, bits, variant, stream)) {
+          x, weight, scales, biases, bits, variant, group_size, stream)) {
     throw std::invalid_argument(
         "[omlx_qwen35_prefill.qwen35_q_affine_qmm_t] unsupported shape.");
   }
 
-  // NAX candidacy: the classic variant above stays the validated fallback,
-  // so demote instead of throwing when the NAX tile does not fit or the
-  // runtime lacks tensor units / the NAX metallib.
-  bool nax = use_nax && is_nax_available() && nax_qmm_kernels_built() &&
+  // NAX only supports group_size=64; demote rather than throwing when the
+  // NAX tile does not fit or the runtime lacks tensor units / the NAX metallib.
+  bool nax = use_nax && group_size == 64 && is_nax_available() &&
+      nax_qmm_kernels_built() &&
       nax_qmm_runtime_ok.load(std::memory_order_relaxed);
   if (nax) {
     const auto nax_cfg = qwen_q_affine_nax_variant(nax_variant);
@@ -826,8 +1010,22 @@ array qwen35_q_affine_qmm_t(
       std::move(out_shape),
       x.dtype(),
       std::make_shared<Qwen35QAffineQmmTPrimitive>(
-          stream, bits, variant, nax, nax_variant),
+          stream, bits, variant, nax, nax_variant, group_size),
       std::move(inputs));
+}
+
+array qwen35_q2_affine_qmm_t(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    int variant,
+    bool use_nax,
+    int nax_variant,
+    int group_size,
+    StreamOrDevice s) {
+  return qwen35_q_affine_qmm_t(
+      x, weight, scales, biases, 2, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_q4_affine_qmm_t(
@@ -838,9 +1036,10 @@ array qwen35_q4_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   return qwen35_q_affine_qmm_t(
-      x, weight, scales, biases, 4, variant, use_nax, nax_variant, s);
+      x, weight, scales, biases, 4, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_q5_affine_qmm_t(
@@ -851,9 +1050,10 @@ array qwen35_q5_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   return qwen35_q_affine_qmm_t(
-      x, weight, scales, biases, 5, variant, use_nax, nax_variant, s);
+      x, weight, scales, biases, 5, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_q6_affine_qmm_t(
@@ -864,9 +1064,10 @@ array qwen35_q6_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   return qwen35_q_affine_qmm_t(
-      x, weight, scales, biases, 6, variant, use_nax, nax_variant, s);
+      x, weight, scales, biases, 6, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_q8_affine_qmm_t(
@@ -877,9 +1078,10 @@ array qwen35_q8_affine_qmm_t(
     int variant,
     bool use_nax,
     int nax_variant,
+    int group_size,
     StreamOrDevice s) {
   return qwen35_q_affine_qmm_t(
-      x, weight, scales, biases, 8, variant, use_nax, nax_variant, s);
+      x, weight, scales, biases, 8, variant, use_nax, nax_variant, group_size, s);
 }
 
 array qwen35_moe_weighted_sum(

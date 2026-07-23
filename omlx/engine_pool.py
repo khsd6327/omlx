@@ -141,7 +141,13 @@ class EnginePool:
         Note:
             Pre-load admission consults `enforcer.get_final_ceiling()` via
             the `_get_final_ceiling` callback set by `server.init_server()`.
-            Until the callback is wired up the pool admits unconditionally.
+            When that reads 0 (memory guard disabled), the pool falls back
+            to `enforcer.get_admission_ceiling()` via `_get_admission_ceiling`
+            for best-effort LRU eviction (#2290). Idle-model eviction
+            starts at `enforcer.get_admission_soft_target()` via
+            `_get_admission_soft_target` so the old model is unloaded
+            before the new weights allocate (#2319). Until the callbacks
+            are wired up the pool admits unconditionally.
         """
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
@@ -153,10 +159,13 @@ class EnginePool:
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
+        self._get_admission_ceiling: object | None = None  # Set by server
+        self._get_admission_soft_target: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
+        self._lease_release_tasks: set[asyncio.Task[None]] = set()
         self.configure_hot_cache_budget()
 
     @property
@@ -245,6 +254,40 @@ class EnginePool:
             total += self._estimated_entry_size(model_settings.vlm_mtp_draft_model)
 
         return max(0, int(total))
+
+    def _fallback_admission_ceiling(self) -> int:
+        """Best-effort admission ceiling used when `_current_ceiling()` is 0.
+
+        Wired to `enforcer.get_admission_ceiling`, which keeps returning
+        the static ceiling while the memory guard is disabled so a model
+        swap still evicts LRU models instead of overcommitting physical
+        memory (#2290). Returns 0 when no callback is wired up (standalone
+        pools admit unconditionally).
+        """
+        cb = self._get_admission_ceiling
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _admission_soft_target(self) -> int:
+        """Soft watermark that pre-load eviction targets (#2319).
+
+        Wired to `enforcer.get_admission_soft_target`. Eviction of idle
+        LRU models starts once the projected total exceeds this, so an
+        old model is unloaded *before* the new weights allocate instead
+        of after the first request's prefill guard fires. Returns 0 when
+        no callback is wired up (callers fall back to the ceiling).
+        """
+        cb = self._get_admission_soft_target
+        if cb is None:
+            return 0
+        try:
+            return int(cb())
+        except Exception:  # noqa: BLE001
+            return 0
 
     def _wake_process_memory_enforcer(self, *, active: bool = False) -> None:
         enforcer = self._process_memory_enforcer
@@ -435,15 +478,12 @@ class EnginePool:
 
         for model_id, info in discovered.items():
             existing = self._entries.get(model_id)
-            # fork: also preserve entries that are mid-load (is_loading with
-            # engine still None). Replacing the entry object would orphan the
-            # in-flight _load_engine's mutations — the loaded engine ends up
-            # on an object no longer in _entries (leak + double load), and
-            # get_engine's post-load lookup can KeyError.
             if existing is not None and (
                 existing.engine is not None or existing.is_loading
             ):
-                # Loaded model: preserve runtime state, only update pinned flag
+                # Loaded or loading model: preserve runtime state, only
+                # update the pinned flag. Replacing an in-flight entry would
+                # orphan the engine the load attaches on completion (#2307).
                 existing.is_pinned = model_id in pinned_set
             else:
                 # New or unloaded model: create fresh entry
@@ -468,8 +508,7 @@ class EnginePool:
             if model_id in pinned_set:
                 logger.info(f"Pinned model: {model_id}")
 
-        # Remove entries no longer discovered and not loaded
-        # fork: never delete an entry that is mid-load (see above).
+        # Remove entries no longer discovered and neither loaded nor loading
         discovered_ids = set(discovered.keys())
         stale = [
             mid
@@ -874,8 +913,9 @@ class EnginePool:
                     # evicting LRU non-pinned models first; if the model still
                     # cannot fit after evicting everything available, raise.
                     #
-                    # ceiling == 0 means the enforcer is off (guard disabled
-                    # or not yet wired up), so we admit unconditionally.
+                    # When the guard is disabled, use its static fallback only
+                    # to evict idle models. Admission remains best-effort and
+                    # must not become a hard refusal.
                     model_settings = runtime_settings
                     if model_settings is None and self._settings_manager is not None:
                         model_settings = self._settings_manager.get_settings(model_id)
@@ -884,33 +924,15 @@ class EnginePool:
                         + self._estimate_auxiliary_size(model_settings)
                     )
                     ceiling = self._current_ceiling()
+                    best_effort = False
+                    if ceiling <= 0:
+                        ceiling = self._fallback_admission_ceiling()
+                        best_effort = ceiling > 0
                     if ceiling > 0:
-                        # fork: when other models stay resident, evict down to
-                        # the enforcer's SOFT watermark before loading instead
-                        # of admitting at the full ceiling. Admission-at-
-                        # ceiling + enforcer-eviction-to-soft made the band
-                        # between them a no-coexistence zone: a load would
-                        # succeed and the enforcer's next poll evicted the
-                        # idle LRU model anyway, alternating traffic
-                        # re-loaded ~90 GB of weights per switch. If nothing
-                        # more is evictable, the load is still admitted up to
-                        # the full ceiling rather than failing.
-                        soft_target = 0
-                        enforcer = self._process_memory_enforcer
-                        if enforcer is not None:
-                            soft_fraction = float(
-                                getattr(enforcer, "_soft_threshold", 0) or 0
-                            )
-                            if 0 < soft_fraction < 1:
-                                soft_target = int(ceiling * soft_fraction)
-                        others_resident = any(
-                            (e.engine is not None or e.is_loading)
-                            and mid != model_id
-                            for mid, e in self._entries.items()
-                        )
-                        target = (
-                            soft_target
-                            if (others_resident and 0 < soft_target < ceiling)
+                        soft_target = self._admission_soft_target()
+                        evict_target = (
+                            min(soft_target, ceiling)
+                            if soft_target > 0
                             else ceiling
                         )
                         while True:
@@ -931,22 +953,29 @@ class EnginePool:
                                 + self._loading_reserved_bytes,
                             )
                             projected = current + load_estimated_size
-                            if projected <= target:
+                            if projected <= evict_target:
                                 break
                             victim = self._find_lru_victim()
                             if victim is not None:
                                 logger.info(
                                     f"Evicting '{victim}' to fit '{model_id}' "
-                                    f"under memory target "
+                                    f"under the admission soft target "
                                     f"({format_size(projected)} > "
-                                    f"{format_size(target)})"
+                                    f"{format_size(evict_target)})"
                                 )
                                 await self._unload_engine(victim)
                                 evicted_any = True
                                 continue
-                            if target < ceiling and projected <= ceiling:
-                                # fork: nothing left to evict but the load
-                                # fits under the hard ceiling. Admit.
+                            if projected <= ceiling:
+                                if evict_target < ceiling:
+                                    logger.info(
+                                        f"Admitting '{model_id}' above the "
+                                        "admission soft target with no idle "
+                                        "model left to evict "
+                                        f"({format_size(projected)} > "
+                                        f"{format_size(evict_target)}, ceiling "
+                                        f"{format_size(ceiling)})"
+                                    )
                                 break
                             failure_current = current
                             failure_projected = projected
@@ -980,6 +1009,20 @@ class EnginePool:
                                 failure_current = committed
                                 failure_projected = committed_projected
                                 failure_label = "committed"
+
+                            if best_effort:
+                                logger.warning(
+                                    f"Loading '{model_id}' past the static "
+                                    "memory ceiling with the memory guard "
+                                    "disabled "
+                                    f"(projected "
+                                    f"{format_size(failure_projected)} > "
+                                    f"ceiling {format_size(ceiling)}, "
+                                    f"{failure_label} baseline) and nothing "
+                                    "left to evict; the system may swap "
+                                    "heavily."
+                                )
+                                break
 
                             # Nothing else to evict -- model cannot fit. Use
                             # ModelTooLargeError when the model alone exceeds
@@ -1062,13 +1105,41 @@ class EnginePool:
                     loaded.in_use += 1
                 return loaded.engine
 
-    async def release_engine(self, model_id: str) -> None:
-        """Release one in-use lease previously taken via get_engine(_lease=True)."""
+    async def _release_engine_lease(self, model_id: str) -> None:
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
             await self._unload_pending_if_idle_locked(model_id)
+
+    def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:
+        self._lease_release_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.warning("Engine lease release task was cancelled")
+        except Exception:
+            logger.exception("Engine lease release task failed")
+
+    async def _drain_lease_release_tasks(self) -> None:
+        while self._lease_release_tasks:
+            tasks = tuple(self._lease_release_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def release_engine(self, model_id: str) -> None:
+        """Release one in-use lease even if the caller is cancelled.
+
+        ASGI disconnect cancellation can arrive while this release is waiting
+        for the pool lock. Run the lock-taking operation in its own task so the
+        lease still drains after the cancelled request task exits.
+        """
+        task = asyncio.create_task(
+            self._release_engine_lease(model_id),
+            name=f"engine-lease-release:{model_id}",
+        )
+        self._lease_release_tasks.add(task)
+        task.add_done_callback(self._finish_lease_release_task)
+        await asyncio.shield(task)
 
     async def unload_if_idle_unpinned(self, model_id: str) -> bool:
         """Unload a loaded engine only when it is idle and not pinned."""
@@ -1297,6 +1368,7 @@ class EnginePool:
             return False
 
         evicted_any = False
+        reclaim_attempted = False
         async with self._lock:
             while True:
                 current = max(
@@ -1305,12 +1377,39 @@ class EnginePool:
                     self._current_model_memory,
                 )
                 if current + predicted <= target:
-                    return evicted_any
+                    # A model eviction and/or the pooled-buffer reclaim below
+                    # created enough headroom; signal the caller to re-admit.
+                    # reclaim_attempted stands in for "the reclaim freed
+                    # memory": the helper's own footprint delta is
+                    # process-wide and can be masked by concurrent
+                    # allocation, but reaching this check with headroom
+                    # after an attempt means admission will now succeed.
+                    return evicted_any or reclaim_attempted
 
                 victim = self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
                 )
                 if victim is None:
+                    # No idle model left to evict -- the "No idle model
+                    # evicted" case that used to reject outright even when
+                    # tens of GB were reclaimable. Try the cheaper reclaim
+                    # once before giving up: return MLX's pooled Metal buffers
+                    # (freed by finished requests but still cached, so
+                    # get_phys_footprint stays high) to the OS on the
+                    # requesting engine's own MLX thread, then let the loop
+                    # re-measure.
+                    if not reclaim_attempted:
+                        reclaim_attempted = True
+                        await self._reclaim_pooled_buffers_for_prefill(
+                            exclude_model_id, request_id
+                        )
+                        # Re-measure regardless of the reported delta: the
+                        # helper measures a process-wide footprint, so
+                        # concurrent allocation on another engine can mask a
+                        # real reclaim as 0 bytes freed. The loop re-checks
+                        # the target with a fresh reading; reclaim_attempted
+                        # keeps this branch from running twice.
+                        continue
                     if evicted_any:
                         logger.info(
                             "Prefill eviction for request %s stopped with no "
@@ -1335,18 +1434,104 @@ class EnginePool:
                 await self._unload_engine(victim)
                 evicted_any = True
 
+    @staticmethod
+    def _resolve_engine_core_from_engine(engine: object) -> object | None:
+        """Resolve the EngineCore owning an entry's scheduler and MLX thread."""
+        if getattr(engine, "scheduler", None) is not None:
+            return engine
+        try:
+            return engine._engine.engine  # type: ignore[attr-defined]
+        except AttributeError:
+            return None
+
+    async def _reclaim_pooled_buffers_for_prefill(
+        self, model_id: str, request_id: str
+    ) -> int:
+        """Return MLX's pooled Metal buffers to the OS; report bytes freed.
+
+        A warm server's resident baseline creeps between requests: finished
+        requests free their KV / activation arrays into MLX's buffer *cache*
+        (retained for reuse) rather than handing the pages back to the OS, so
+        ``get_phys_footprint`` -- the resident figure the prefill guard reads
+        -- stays high even though the bytes are reclaimable.
+
+        The clear runs on the requesting engine's own MLX thread through the
+        scheduler's ``_reclaim_prefill_headroom``, which synchronizes that
+        engine's generation stream under ``_mx_buffer_access_lock`` before
+        clearing (issues #300, #888, #1106) -- clearing from any other thread
+        could release cached buffers still referenced by in-flight
+        ``mx.async_eval`` command buffers. The engine's step loop is parked
+        awaiting this eviction callback, so its executor is free. A failing
+        reclaim is contained (#435 class): the request is then rejected
+        exactly as if nothing had been reclaimable. ``clear_cache`` releases
+        only unused cached buffers, so arrays an in-flight request still
+        references are never touched, and the shared hot / prefix cache is
+        left intact (it is SSD-backed and reclaimed separately by the
+        enforcer).
+
+        Returns:
+            Bytes handed back to the OS (``get_phys_footprint`` delta, >= 0).
+        """
+        entry = self._entries.get(model_id)
+        engine = entry.engine if entry is not None else None
+        core = (
+            self._resolve_engine_core_from_engine(engine)
+            if engine is not None
+            else None
+        )
+        scheduler = getattr(core, "scheduler", None)
+        reclaim = getattr(scheduler, "_reclaim_prefill_headroom", None)
+        executor = getattr(core, "_mlx_executor", None)
+        if not callable(reclaim) or executor is None:
+            # Engine mid-teardown (executor dropped at close) or an engine
+            # shape without the scheduler helper: skip -- reject as before.
+            return 0
+
+        def _reclaim_on_engine_thread() -> None:
+            gc.collect()
+            reclaim()
+
+        before = get_phys_footprint()
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(executor, _reclaim_on_engine_thread)
+        except Exception as e:
+            logger.warning(
+                "Pooled-buffer reclaim failed for prefill request %s: %s",
+                request_id,
+                e,
+            )
+            return 0
+        freed = max(0, before - get_phys_footprint())
+        if freed > 0:
+            logger.info(
+                "Reclaimed %s of pooled Metal buffers for prefill request %s "
+                "(no idle model to evict)",
+                format_size(freed),
+                request_id,
+            )
+        return freed
+
     def _other_entries_serving(self, model_id: str) -> bool:
-        """True when any loaded entry other than ``model_id`` is serving.
+        """True when any other entry is serving or loading.
 
         Used by the settle barrier in ``_unload_engine``: the barrier's
         freed-memory check is a delta of the process-global
         ``mx.get_active_memory()`` gauge, which only measures THIS unload
-        while no other engine is allocating concurrently.
+        while no other engine is allocating concurrently. A loading entry
+        (``is_loading=True``, ``engine`` still None) allocates weights at
+        full speed, so it must count as concurrent activity too — else the
+        barrier burns its rounds against a gauge that can even read
+        negative and logs a bogus timeout (#2312).
         """
         # Snapshot the items: admin unload routes call _unload_engine without
         # the pool lock, so discover_models() can mutate _entries mid-iteration.
         for mid, e in list(self._entries.items()):
-            if mid == model_id or e.engine is None:
+            if mid == model_id:
+                continue
+            if e.is_loading:
+                return True
+            if e.engine is None:
                 continue
             if e.in_use > 0:
                 return True
@@ -1609,6 +1794,8 @@ class EnginePool:
         self._wake_process_memory_enforcer(active=True)
         load_started_at = entry.loading_started_at
         load_completed = False
+        entry_detached = False
+        entry.abort_loading = False
         pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
         try:
             effective_type = entry.engine_type
@@ -1984,6 +2171,42 @@ class EnginePool:
                 self._current_model_memory += charged_size - entry.resident_size
                 entry.resident_size = charged_size
 
+            # Registry consistency check: a lockless mutator (a
+            # discover_models() rescan or the runtime model-directory
+            # reload) may have replaced or dropped this model's entry at an
+            # await point above. The engine was then attached to a stale
+            # object unreachable from the pool; keeping it running would
+            # strand the weights until a process restart (#2307).
+            if self._entries.get(model_id) is not entry:
+                entry_detached = True
+                logger.warning(
+                    f"Registry entry for '{model_id}' changed during load; "
+                    f"releasing the freshly loaded engine "
+                    f"({format_size(entry.estimated_size)})"
+                )
+                entry.engine = None
+                self._current_model_memory = max(
+                    0, self._current_model_memory - entry.resident_size
+                )
+                entry.resident_size = 0
+                try:
+                    await engine.stop()
+                except Exception as e:
+                    logger.warning(
+                        f"Error stopping orphaned engine for {model_id}: {e}"
+                    )
+                gc.collect()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' was removed or replaced while it "
+                    "was loading; the loaded engine was released. Retry "
+                    "the request.",
+                )
+
             logger.info(
                 f"Loaded model: {model_id} "
                 f"(actual: {format_size(entry.actual_size)}, "
@@ -2002,7 +2225,7 @@ class EnginePool:
             # inflated and the memory-ceiling admission check rejects all
             # subsequent loads until a server restart.
             self._schedule_failed_load_reclaim(model_id, pre_load_memory)
-            if not entry.abort_loading:
+            if not entry.abort_loading and not entry_detached:
                 self._mark_load_failure(entry, exc)
                 logger.exception(
                     "Model load failed for '%s'; caching failure until next discovery refresh",
@@ -2060,6 +2283,7 @@ class EnginePool:
 
     async def shutdown(self) -> None:
         """Shutdown all engines gracefully."""
+        await self._drain_lease_release_tasks()
         async with self._lock:
             for model_id in list(self._entries.keys()):
                 entry = self._entries.get(model_id)
