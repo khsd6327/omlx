@@ -27,6 +27,8 @@ import sys
 import types
 from typing import Any, Dict, List, Optional
 
+from . import prompt_priming
+
 logger = logging.getLogger(__name__)
 
 
@@ -319,6 +321,16 @@ def _patch_model(dsv4: Any) -> None:
         if return_hidden:
             h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
             return self.lm_head(h), h_raw
+        if not n_confirmed and prompt_priming.capture_eligible(self, cache):
+            # Prompt-priming capture needs the head-input hidden (the raw 4D
+            # Hyper-stream activation), which the stock branch discards
+            # inside self.model — same compute, one extra returned tensor.
+            h, h_raw = self.model(inputs, cache, return_raw_hidden=True)
+            try:
+                prompt_priming.maybe_capture(self, inputs, h_raw, cache)
+            except Exception:
+                logger.debug("MTP prompt-priming capture failed", exc_info=True)
+            return self.lm_head(h)
         h = self.model(inputs, cache)
         return self.lm_head(h)
 
