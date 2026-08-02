@@ -264,6 +264,13 @@ def maybe_apply_pre_load_patches(
     if apply_m5_gather_qmm_workaround():
         logger.info("M5 sorted gather_qmm reroute installed (issue #2267)")
 
+    # Model-independent: ArraysCache.extract lacks the None-slot guard its
+    # filter/extend/merge siblings have; early-aborted requests on
+    # CacheList(KVCache, ArraysCache) models crash without it.
+    from ..patches.arrays_cache_extract import apply_arrays_cache_extract_guard
+
+    apply_arrays_cache_extract_guard()
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
@@ -397,6 +404,17 @@ def maybe_apply_pre_load_patches(
                 model_name,
             )
 
+    if for_vlm and model_type in ("inkling", "inkling_mm_model"):
+        from ..patches.mlx_vlm_inkling_compat import (
+            apply_mlx_vlm_inkling_compat_patch,
+        )
+
+        if apply_mlx_vlm_inkling_compat_patch():
+            logger.info(
+                "Inkling mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     # Apply the MTP patch whenever the model has MTP heads on a compatible
     # model_type — even when mtp_enabled is False. The patch is required
     # for *sanitize correctness*: stock mlx-lm Model.sanitize triggers a
@@ -446,12 +464,24 @@ def maybe_apply_pre_load_patches(
                 # vs 1.53x capped at 3); the controller still settles shallow
                 # on low-accept content.
                 set_mtp_depth(8)
+            elif model_type in ("inkling", "inkling_mm_model"):
+                # The checkpoint ships one MTP block per draft depth; cap
+                # the chain at the shipped depth (8 on Inkling Small).
+                mtp_cfg = config.get("mtp_config") or {}
+                set_mtp_depth(
+                    int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3
+                )
             else:
                 set_mtp_depth(3)
             if mtp_enabled:
+                backend = (
+                    "embedded DSpark" if _has_dspark_heads(config) else "Lightning MTP"
+                )
                 logger.info(
-                    "Native MTP patch applied for %s (model_type=%s, active)",
+                    "Speculative backend selected for %s: %s "
+                    "(model_type=%s, active)",
                     model_name,
+                    backend,
                     model_type,
                 )
             else:
@@ -624,8 +654,22 @@ def maybe_apply_pre_load_patches(
                 )
 
 
+def _has_dspark_heads(config: dict) -> bool:
+    """True for checkpoints with an embedded DSpark drafter."""
+    cfgs = (config, config.get("text_config") or {})
+    for cfg in cfgs:
+        if int(cfg.get("dspark_block_size", 0) or 0) <= 0:
+            continue
+        target_ids = cfg.get("dspark_target_layer_ids") or ()
+        if target_ids:
+            return True
+    return False
+
+
 def _has_mtp_heads(config: dict) -> bool:
     """True iff the model config declares any MTP head layers."""
+    if _has_dspark_heads(config):
+        return True
     if int(config.get("mtp_num_hidden_layers", 0) or 0) > 0:
         return True
     if int(config.get("num_nextn_predict_layers", 0) or 0) > 0:
@@ -634,6 +678,10 @@ def _has_mtp_heads(config: dict) -> bool:
     if int(text_cfg.get("mtp_num_hidden_layers", 0) or 0) > 0:
         return True
     if int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
+        return True
+    # Inkling nests the head declaration under a top-level mtp_config.
+    mtp_cfg = config.get("mtp_config") or {}
+    if int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
         return True
     return False
 
@@ -644,6 +692,26 @@ _MTP_WEIGHT_PREFIXES = (
     "model.mtp.",
     "model.language_model.mtp.",
 )
+
+
+def _nextn_weight_prefixes_from_config(config: dict) -> tuple[str, ...]:
+    """Return every supported weight prefix for native nextn layers."""
+    cfgs = (config, config.get("text_config") or {})
+    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
+    if n_mtp <= 0:
+        return ()
+    n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
+    if n_main <= 0:
+        return ()
+    return tuple(
+        prefix
+        for i in range(n_mtp)
+        for prefix in (
+            f"model.layers.{n_main + i}.",
+            f"language_model.model.layers.{n_main + i}.",
+            f"model.language_model.layers.{n_main + i}.",
+        )
+    )
 
 
 def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
@@ -658,14 +726,7 @@ def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
         config = json.loads((Path(model_path) / "config.json").read_text())
     except Exception:
         return ()
-    cfgs = (config, config.get("text_config") or {})
-    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
-    if n_mtp <= 0:
-        return ()
-    n_main = max(int(c.get("num_hidden_layers", 0) or 0) for c in cfgs)
-    if n_main <= 0:
-        return ()
-    return tuple(f"model.layers.{n_main + i}." for i in range(n_mtp))
+    return _nextn_weight_prefixes_from_config(config)
 
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
@@ -741,6 +802,8 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
         or model_type == "gemma4"
+        or model_type in ("inkling", "inkling_mm_model")
+        or model_type == "step3p7"
     )
 
 def load_text_model(

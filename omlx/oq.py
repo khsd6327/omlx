@@ -425,6 +425,15 @@ def universal_quant_predicate(
     if "linear_attn.out_proj" in path_l:
         return bits(5)
 
+    # Inkling short-conv weights (k/v/attn/mlp_sconv.conv.weight; the
+    # .weight suffix is stripped by _normalize_quant_path) are tiny
+    # depthwise causal convs on nn.Conv1d modules, which have no
+    # to_quantized() — a quantized emission here would make mlx-vlm's
+    # load-time class_predicate try to quantize a Conv1d and fail. Keep
+    # them at source precision like the conv1d rule above.
+    if path_l.endswith("sconv.conv"):
+        return False
+
     boost_map = config.get("_oq_boost_map") or {}
     if path in boost_map:
         return dict(boost_map[path])
@@ -498,6 +507,16 @@ def universal_quant_predicate(
         sensitive = layer_idx >= 0 and (
             layer_idx < num_layers // 8 or layer_idx >= 7 * num_layers // 8
         )
+
+    # Inkling stacks Q/K/V/R at load when their formats are compatible.
+    # Attention is under 1% of this fine-grained MoE model, and existing
+    # Inkling oQe checkpoints already keep every trunk Q/K/V/R projection at
+    # Q8. Preserve that floor for the fused trunk and MTP layouts: the small
+    # size cost protects both target logits and draft acceptance.
+    if config.get("model_type") in ("inkling", "inkling_mm_model") and (
+        "qkvr_proj" in path
+    ):
+        return bits(8)
 
     if any(p in path for p in ("v_proj", "v_a_proj", "v_b_proj")):
         if sensitive:
@@ -2869,6 +2888,44 @@ def estimate_bpw_and_size(
     )
     logical = idx.logical_metadata()
 
+    # Price on post-sanitize names when a streaming sanitize plan is
+    # discoverable — the quantization loop itself decides on those names.
+    # Some checkpoints store quantizable tensors under source names the
+    # predicate cannot see (inkling's ``experts.w13_weight`` has no
+    # ``.weight`` suffix and fuses gate+up), which priced ~97% of the
+    # model as fp16 passthrough (15.8 bpw for a 4-bit run). Falls back to
+    # the raw header names when discovery is unavailable.
+    plan_view = None
+    try:
+        _sanitize_fn = _build_model_sanitizer(config)
+        if _sanitize_fn is not None:
+            _plan = _discover_sanitize_plan(_sanitize_fn, idx)
+            if _plan:
+                plan_view = _DiscoveredPlan(_plan, idx)
+    except Exception as e:
+        logger.debug("bpw estimate: sanitize-plan discovery unavailable: %s", e)
+
+    if plan_view is not None:
+        planned_logical = {}
+        for out_name, info in plan_view._plan.items():
+            if info.get("transform") == "literal":
+                continue
+            shape = tuple(info.get("shape") or ())
+            dtype = info.get("dtype")
+            sources = info.get("sources") or []
+            if dtype is None and len(sources) == 1:
+                src_meta = logical.get(sources[0])
+                if src_meta is not None:
+                    dtype = src_meta[1]
+            planned_logical[out_name] = (shape, dtype)
+        if planned_logical:
+            logical = planned_logical
+
+    def _source_quant_info(name):
+        if plan_view is not None:
+            return plan_view.source_quant_info(name)
+        return idx.source_quant_info(name)
+
     named_shapes = {}
     for name, (shape, _dtype) in logical.items():
         norm = _normalize_quant_path(name)
@@ -2886,7 +2943,7 @@ def estimate_bpw_and_size(
     fixed_overrides = {}
     _pre_boost_config = {**config, "_oq_boost_map": {}}
     for _path in named_shapes:
-        _info = idx.source_quant_info(f"{_path}.weight")
+        _info = _source_quant_info(f"{_path}.weight")
         if _info is None:
             continue
         _floor_bits, _, _ = _get_predicate_bits(
@@ -2952,7 +3009,7 @@ def estimate_bpw_and_size(
             continue
 
         total_params += n_elements
-        src_info = idx.source_quant_info(name)
+        src_info = _source_quant_info(name)
         if src_info is not None and bits >= src_info["bits"]:
             # Passthrough: packed weight at source bits plus one e8m0
             # uint8 scale byte per group.
@@ -3298,16 +3355,9 @@ def _source_has_nextn_tensors(keys, config: dict) -> bool:
     they count as MTP tensors even though ``_is_mtp_tensor`` (which sees
     post-sanitize names) doesn't match them.
     """
-    cfgs = (config, config.get("text_config") or {})
-    n_mtp = max(int(c.get("num_nextn_predict_layers", 0) or 0) for c in cfgs)
-    if n_mtp <= 0:
-        return False
-    n_main = 0
-    for c in cfgs:
-        n_main = max(n_main, int(c.get("num_hidden_layers", 0) or 0))
-    if n_main <= 0:
-        return False
-    prefixes = tuple(f"model.layers.{n_main + i}." for i in range(n_mtp))
+    from omlx.utils.model_loading import _nextn_weight_prefixes_from_config
+
+    prefixes = _nextn_weight_prefixes_from_config(config)
     return any(k.startswith(prefixes) for k in keys)
 
 
@@ -3328,6 +3378,20 @@ def _normalize_mtp_in_config(config: dict) -> None:
         for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
             if key in text_cfg and text_cfg[key]:
                 text_cfg[key] = 0
+    # Inkling nests the declaration under a top-level mtp_config block.
+    if isinstance(config.get("mtp_config"), dict):
+        config.pop("mtp_config", None)
+    # DeepSeek-V4-Flash-0731 uses these fields as the embedded-DSpark
+    # discriminator. Leaving them behind after mtp.* tensors are stripped
+    # would make the shared Lightning MTP toggle select a missing drafter.
+    for key in (
+        "dspark_block_size",
+        "dspark_noise_token_id",
+        "dspark_target_layer_ids",
+        "dspark_markov_rank",
+        "n_mtp_layers",
+    ):
+        config.pop(key, None)
 
 
 def _normalize_text_only_in_config(config: dict) -> None:
@@ -3440,6 +3504,12 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                     )
 
                     apply_mlx_vlm_minimax_m3_compat_patch()
+                if model_type in ("inkling", "inkling_mm_model"):
+                    from omlx.patches.mlx_vlm_inkling_compat import (
+                        apply_mlx_vlm_inkling_compat_patch,
+                    )
+
+                    apply_mlx_vlm_inkling_compat_patch()
             except Exception as patch_err:
                 logger.debug(f"MiniMax M3 mlx-vlm patch not applied: {patch_err}")
 
@@ -3507,6 +3577,17 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                     audio_tower = _AUDIO_SENTINEL
                     embed_audio = _AUDIO_SENTINEL
 
+                    # Some sanitizes call sibling instance methods (inkling's
+                    # ``self._map_llm_layer`` / ``self._map_experts``) or read
+                    # class attributes (``self._ATTN``). Resolve anything the
+                    # proxy itself lacks from the model class, binding
+                    # functions so ``self`` stays the proxy.
+                    def __getattr__(self, name):
+                        attr = getattr(model_module.Model, name)
+                        if callable(attr):
+                            return attr.__get__(self, type(self))
+                        return attr
+
                 proxy = _Proxy()
                 proxy.config = model_config
                 # Nested-VLM sanitizes (e.g. MiniMax-M3 minimax_m3_vl) read
@@ -3527,8 +3608,15 @@ def _build_model_sanitizer(config: dict, text_only: bool = False):
                 else:
                     w = _san(weights)
 
-                w = sanitize_weights(model_module.VisionModel, w, vision_config)
-                w = sanitize_weights(model_module.LanguageModel, w, text_config)
+                # Not every model package re-exports its tower classes
+                # (inkling's __init__ has no VisionModel); a missing class
+                # simply has no per-tower sanitize to run.
+                vision_cls = getattr(model_module, "VisionModel", None)
+                if vision_cls is not None:
+                    w = sanitize_weights(vision_cls, w, vision_config)
+                language_cls = getattr(model_module, "LanguageModel", None)
+                if language_cls is not None:
+                    w = sanitize_weights(language_cls, w, text_config)
                 return w
 
             logger.info(
@@ -3760,8 +3848,11 @@ def _is_mtp_protected_tensor(name: str) -> bool:
     # Qwen3.5/3.6 fusion projection
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
         return True
-    # DeepSeek-V4 / GLM-5.2 MTP block fusion projections
-    if name.endswith((".e_proj.weight", ".h_proj.weight", ".eh_proj.weight")):
+    # DeepSeek-V4 / GLM-5.2 MTP block fusion projections. Embedded DSpark
+    # combines target-layer taps through main_proj instead of e_proj/h_proj.
+    if name.endswith(
+        (".e_proj.weight", ".h_proj.weight", ".eh_proj.weight", ".main_proj.weight")
+    ):
         return True
     # DeepSeek-V4 HyperHead final projection (sanitized form has the dot;
     # the raw-HF form arrives as ``hc_head_<param>`` and we cover both).
@@ -3772,6 +3863,11 @@ def _is_mtp_protected_tensor(name: str) -> bool:
         or name.endswith(".hc_head_base")
         or name.endswith(".hc_head_scale")
     ):
+        return True
+    # DSpark's rank-R Markov transition is added directly to draft logits;
+    # quantizing it can change every proposal distribution. The confidence
+    # head is tiny and precision-sensitive, so neither is worth compressing.
+    if ".markov_head." in name or ".confidence_head." in name:
         return True
     return False
 
@@ -6138,6 +6234,13 @@ def _find_model_layers(model):
         lm = model.language_model.model
         if hasattr(lm, "embed_tokens"):
             embed_fn = lm.embed_tokens
+            # Inkling applies an embed-side RMSNorm (use_embed_norm)
+            # inside InklingModel.embed(); raw embed_tokens would feed
+            # layer 0 un-normalized activations to calibration.
+            if callable(getattr(lm, "embed", None)) and (
+                getattr(lm, "embed_norm", None) is not None
+            ):
+                embed_fn = lm.embed
             layers = lm.layers
     elif hasattr(model, "embed_tokens"):
         embed_fn = model.embed_tokens
@@ -6363,6 +6466,18 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
                 f"{type(block).__name__}: {e}"
             )
             return None, None
+    if isinstance(position_ids, dict) and position_ids.get("kind") == "inkling":
+        try:
+            result = block(inputs)
+            if isinstance(result, tuple):
+                return result[0], result[1] if len(result) > 1 else None
+            return result, None
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            logger.debug(
+                f"_forward_layer: inkling signature failed for "
+                f"{type(block).__name__}: {e}"
+            )
+            return None, None
 
     last_exc = None
     for call_args in [
@@ -6514,6 +6629,14 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs):
         mask = create_attention_mask(inputs, None, return_array=True)
         state = {"kind": "glm_moe_dsa", "prev_topk_indices": None}
         return inputs, [mask] * len(layers), state
+    if model_type in ("inkling", "inkling_mm_model"):
+        # Inkling decoder layers build their own banded causal/sliding
+        # masks internally (banded_additive_mask) and take
+        # (x, cache=None, conv_mask=None). Calibration walks cache-less
+        # single sequences, so both stay None; without this branch the
+        # generic signature probe only lands on ``(inputs,)`` after four
+        # caught exceptions per layer.
+        return inputs, [None] * len(layers), {"kind": "inkling"}
     masks = _layer_masks_for_model(model, layers, inputs)
     position_ids = mx.arange(calib_data.shape[1])[None, :]
     return inputs, masks, position_ids
@@ -6708,7 +6831,12 @@ class OQImatrixCollector:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
 
 
-def _collect_mtp_head_imatrix(model, batch, hidden) -> bool:
+def _collect_mtp_head_imatrix(
+    model,
+    batch,
+    hidden,
+    dspark_hiddens=None,
+) -> bool:
     """Run the MTP head over a calibration micro-batch.
 
     The trunk-layer walk never invokes the head, so without this pass every
@@ -6723,6 +6851,16 @@ def _collect_mtp_head_imatrix(model, batch, hidden) -> bool:
     if mtp is None:
         return False
     try:
+        dspark_calibration = getattr(inner, "dspark_calibration_forward", None)
+        if (
+            getattr(inner, "_omlx_dspark_decode_enabled", False)
+            and callable(dspark_calibration)
+            and dspark_hiddens
+        ):
+            target_hidden = mx.concatenate(dspark_hiddens, axis=-1)
+            out = dspark_calibration(target_hidden, batch)
+            mx.eval(out)
+            return True
         if isinstance(mtp, (list, tuple)):
             # DeepSeek-V4 style: MTPBlock stack consuming the raw (4D)
             # trunk hidden; Model.mtp_forward wires mask/cache/embedding.
@@ -6848,6 +6986,13 @@ def _collect_imatrix_from_model(
                     model, layers, batch, inputs
                 )
 
+                inner = getattr(model, "language_model", None) or model
+                args = getattr(inner, "args", None)
+                dspark_target_ids = set(
+                    getattr(args, "dspark_target_layer_ids", ()) or ()
+                )
+                dspark_hiddens = []
+
                 for layer_idx, block in enumerate(layers):
                     layer_mask = (
                         layer_masks[layer_idx] if layer_idx < len(layer_masks) else None
@@ -6869,6 +7014,11 @@ def _collect_imatrix_from_model(
                         continue
                     mx.eval(out)
                     inputs = out
+                    # DSpark config uses one-based completed layer depths,
+                    # matching the runtime target-tap path.
+                    if layer_idx + 1 in dspark_target_ids:
+                        tapped = out.mean(axis=2) if out.ndim == 4 else out
+                        dspark_hiddens.append(tapped)
                     _commit_layer_forward_aux(
                         position_ids, layer_idx, aux, fallback=prev_aux
                     )
@@ -6879,7 +7029,12 @@ def _collect_imatrix_from_model(
                 # the final-layer hidden states; feed them (post-norm) plus
                 # the shifted token ids through the head so its linears
                 # contribute imatrix entries too.
-                if _collect_mtp_head_imatrix(model, batch, inputs):
+                if _collect_mtp_head_imatrix(
+                    model,
+                    batch,
+                    inputs,
+                    dspark_hiddens=dspark_hiddens,
+                ):
                     mx.synchronize()
                     mx.clear_cache()
 
@@ -7762,7 +7917,11 @@ def _measure_sensitivity_from_quantized_model(
                     set_mtp_active,
                 )
 
-                have_lm_patch = apply_mlx_lm_mtp_patch()
+                apply_mlx_lm_mtp_patch()
+                # apply() is idempotent and returns whether it changed live
+                # classes, not whether the patch is available. A prior oQe
+                # phase commonly installed it already.
+                have_lm_patch = True
             except Exception:
                 have_lm_patch = False
                 is_mtp_active = None

@@ -99,6 +99,22 @@ def _set_verify_qmm_armed(flag: bool) -> None:
     except Exception:
         pass
 
+
+def _set_dspark_target_verify(model: Any, flag: bool) -> None:
+    try:
+        import sys
+
+        host = _dspark_host(model)
+        if host is None:
+            return
+        module = sys.modules.get(type(host).__module__)
+        setter = getattr(module, "set_dspark_verify_armed", None)
+        if setter is not None:
+            setter(flag)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -172,6 +188,9 @@ def apply() -> bool:
                         return _mtp_next(self, state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP next() fallback to standard step: %s", exc)
+                    active = getattr(self, "_omlx_mtp_state", None)
+                    if active is not None:
+                        _reconcile_mtp_to_standard(self, active)
                     _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
@@ -508,6 +527,16 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
 
 def _is_mtp_batch_eligible(gen_batch: Any) -> bool:
     if not _mtp_common_eligible(gen_batch):
+        return False
+    model = getattr(gen_batch, "model", None)
+    if getattr(model, "_omlx_mtp_rowwise_unsupported", False) or getattr(
+        getattr(model, "_language_model", None),
+        "_omlx_mtp_rowwise_unsupported",
+        False,
+    ):
+        # Multi-block window heads (inkling) keep per-request cycle state
+        # on the cache list; the row-wise extract/merge path does not
+        # model that.
         return False
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) <= 1:
@@ -1317,11 +1346,17 @@ def _call_backbone(
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
+    dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
-    _set_verify_qmm_armed(True)
+    # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
+    # DeepSeek target on its architecture-native quantized linear path.
+    _set_verify_qmm_armed(not dspark_verify)
+    _set_dspark_target_verify(model, dspark_verify)
     try:
         result = model(inputs, **kwargs)
     finally:
+        if dspark_verify:
+            _set_dspark_target_verify(model, False)
         _set_verify_qmm_armed(False)
         _rollback_mod.set_undo_armed(False)
 
@@ -1341,16 +1376,19 @@ def _call_backbone(
 
 def _clear_rollback(prompt_cache: List[Any]) -> None:
     """Drop rollback snapshots after a draft is accepted."""
-    for c in prompt_cache:
+    pending = list(prompt_cache)
+    while pending:
+        c = pending.pop()
+        pending.extend(getattr(c, "caches", ()))
         if hasattr(c, "rollback_state") and c.rollback_state is not None:
             c.rollback_state = None
         if getattr(c, "_mtp_draft_stash", None) is not None:
             c._mtp_draft_stash = None
         if getattr(c, "_mtp_undo", None) is not None:
             c._mtp_undo = None
-        for sub in getattr(c, "caches", ()):
-            if getattr(sub, "_mtp_undo", None) is not None:
-                sub._mtp_undo = None
+        if getattr(c, "_undo", None) is not None:
+            c._undo = None
+            c._undo_chain = False
 
 
 def _ensure_uint32(arr):
@@ -1656,7 +1694,13 @@ class _DepthController:
         if self.max_depth > 1:
             self._warmup.extend([0, 0, 0])
 
-    def observe(self, used: int, accepted: int, cycle_ms: float) -> None:
+    def observe(
+        self,
+        used: int,
+        accepted: int,
+        cycle_ms: float,
+        time_sample: bool = True,
+    ) -> None:
         self.cycles += 1
         used = max(0, min(int(used), self.max_depth))
         accepted = max(0, min(int(accepted), used))
@@ -1669,11 +1713,16 @@ class _DepthController:
                 break
         # Cost: wall-time-domain EMA with a one-off-spike guard, plus per-depth
         # ages so probes can target the estimate that is most stale.
+        # ``time_sample=False`` marks cycles carrying a one-off maintenance
+        # cost (a multi-block head keepalive refold) whose spike would bias
+        # this depth's estimate; the acceptance update above still applies.
         cycle_ms = max(0.0, float(cycle_ms))
-        self._update_time(used, cycle_ms)
+        if time_sample:
+            self._update_time(used, cycle_ms)
         for d in list(self.t_age):
             self.t_age[d] += cycle_ms
-        self.t_age[used] = 0.0
+        if time_sample:
+            self.t_age[used] = 0.0
         self._ms_probe += cycle_ms
         self._ms_explore += cycle_ms
 
@@ -1911,6 +1960,87 @@ def _resolve_draft_sampler(gen_batch: Any, state: _MtpState):
     return state.draft_sampler
 
 
+def _dspark_host(model: Any) -> Optional[Any]:
+    """Return the model object that owns an active embedded DSpark head."""
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        if getattr(candidate, "_omlx_dspark_decode_enabled", False):
+            return candidate
+    return None
+
+
+def _dspark_next_drafts(
+    gen_batch: Any,
+    state: _MtpState,
+    hidden_rows: Any,
+    committed: Any,
+    prev_buf: Optional[Any],
+) -> None:
+    """Append committed target taps and sample one DSpark block.
+
+    The expensive three-stage decoder runs once over anchor+noise positions.
+    A rank-R Markov head then samples left-to-right, preserving DSpark's
+    intra-block dependency without another decoder pass.
+    """
+    import mlx.core as mx
+
+    host = _dspark_host(gen_batch.model)
+    if host is None:
+        raise _MtpStepFallback("embedded DSpark host is unavailable")
+
+    depth = state.controller.cur if state.controller is not None else state.depth
+    depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
+    n = int(committed.shape[0])
+    if depth <= 0:
+        host.dspark_append_context(hidden_rows, state.mtp_cache)
+        state.hist_offset += n
+        state.drafts = mx.zeros((0,), dtype=mx.uint32)
+        state.draft_lps = []
+        state.draft_accept_lps = []
+        return
+
+    anchor = committed[-1:].reshape(1, 1)
+    logits, _ = host.dspark_forward(
+        hidden_rows,
+        anchor,
+        state.mtp_cache,
+        draft_length=depth,
+    )
+    state.hist_offset += n
+
+    sampler = _resolve_sampler(gen_batch)
+    procs = _proc_list(gen_batch)
+    draft_toks: List[Any] = []
+    draft_lps: List[Any] = []
+    draft_accept_lps: List[Any] = []
+    previous = anchor.reshape(1)
+
+    for idx in range(depth):
+        bias, _ = host.dspark_markov(previous)
+        logits_2d = logits[:, idx, :] + bias
+        if procs is not None and prev_buf is not None:
+            prefix = mx.concatenate(
+                [prev_buf.astype(mx.int32), anchor.reshape(1).astype(mx.int32)]
+                + [token.reshape(1).astype(mx.int32) for token in draft_toks]
+            )
+            logits_2d = _apply_processors(procs, prefix, logits_2d)
+        lp_2d = _logprobs(logits_2d)
+        token = _ensure_uint32(sampler(lp_2d))
+        draft_toks.append(token)
+        draft_lps.append(lp_2d.squeeze(0))
+        draft_accept_lps.append(_accept_lp_for(sampler, lp_2d).squeeze(0))
+        previous = token.reshape(1)
+
+    state.drafts = mx.concatenate(draft_toks)
+    state.draft_lps = draft_lps
+    state.draft_accept_lps = draft_accept_lps
+    mx.async_eval(state.drafts)
+
+
 def _chain_next_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -1940,6 +2070,14 @@ def _chain_next_drafts(
     import mlx.core as mx
 
     model = gen_batch.model
+    if _dspark_host(model) is not None:
+        return _dspark_next_drafts(
+            gen_batch,
+            state,
+            hidden_rows,
+            committed,
+            prev_buf,
+        )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
 
@@ -1956,8 +2094,23 @@ def _chain_next_drafts(
         state.draft_accept_lps = []
         return
 
-    if _HEAD_HIDDEN_POST_NORM and hidden_rows.ndim == 3:
+    # Models whose MTP head normalizes its hidden input internally
+    # (inkling: per-block hidden_norm, chain_hidden_post_norm=False) mark
+    # themselves and receive the raw pre-norm trunk hidden.
+    head_prenorm = getattr(model, "_omlx_mtp_head_prenorm", False) or getattr(
+        getattr(model, "_language_model", None), "_omlx_mtp_head_prenorm", False
+    )
+    if _HEAD_HIDDEN_POST_NORM and not head_prenorm and hidden_rows.ndim == 3:
         hidden_rows = _trunk_norm_module(model)(hidden_rows)
+
+    # Multi-block heads (inkling) route fold/chain by a per-cycle pass
+    # counter on the cache list; reset it before the fold. Single-block
+    # heads have no hook and are unaffected.
+    begin = getattr(model, "mtp_begin_cycle", None) or getattr(
+        getattr(model, "_language_model", None), "mtp_begin_cycle", None
+    )
+    if begin is not None:
+        begin(state.mtp_cache, depth)
 
     n = committed.shape[0]
     logits, head_hidden = model.mtp_forward(
@@ -2065,6 +2218,7 @@ def _post_init_mtp(gen_batch: Any) -> None:
     logits, hidden, _ = _call_backbone(
         gen_batch.model, main_tok[:, None], gen_batch.prompt_cache
     )
+    _clear_rollback(gen_batch.prompt_cache)
 
     next_main_logits = logits[:, -1, :]  # (1, vocab) — distribution after main_tok
     next_main_logits = _apply_processors(procs, prev_buf, next_main_logits)
@@ -2627,8 +2781,14 @@ def _run_verify_cycle_chain(gen_batch: Any, state: _MtpState) -> None:
     state.next_main = next_main
     state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
     if state.controller is not None:
+        keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
+        if keepalive:
+            state.mtp_cache.fold_keepalive = False
         state.controller.observe(
-            k, m, (time.perf_counter() - cycle_t0) * 1000
+            k,
+            m,
+            (time.perf_counter() - cycle_t0) * 1000,
+            time_sample=not keepalive,
         )
 
 
