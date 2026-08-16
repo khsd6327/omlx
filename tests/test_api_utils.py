@@ -52,9 +52,34 @@ from omlx.api.utils import (
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
+
+
+class TestReasoningEffortChatTemplateKwargs:
+    def test_adds_top_level_reasoning_effort(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, "xhigh") == {
+            "reasoning_effort": "xhigh"
+        }
+
+    def test_explicit_template_kwarg_wins(self):
+        original = {"reasoning_effort": "low", "enable_thinking": True}
+
+        merged = merge_reasoning_effort_chat_template_kwargs(original, "xhigh")
+
+        assert merged == original
+        assert merged is not original
+
+    def test_empty_inputs_return_none(self):
+        assert merge_reasoning_effort_chat_template_kwargs(None, None) is None
+
+    def test_numeric_effort_forwarded_unchanged(self):
+        merged = merge_reasoning_effort_chat_template_kwargs(None, 0.9)
+
+        assert merged == {"reasoning_effort": 0.9}
+        assert isinstance(merged["reasoning_effort"], float)
 
 
 class TestCleanOutputText:
@@ -623,6 +648,16 @@ class TestUsesNativeReasoningContent:
         assert uses_native_reasoning_content(
             "qwen",
             preserve_thinking_default=True,
+        )
+
+    def test_detects_muse_glimmer(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="muse_glimmer",
+        )
+        assert uses_native_reasoning_content(
+            "any-name",
+            engine_model_type="muse_glimmer",
         )
 
     def test_plain_model_is_not_native(self):

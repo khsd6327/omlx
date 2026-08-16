@@ -750,7 +750,15 @@ def relocate_mid_system_messages(
     context immediately before the same user, preserving append-only prompt
     caching across requests.
 
-    Only the observed ``user -> system -> (assistant | end)`` shape is
+    Tool-call turns need the same treatment: the Anthropic adapter splits
+    ``tool_result`` blocks into ``tool`` role messages, so Claude Code's
+    periodic reminders arrive as ``tool -> system -> assistant`` runs.
+    Those are reclassified as a ``latest_reminder`` before the contiguous
+    tool run (the run merges into one user turn at encode time), which
+    keeps the rendered prefix byte-stable across requests instead of
+    falling back to front-consolidation that rewrites the whole prompt.
+
+    Only ``(user | tool) -> system -> (assistant | end)`` shapes are
     rewritten. Other placements and non-leading developer messages return
     None so oMLX can use its configured strict or user-note fallback.
     """
@@ -782,22 +790,35 @@ def relocate_mid_system_messages(
             continue
 
         next_role = source[index].get("role") if index < len(source) else None
-        if (
-            not relocated
-            or relocated[-1].get("role") != "user"
-            or next_role not in {None, "assistant"}
-        ):
+        prev_role = relocated[-1].get("role") if relocated else None
+        if prev_role not in {"user", "tool"} or next_role not in {None, "assistant"}:
             return None
 
-        associated_user = relocated.pop()
-        if parts:
-            relocated.append(
+        if prev_role == "user":
+            associated_user = relocated.pop()
+            if parts:
+                relocated.append(
+                    {
+                        "role": "latest_reminder",
+                        "content": "\n\n".join(parts),
+                    }
+                )
+            relocated.append(associated_user)
+        elif parts:
+            # Tool-adjacent run: the tool messages merge into one user turn
+            # whose template ends with the assistant primer, so the reminder
+            # must move before the whole tool run to render ahead of that
+            # user turn (mirroring the user-adjacent placement above).
+            insert_at = len(relocated)
+            while insert_at > 0 and relocated[insert_at - 1].get("role") == "tool":
+                insert_at -= 1
+            relocated.insert(
+                insert_at,
                 {
                     "role": "latest_reminder",
                     "content": "\n\n".join(parts),
-                }
+                },
             )
-        relocated.append(associated_user)
 
     return relocated
 
@@ -845,6 +866,25 @@ def apply_chat_template(
     if not add_generation_prompt:
         out = out.removesuffix(ASSISTANT_SP_TOKEN + thinking_start_token)
         out = out.removesuffix(ASSISTANT_SP_TOKEN + thinking_end_token)
+    elif not (
+        prepared_messages and prepared_messages[-1].get("task") is not None
+    ) and not out.endswith(
+        (
+            ASSISTANT_SP_TOKEN + thinking_start_token,
+            ASSISTANT_SP_TOKEN + thinking_end_token,
+        )
+    ):
+        # encode_messages only emits the generation anchor after a
+        # user/developer-final message. A system-final conversation (e.g. a
+        # bare title-generation instruction, or a trailing workspace/system
+        # note after the last user turn) otherwise ends without
+        # <|Assistant|><think>, and the model free-runs as document
+        # continuation until max_tokens.
+        out += ASSISTANT_SP_TOKEN + (
+            thinking_start_token
+            if encode_kwargs.get("thinking_mode", "thinking") == "thinking"
+            else thinking_end_token
+        )
     if continue_final_message and messages and messages[-1].get("role") == "assistant":
         out = out.removesuffix(eos_token)
     return out

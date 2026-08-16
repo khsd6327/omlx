@@ -1875,12 +1875,17 @@ class VLMBatchedEngine(BaseEngine):
         ):
             try:
                 from ..patches.qwen35_q4_mlp import (
+                    apply_muse_glimmer_q4_prefill_patch,
                     apply_qwen35_q4_mlp_patch,
                     apply_qwen35_q4_prefill_linear_patch,
                 )
 
                 apply_qwen35_q4_mlp_patch()
                 apply_qwen35_q4_prefill_linear_patch()
+                # Muse Glimmer rides the same native qmm tile (MLP plus the
+                # q/gate/o attention projections); no-op unless the muse
+                # compat patch installed the vendored module.
+                apply_muse_glimmer_q4_prefill_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
@@ -2081,6 +2086,21 @@ class VLMBatchedEngine(BaseEngine):
         """
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
+            return
+
+        # MiniMax M3's template contains generic <tool_call> text in comments
+        # and examples, so upstream inference incorrectly selects json_tools.
+        # Use the same oMLX protocol adapter as distributed ranks.
+        from ..adapter.output_parser import (
+            install_minimax_m3_tokenizer_protocol,
+        )
+
+        if install_minimax_m3_tokenizer_protocol(
+            tokenizer,
+            self._model_name,
+            {"model_type": self.model_type} if self.model_type else None,
+        ):
+            logger.info("VLM tool calling enabled: parser=minimax_m3")
             return
 
         # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)
@@ -3223,6 +3243,7 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: forward per-request overrides to the engine, mirroring
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -3232,6 +3253,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=vlm_image_hash,
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
+            tools=tools,
             **specprefill_kwargs,
         )
 
@@ -3332,6 +3354,7 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -3343,6 +3366,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            tools=tools,
             **specprefill_kwargs,
         )
 
@@ -3456,6 +3480,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=image_hash,
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
+            tools=tools,
             **kwargs,
         )
 
@@ -3693,6 +3718,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_image_hash=image_hash,
             vlm_cache_key_start=image_cache_key_start,
             vlm_cache_key_ranges=image_cache_key_ranges,
+            tools=tools,
             **kwargs,
         ):
             yield output
@@ -4287,7 +4313,12 @@ class VLMBatchedEngine(BaseEngine):
             return self._engine.get_cache_stats()
         return None
 
-    async def abort_all_requests(self) -> int:
+    async def abort_all_requests(
+        self,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
         """Abort all active requests."""
         if self.is_diffusion_model:
             cancel_events = list(getattr(self, "_diffusion_cancel_events", ()))
@@ -4295,5 +4326,8 @@ class VLMBatchedEngine(BaseEngine):
                 cancel_event.set()
             return len(cancel_events)
         if self._engine and self._engine.engine:
-            return await self._engine.engine.abort_all_requests()
+            return await self._engine.engine.abort_all_requests(
+                reason=reason,
+                error_code=error_code,
+            )
         return 0

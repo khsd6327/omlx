@@ -37,6 +37,12 @@ from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
+from ..websearch import (
+    DDGS_TEXT_BACKENDS,
+    DEFAULT_MAX_RESULTS,
+    run_web_search_test,
+)
+from ..websearch import SUPPORTED_PROVIDERS as SUPPORTED_WEB_SEARCH_PROVIDERS
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
@@ -221,6 +227,7 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    distributed_inference_enabled: bool | None = None
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -242,17 +249,23 @@ class GlobalSettingsRequest(BaseModel):
     embedding_batch_size: int | None = None
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
+    decode_fairness: bool | None = None
 
     # Cache settings
     cache_enabled: bool | None = None
     ssd_cache_dir: str | None = None
     ssd_cache_max_size: str | None = None
     hot_cache_only: bool | None = None
+    gdn_snapshot_storage: str | None = None
+    gdn_ssd_split_enabled: bool | None = None
+    gdn_ssd_pending_max_size: str | None = None
+    gdn_sidecar_state_dtype: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
     # MCP settings
     mcp_config: str | None = None
+    mcp_expose_tools: bool | None = None
 
     # HuggingFace settings
     hf_endpoint: str | None = None
@@ -297,6 +310,14 @@ class GlobalSettingsRequest(BaseModel):
     markitdown_max_file_size_mb: int | None = None
     markitdown_max_files_per_request: int | None = None
     markitdown_pdf_processing_engine: str | None = None
+    web_search_provider: str | None = None
+    web_search_brave_api_key: str | None = None
+    web_search_searxng_url: str | None = None
+    web_search_ddgs_backends: str | None = None
+    web_search_max_results: int | None = None
+    web_search_content_mode: str | None = None
+    web_search_content_truncate: bool | None = None
+    web_search_content_max_chars: int | None = None
 
     # UI settings
     ui_language: str | None = None
@@ -661,9 +682,19 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     if not _is_mtp_compatible(cfg, model_type):
         return False, (
             f"model_type={model_type!r} is not on the MTP whitelist "
-            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa)"
+            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
+            "gemma4, gemma4_unified)"
         )
     if not _checkpoint_has_mtp_weights(model_path):
+        from ..oq import _resolve_mtplx_sidecar
+
+        if _resolve_mtplx_sidecar(Path(model_path), cfg) is not None:
+            # The dashboard keys the one-click import button off this
+            # "MTPLX side-car" marker (models.js).
+            return False, (
+                "MTPLX side-car detected but not imported. Import it to "
+                "merge the MTP head into the checkpoint index."
+            )
         return False, (
             "Config declares MTP layers but the weight files contain neither "
             "mtp.* tensors nor native nextn layers. Re-convert from HF with a "
@@ -907,6 +938,22 @@ async def _apply_cache_settings_runtime(
         return False, "Engine pool not initialized"
 
     pool = _server_state.engine_pool
+
+    # These settings all affect objects constructed with each scheduler. Keep
+    # the pool template synchronized before unloading existing engines.
+    pool._scheduler_config.hot_cache_only = global_settings.cache.hot_cache_only
+    pool._scheduler_config.gdn_ssd_split_enabled = (
+        global_settings.cache.get_gdn_ssd_split_enabled()
+    )
+    pool._scheduler_config.gdn_ssd_pending_max_bytes = parse_size(
+        global_settings.cache.gdn_ssd_pending_max_size
+    )
+    pool._scheduler_config.gdn_sidecar_state_dtype = (
+        global_settings.cache.gdn_sidecar_state_dtype
+    )
+    pool._scheduler_config.initial_cache_blocks = (
+        global_settings.cache.initial_cache_blocks
+    )
 
     # Update scheduler config based on cache settings
     if enabled is False or (enabled is None and not global_settings.cache.enabled):
@@ -1996,9 +2043,22 @@ async def unload_model(
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+    if entry.is_loading:
+        raise HTTPException(status_code=409, detail=f"Model still loading: {model_id}")
 
-    await engine_pool._unload_engine(model_id)
-    logger.info(f"Manually unloaded model: {model_id}")
+    unloaded = await engine_pool.request_unload(model_id, reason="manual admin unload")
+    if not unloaded:
+        logger.info("Queued manual unload for active model: %s", model_id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "unloading",
+                "model_id": model_id,
+                "message": f"Aborting active requests before unloading {model_id}",
+            },
+        )
+
+    logger.info("Manually unloaded model: %s", model_id)
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
 
@@ -2064,6 +2124,32 @@ async def load_model(
 
     logger.info(f"Manually loaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
+
+
+@router.post("/api/models/{model_id}/import-mtplx")
+async def import_mtplx(
+    model_id: str,
+    is_admin: bool = Depends(_require_admin_or_bearer),
+):
+    """Import an MTPLX side-car MTP head into the model's checkpoint index."""
+    from ..oq import import_mtplx_sidecar
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    entry = engine_pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    try:
+        result = await asyncio.to_thread(import_mtplx_sidecar, entry.model_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    logger.info(f"Imported MTPLX side-car for model: {model_id}")
+    if entry.engine is not None:
+        result["message"] = "Imported. Reload the model to activate the MTP head."
+    return {"status": "ok", "model_id": model_id, **result}
 
 
 @router.post("/api/reload")
@@ -2401,8 +2487,9 @@ async def update_model_settings(
                     detail=(
                         f"Model is not MTP-compatible (model_type={model_type!r}, "
                         f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4 or "
-                        "GLM-5.2 checkpoint with MTP heads."
+                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
+                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
+                        "MTP heads."
                     ),
                 )
             if not _checkpoint_has_mtp_weights(entry.model_path):
@@ -3185,6 +3272,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
     )
     disk_info = get_ssd_disk_info(cache_dir)
+    server_state = _get_server_state() if _get_server_state is not None else None
 
     return {
         "base_path": str(global_settings.base_path),
@@ -3200,6 +3288,19 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 global_settings.server,
                 "preserve_mid_system_cache",
                 True,
+            ),
+            "distributed_inference_enabled": getattr(
+                global_settings.server,
+                "distributed_inference_enabled",
+                False,
+            ),
+            "distributed_inference_active": bool(
+                server_state is not None
+                and getattr(
+                    server_state,
+                    "distributed_inference_enabled",
+                    False,
+                )
             ),
         },
         "model": {
@@ -3226,6 +3327,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "embedding_batch_size": global_settings.scheduler.embedding_batch_size,
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
+            "decode_fairness": global_settings.scheduler.decode_fairness,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -3237,11 +3339,16 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 )
             ),
             "hot_cache_only": global_settings.cache.hot_cache_only,
+            "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
+            "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
+            "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
+            "gdn_sidecar_state_dtype": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
+            "expose_tools": global_settings.mcp.expose_tools,
         },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
@@ -3293,6 +3400,14 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
             "markitdown_max_file_size_mb": global_settings.integrations.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": global_settings.integrations.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": global_settings.integrations.markitdown_pdf_processing_engine,
+            "web_search_provider": global_settings.integrations.web_search_provider,
+            "web_search_brave_api_key": global_settings.integrations.web_search_brave_api_key,
+            "web_search_searxng_url": global_settings.integrations.web_search_searxng_url,
+            "web_search_ddgs_backends": global_settings.integrations.web_search_ddgs_backends,
+            "web_search_max_results": global_settings.integrations.web_search_max_results,
+            "web_search_content_mode": global_settings.integrations.web_search_content_mode,
+            "web_search_content_truncate": global_settings.integrations.web_search_content_truncate,
+            "web_search_content_max_chars": global_settings.integrations.web_search_content_max_chars,
         },
         "system": {
             "total_memory_bytes": memory_info["total_bytes"],
@@ -3327,9 +3442,9 @@ async def update_global_settings(
     """
     Update global server settings.
 
-    Updates are persisted to the global settings file. Some settings
-    (log_level, model_dir, memory_guard_tier, cache) are applied immediately,
-    while others (host, port, scheduler, mcp) require server restart.
+    Updates are persisted to the global settings file. Some settings,
+    including the MCP exposure toggle, are applied immediately, while network
+    binding and MCP config path changes require a server restart.
 
     Args:
         request: GlobalSettingsRequest with the new settings.
@@ -3425,6 +3540,12 @@ async def update_global_settings(
             request.preserve_mid_system_cache
         )
         runtime_applied.append("preserve_mid_system_cache")
+    if request.distributed_inference_enabled is not None:
+        # Route exposure and Bonjour publication are fixed at process startup,
+        # so this intentionally takes effect after the normal settings restart.
+        global_settings.server.distributed_inference_enabled = (
+            request.distributed_inference_enabled
+        )
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias
@@ -3544,6 +3665,11 @@ async def update_global_settings(
 
         pool = _server_state.engine_pool
         if pool is not None:
+            # Engines loaded from now on build their Scheduler from the
+            # pool's stored config (same gap as prefill_priority had).
+            pool_config = getattr(pool, "_scheduler_config", None)
+            if pool_config is not None:
+                pool_config.chunked_prefill = request.chunked_prefill
             for mid, entry in pool._entries.items():
                 if entry is None or entry.engine is None:
                     continue
@@ -3604,12 +3730,132 @@ async def update_global_settings(
         runtime_applied.append("prefill_priority")
         logger.info(f"Prefill priority set to '{value}'")
 
+    # Apply decode fairness setting (Live)
+    if request.decode_fairness is not None:
+        enabled = bool(request.decode_fairness)
+        global_settings.scheduler.decode_fairness = enabled
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            pool_config = getattr(pool, "_scheduler_config", None)
+            if pool_config is not None:
+                pool_config.decode_fairness = enabled
+            for mid, entry in pool._entries.items():
+                if entry is None or entry.engine is None:
+                    continue
+                async_core = getattr(entry.engine, "_engine", None)
+                core = (
+                    getattr(async_core, "engine", None)
+                    if async_core is not None
+                    else None
+                )
+                scheduler = (
+                    getattr(core, "scheduler", None) if core is not None else None
+                )
+                if scheduler is not None:
+                    scheduler._decode_fairness = enabled
+                    scheduler._decode_time_owed_s = 0.0
+                    if hasattr(scheduler, "config"):
+                        scheduler.config.decode_fairness = enabled
+        runtime_applied.append("decode_fairness")
+        logger.info(
+            f"Decode fairness {'enabled' if enabled else 'disabled'}"
+        )
+
     if request.hot_cache_max_size is not None:
         try:
             _parse_hot_cache_max_size(request.hot_cache_max_size)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.initial_cache_blocks is not None and request.initial_cache_blocks <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="initial_cache_blocks must be positive",
+        )
 
+    # GDN sidecar persistence requires the SSD tier. Validate the effective
+    # values before mutating the live settings object so an invalid admin
+    # update cannot leave an unsaved split/hot-only combination in memory.
+    requested_storage = request.gdn_snapshot_storage
+    if requested_storage is not None:
+        requested_storage = requested_storage.strip().lower()
+        if requested_storage not in {"auto", "ssd", "ssd_sidecar", "hot", "embedded"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "gdn_snapshot_storage must be one of: "
+                    "auto, ssd_sidecar, embedded"
+                ),
+            )
+    if requested_storage is not None and request.gdn_ssd_split_enabled is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "gdn_snapshot_storage cannot be combined with the legacy "
+                "gdn_ssd_split_enabled field"
+            ),
+        )
+
+    current_gdn_raw = getattr(
+        global_settings.cache, "gdn_ssd_split_enabled", False
+    )
+    current_hot_only = getattr(global_settings.cache, "hot_cache_only", False)
+    effective_hot_only = (
+        request.hot_cache_only
+        if request.hot_cache_only is not None
+        else current_hot_only is True
+    )
+    current_cache_enabled = getattr(global_settings.cache, "enabled", True)
+    effective_cache_enabled = (
+        request.cache_enabled
+        if request.cache_enabled is not None
+        else current_cache_enabled is not False
+    )
+    if requested_storage == "auto":
+        effective_gdn_split = effective_cache_enabled and not effective_hot_only
+    elif requested_storage in {"ssd", "ssd_sidecar"}:
+        effective_gdn_split = True
+    elif requested_storage in {"hot", "embedded"}:
+        effective_gdn_split = False
+    elif request.gdn_ssd_split_enabled is not None:
+        effective_gdn_split = request.gdn_ssd_split_enabled
+    elif current_gdn_raw is None:
+        effective_gdn_split = effective_cache_enabled and not effective_hot_only
+    else:
+        effective_gdn_split = current_gdn_raw is True
+    if effective_gdn_split and effective_hot_only:
+        raise HTTPException(
+            status_code=400,
+            detail="gdn_ssd_split_enabled cannot be used with hot_cache_only",
+        )
+    if request.gdn_ssd_pending_max_size is not None:
+        from ..config import parse_size
+
+        try:
+            pending_size = parse_size(request.gdn_ssd_pending_max_size)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid gdn_ssd_pending_max_size: {exc}",
+            ) from exc
+        if pending_size <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="gdn_ssd_pending_max_size must be positive",
+            )
+    if (
+        request.gdn_sidecar_state_dtype is not None
+        and request.gdn_sidecar_state_dtype.lower()
+        not in {"fp32", "bf16", "int8", "rht_int8", "rht_int16"}
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "gdn_sidecar_state_dtype must be one of: "
+                "fp32, bf16, int8, rht_int8, rht_int16"
+            ),
+        )
     # Apply cache settings
     cache_changed = False
     if request.cache_enabled is not None:
@@ -3623,11 +3869,29 @@ async def update_global_settings(
         cache_changed = True
     if request.hot_cache_only is not None:
         global_settings.cache.hot_cache_only = request.hot_cache_only
+        cache_changed = True
+    if requested_storage is not None:
+        global_settings.cache.set_gdn_snapshot_storage(requested_storage)
+        cache_changed = True
+    elif request.gdn_ssd_split_enabled is not None:
+        global_settings.cache.gdn_ssd_split_enabled = request.gdn_ssd_split_enabled
+        cache_changed = True
+    if request.gdn_ssd_pending_max_size is not None:
+        global_settings.cache.gdn_ssd_pending_max_size = (
+            request.gdn_ssd_pending_max_size
+        )
+        cache_changed = True
+    if request.gdn_sidecar_state_dtype is not None:
+        global_settings.cache.gdn_sidecar_state_dtype = (
+            request.gdn_sidecar_state_dtype.lower()
+        )
+        cache_changed = True
     if request.hot_cache_max_size is not None:
         global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
         cache_changed = True
     if request.initial_cache_blocks is not None:
         global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
+        cache_changed = True
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
@@ -3643,11 +3907,15 @@ async def update_global_settings(
         else:
             logger.warning(f"Failed to apply cache settings runtime: {msg}")
 
-    # Apply MCP settings (restart required)
+    # MCP config path changes require restart; exposure changes are live.
     if request.mcp_config is not None:
         global_settings.mcp.config_path = (
             request.mcp_config if request.mcp_config else None
         )
+    # MCP expose toggle is applied at runtime (no restart needed)
+    if request.mcp_expose_tools is not None:
+        global_settings.mcp.expose_tools = request.mcp_expose_tools
+        runtime_applied.append("mcp_expose_tools")
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
@@ -3881,6 +4149,90 @@ async def update_global_settings(
             )
         global_settings.integrations.markitdown_pdf_processing_engine = engine
         integrations_changed = True
+    if "web_search_provider" in request.model_fields_set:
+        provider = (request.web_search_provider or "").strip().lower()
+        if provider not in SUPPORTED_WEB_SEARCH_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "web_search_provider must be one of: "
+                    + ", ".join(SUPPORTED_WEB_SEARCH_PROVIDERS)
+                ),
+            )
+        global_settings.integrations.web_search_provider = provider
+        integrations_changed = True
+    if "web_search_brave_api_key" in request.model_fields_set:
+        global_settings.integrations.web_search_brave_api_key = (
+            request.web_search_brave_api_key or ""
+        ).strip()
+        integrations_changed = True
+    if "web_search_searxng_url" in request.model_fields_set:
+        searxng_url = (request.web_search_searxng_url or "").strip().rstrip("/")
+        if searxng_url and not searxng_url.startswith(("http://", "https://")):
+            raise HTTPException(
+                status_code=400,
+                detail="web_search_searxng_url must start with http:// or https://",
+            )
+        global_settings.integrations.web_search_searxng_url = searxng_url
+        integrations_changed = True
+    if "web_search_ddgs_backends" in request.model_fields_set:
+        raw_backends = request.web_search_ddgs_backends or ""
+        requested = [
+            b.strip().lower() for b in raw_backends.split(",") if b.strip()
+        ]
+        unknown = [b for b in requested if b not in DDGS_TEXT_BACKENDS]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "web_search_ddgs_backends contains unknown engines: "
+                    + ", ".join(unknown)
+                ),
+            )
+        global_settings.integrations.web_search_ddgs_backends = ",".join(
+            dict.fromkeys(requested)
+        )
+        integrations_changed = True
+    if "web_search_max_results" in request.model_fields_set:
+        if (
+            request.web_search_max_results is None
+            or not 1 <= request.web_search_max_results <= 10
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="web_search_max_results must be between 1 and 10",
+            )
+        global_settings.integrations.web_search_max_results = (
+            request.web_search_max_results
+        )
+        integrations_changed = True
+    if "web_search_content_mode" in request.model_fields_set:
+        content_mode = (request.web_search_content_mode or "").strip().lower()
+        if content_mode not in ("snippet", "full"):
+            raise HTTPException(
+                status_code=400,
+                detail="web_search_content_mode must be snippet or full",
+            )
+        global_settings.integrations.web_search_content_mode = content_mode
+        integrations_changed = True
+    if "web_search_content_truncate" in request.model_fields_set:
+        global_settings.integrations.web_search_content_truncate = bool(
+            request.web_search_content_truncate
+        )
+        integrations_changed = True
+    if "web_search_content_max_chars" in request.model_fields_set:
+        if (
+            request.web_search_content_max_chars is None
+            or request.web_search_content_max_chars <= 0
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="web_search_content_max_chars must be > 0",
+            )
+        global_settings.integrations.web_search_content_max_chars = (
+            request.web_search_content_max_chars
+        )
+        integrations_changed = True
 
     if integrations_changed:
         runtime_applied.append("integrations")
@@ -3894,7 +4246,8 @@ async def update_global_settings(
             f"pi={global_settings.integrations.pi_model}, "
             f"markitdown_enabled={global_settings.integrations.markitdown_enabled}, "
             f"markitdown_expose_model={global_settings.integrations.markitdown_expose_model}, "
-            f"markitdown_pdf_processing_engine={global_settings.integrations.markitdown_pdf_processing_engine}"
+            f"markitdown_pdf_processing_engine={global_settings.integrations.markitdown_pdf_processing_engine}, "
+            f"web_search_provider={global_settings.integrations.web_search_provider}"
         )
 
     # Apply UI settings
@@ -3974,6 +4327,37 @@ async def update_global_settings(
         "message": message,
         "runtime_applied": runtime_applied,
     }
+
+
+class WebSearchTestRequest(BaseModel):
+    """Pending settings-form values to validate with one real search."""
+
+    provider: str = "ddgs"
+    brave_api_key: str = ""
+    searxng_url: str = ""
+    ddgs_backends: str = ""
+    max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1, le=10)
+
+
+@router.post("/api/web-search/test")
+async def test_web_search(
+    request: WebSearchTestRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """
+    Run one real search with the pending (unsaved) web search settings.
+
+    Nothing is persisted here; saving stays with POST /api/global-settings.
+    Always answers HTTP 200 with an {"ok": bool, ...} payload so the UI
+    can show the provider's error message verbatim.
+    """
+    return await run_web_search_test(
+        request.provider,
+        brave_api_key=request.brave_api_key,
+        searxng_url=request.searxng_url,
+        ddgs_backends=request.ddgs_backends,
+        max_results=request.max_results,
+    )
 
 
 # =============================================================================
@@ -4386,6 +4770,59 @@ def _build_runtime_cache_observability(
             and partial_block_skips > 0
         )
 
+        gdn_staging = runtime_stats.get("gdn_staging")
+        if not isinstance(gdn_staging, dict):
+            gdn_staging = {}
+        gdn_last_restore = prefix_stats.get("gdn_last_restore")
+        if not isinstance(gdn_last_restore, dict):
+            gdn_last_restore = None
+
+        # Keep the cache fields at the model-row level so the dashboard and
+        # external admin clients can inspect them without knowing scheduler's
+        # internal nested stats shape.  These are all existing counters; this
+        # route only maps them and does not alter their accounting.
+        gdn_staging_payload = {
+            "pending_bytes": int(gdn_staging.get("pending_bytes", 0) or 0),
+            "pending_peak_bytes": int(
+                gdn_staging.get("pending_peak_bytes", 0) or 0
+            ),
+            "backpressure_ms": float(gdn_staging.get("backpressure_ms", 0) or 0),
+            "state_dtype": str(
+                gdn_staging.get("state_dtype", "fp32") or "fp32"
+            ),
+            "state_dequantizations": int(
+                gdn_staging.get("state_dequantizations", 0) or 0
+            ),
+            "encode_failures": int(gdn_staging.get("encode_failures", 0) or 0),
+            "decode_failures": int(gdn_staging.get("decode_failures", 0) or 0),
+            "capability_fallbacks": int(
+                gdn_staging.get("capability_fallbacks", 0) or 0
+            ),
+            "legacy_fp32_fallbacks": int(
+                gdn_staging.get("legacy_fp32_fallbacks", 0) or 0
+            ),
+            "sidecar_count": int(gdn_staging.get("sidecar_count", 0) or 0),
+            "sidecar_size_bytes": int(
+                gdn_staging.get("sidecar_size_bytes", 0) or 0
+            ),
+        }
+        ssd_counter_fields = (
+            "hits",
+            "misses",
+            "evictions",
+            "saves",
+            "saves_persisted",
+            "loads",
+            "errors",
+            "ssd_write_drops",
+            "ssd_inline_write_fallbacks",
+            "evict_unlink_failures",
+            "hot_cache_hits",
+            "hot_cache_evictions",
+            "hot_cache_promotions",
+            "hot_cache_promotion_failures",
+        )
+
         model_payload = {
             "id": model_id,
             "block_size": block_size,
@@ -4404,7 +4841,19 @@ def _build_runtime_cache_observability(
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
+            "gdn_checkpoint_loads": int(
+                prefix_stats.get("gdn_checkpoint_loads", 0) or 0
+            ),
+            "gdn_checkpoint_walkbacks": int(
+                prefix_stats.get("gdn_checkpoint_walkbacks", 0) or 0
+            ),
+            "gdn_last_restore": gdn_last_restore,
+            "gdn_staging": gdn_staging_payload,
         }
+
+        for field in ssd_counter_fields:
+            if field in ssd_stats:
+                model_payload[field] = int(ssd_stats.get(field, 0) or 0)
 
         cache_rates = runtime_stats.get("cache_rates")
         if cache_rates:

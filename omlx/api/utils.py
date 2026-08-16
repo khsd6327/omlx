@@ -18,6 +18,9 @@ _NATIVE_REASONING_MODEL_TYPES = {
     # <|content_thinking|> blocks.
     "inkling",
     "inkling_mm_model",
+    # Muse Glimmer's chat template renders history reasoning_content into
+    # <|start|>assistant to=self<|message|> blocks.
+    "muse_glimmer",
 }
 
 
@@ -39,6 +42,17 @@ def uses_native_reasoning_content(
 
     lowered = (model_name or "").lower()
     return "minimax" in lowered and "m3" in lowered
+
+
+def merge_reasoning_effort_chat_template_kwargs(
+    chat_template_kwargs: dict[str, Any] | None,
+    reasoning_effort: Any | None,
+) -> dict[str, Any] | None:
+    """Forward an API reasoning effort without overriding explicit template kwargs."""
+    merged = dict(chat_template_kwargs or {})
+    if reasoning_effort is not None:
+        merged.setdefault("reasoning_effort", reasoning_effort)
+    return merged or None
 
 
 # =============================================================================
