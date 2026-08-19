@@ -40,6 +40,11 @@ enum BenchmarkContextProfile: String, Codable, CaseIterable, Sendable {
     case novelJapanese = "novel_ja"
 }
 
+enum BenchmarkWarmupMode: String, Codable, CaseIterable, Sendable {
+    case quick
+    case ane2048 = "ane_2048"
+}
+
 /// Body for `POST /admin/api/bench/start`. `prompt_lengths` and
 /// `batch_sizes` are server-validated against a known whitelist
 /// (1024…200000 / 2…8). `generation_length` is free-form int.
@@ -51,6 +56,7 @@ enum BenchmarkContextProfile: String, Codable, CaseIterable, Sendable {
 struct BenchStartRequest: Encodable, Sendable {
     let modelId: String
     let contextProfile: BenchmarkContextProfile
+    let warmupMode: BenchmarkWarmupMode
     let promptLengths: [Int]
     let generationLength: Int
     let batchSizes: [Int]
@@ -210,6 +216,63 @@ struct BenchUploadResultDTO: Codable, Equatable, Sendable, Identifiable {
 struct BenchCancelResponse: Codable, Sendable {
     let status: String
     let benchId: String?
+}
+
+// =============================================================================
+// MARK: - Qwen ANE/GPU split tuner
+// =============================================================================
+
+struct ANETuningStartRequest: Encodable, Sendable {
+    let modelId: String
+    let sequenceLength: Int
+    let repeats: Int
+}
+
+struct ANETuningStartResponse: Codable, Sendable {
+    let tuningId: String
+    let status: String
+    let total: Int
+}
+
+struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
+    let label: String
+    let enabled: Bool
+    let mlpFraction: Double?
+    let gdnEnabled: Bool
+    let gdnFraction: Double?
+    let processingTps: Double
+    let samples: [Double]
+    let speedupPercent: Double?
+
+    var id: String { label }
+}
+
+struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
+    let enabled: Bool
+    let mlpFraction: Double?
+    let gdnEnabled: Bool
+    let gdnFraction: Double?
+    let processingTps: Double
+    let speedupPercent: Double
+    let sequenceLength: Int
+}
+
+struct ANETuningStatusResponse: Codable, Sendable {
+    let tuningId: String
+    let modelId: String
+    let status: String
+    let phase: String
+    let message: String
+    let current: Int
+    let total: Int
+    let results: [ANETuningCandidateDTO]
+    let recommendation: ANETuningRecommendationDTO?
+    let error: String?
+}
+
+struct ANETuningCancelResponse: Codable, Sendable {
+    let status: String
+    let tuningId: String
 }
 
 // =============================================================================
