@@ -625,7 +625,16 @@ def _mock_global_settings(api_key=None):
 
 def _loopback_http_request():
     """Create the request state accepted by the loopback-only setup endpoint."""
-    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
+    from starlette.requests import Request
+
+    return Request({
+        "type": "http",
+        "scheme": "http",
+        "path": "/admin/api/setup-api-key",
+        "headers": [],
+        "server": ("127.0.0.1", 8000),
+        "client": ("127.0.0.1", 12345),
+    })
 
 
 def _patch_getter(mock_settings):
