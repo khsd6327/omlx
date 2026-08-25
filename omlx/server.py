@@ -346,8 +346,12 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import fingerprint_key, verify_any_api_key
     from .utils.network import is_loopback_bind
+    from .admin.auth import (
+        fingerprint_key,
+        verify_any_api_key,
+        verify_same_origin_session,
+    )
 
     global_settings = _server_state.global_settings
     configured_host = getattr(
@@ -371,6 +375,9 @@ async def verify_api_key(
         and global_settings.auth.skip_api_key_verification
         and loopback_only
     ):
+        return True
+
+    if verify_same_origin_session(request):
         return True
 
     # Extract API key from Bearer token or x-api-key header
@@ -778,6 +785,8 @@ except ImportError:
 from .admin.auth import _RedirectToLogin, require_admin, set_web_ui_enabled
 from .admin.routes import (
     configured_api_key,
+    request_auth_source,
+    trusted_network_login,
     configured_ui_language,
     is_admin_request,
     set_admin_getters,
@@ -814,6 +823,8 @@ else:
             is_admin=is_admin_request,
             ui_language=configured_ui_language,
             main_api_key=configured_api_key,
+            trusted_login=trusted_network_login,
+            auth_source=request_auth_source,
         )
     )
     # Before admin_router so the page routes keep their original order.

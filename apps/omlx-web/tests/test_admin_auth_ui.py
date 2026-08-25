@@ -4,6 +4,8 @@
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from omlx_web import routes as webui
 
 import omlx.server  # noqa: F401 - wires the web UI host
@@ -61,16 +63,16 @@ class TestDashboardPage:
             mock_templates.TemplateResponse.return_value = MagicMock()
             asyncio.run(webui.dashboard_page(request=mock_request, is_admin=True))
             mock_templates.TemplateResponse.assert_called_once_with(
-                mock_request, "dashboard.html", {}
+                mock_request, "dashboard.html", {"auth_source": "api_key"}
             )
 
 
 class TestChatPageApiKeyInjection:
-    """Tests for GET /admin/chat API key template injection."""
+    """The chat page uses the session cookie; no API key reaches the template."""
 
-    def test_chat_page_passes_api_key_in_context(self):
-        """Chat page should include API key in template context."""
-        mock_settings = _mock_global_settings(api_key="test-chat-key")
+    @pytest.mark.parametrize("api_key", ["test-chat-key", None])
+    def test_chat_page_context_has_no_api_key(self, api_key):
+        mock_settings = _mock_global_settings(api_key=api_key)
         original = _patch_getter(mock_settings)
         try:
             mock_request = MagicMock()
@@ -78,42 +80,10 @@ class TestChatPageApiKeyInjection:
                 mock_templates.TemplateResponse.return_value = MagicMock()
                 asyncio.run(webui.chat_page(request=mock_request, is_admin=True))
                 mock_templates.TemplateResponse.assert_called_once_with(
-                    mock_request,
-                    "chat.html",
-                    {"api_key": "test-chat-key"},
+                    mock_request, "chat.html", {}
                 )
         finally:
             _restore_getter(original)
-
-    def test_chat_page_passes_empty_when_no_key(self):
-        """Chat page should pass empty string when no API key is configured."""
-        mock_settings = _mock_global_settings(api_key=None)
-        original = _patch_getter(mock_settings)
-        try:
-            mock_request = MagicMock()
-            with patch.object(webui, "templates") as mock_templates:
-                mock_templates.TemplateResponse.return_value = MagicMock()
-                asyncio.run(webui.chat_page(request=mock_request, is_admin=True))
-                call_args = mock_templates.TemplateResponse.call_args
-                context = call_args[0][2]
-                assert context["api_key"] == ""
-        finally:
-            _restore_getter(original)
-
-    def test_chat_page_passes_empty_when_no_settings(self):
-        """Chat page should pass empty string when global settings is None."""
-        original = admin_routes._get_global_settings
-        admin_routes._get_global_settings = lambda: None
-        try:
-            mock_request = MagicMock()
-            with patch.object(webui, "templates") as mock_templates:
-                mock_templates.TemplateResponse.return_value = MagicMock()
-                asyncio.run(webui.chat_page(request=mock_request, is_admin=True))
-                call_args = mock_templates.TemplateResponse.call_args
-                context = call_args[0][2]
-                assert context["api_key"] == ""
-        finally:
-            admin_routes._get_global_settings = original
 
 
 class TestLoginPageSkipAuth:
