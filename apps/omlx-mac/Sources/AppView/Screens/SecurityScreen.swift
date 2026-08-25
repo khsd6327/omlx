@@ -202,6 +202,23 @@ private struct AuthenticationSection: View {
 
         ListGroup {
             Row(
+                label: String(localized: "security.auth.web_admin_mode",
+                              defaultValue: "Web Admin Authentication",
+                              comment: "Row label for web admin authentication mode"),
+                sublabel: String(localized: "security.auth.web_admin_mode.sub",
+                                 defaultValue: "Trusted networks can use the web UI without an API key.",
+                                 comment: "Sublabel for web admin authentication mode")
+            ) {
+                Picker("", selection: vm.bind($vm.webAdminAuthMode, save: {
+                    Task { await vm.saveWebAdminAuthMode(client: client) }
+                })) {
+                    Text("API Key").tag("api_key")
+                    Text("Trusted Networks").tag("trusted_networks")
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+            }
+            Row(
                 label: String(localized: "security.auth.disable_verify",
                               defaultValue: "Disable API Key Verification",
                               comment: "Row label for the toggle that disables API key verification"),

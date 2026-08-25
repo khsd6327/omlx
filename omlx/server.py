@@ -322,7 +322,11 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import fingerprint_key, verify_any_api_key
+    from .admin.auth import (
+        fingerprint_key,
+        verify_any_api_key,
+        verify_same_origin_session,
+    )
 
     # No auth required if no API key is configured
     if _server_state.api_key is None:
@@ -333,6 +337,9 @@ async def verify_api_key(
         _server_state.global_settings is not None
         and _server_state.global_settings.auth.skip_api_key_verification
     ):
+        return True
+
+    if verify_same_origin_session(request):
         return True
 
     # Extract API key from Bearer token or x-api-key header
