@@ -108,6 +108,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let apiKey: String?
         let skipApiKeyVerification: Bool?
         let allowUnauthenticatedInference: Bool?
+        let webAdminAuthMode: String?
         let subKeys: [SubKeyDTO]?
     }
 
@@ -316,6 +317,7 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil
     var allowUnauthenticatedInference: Bool? = nil
+    var webAdminAuthMode: String? = nil
     /// Update the configured API key. Server applies and persists via
     /// /admin/api/global-settings (`api_key` field). Only valid when an
     /// admin session is already authenticated — first-time setup still

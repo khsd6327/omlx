@@ -620,8 +620,7 @@ async def create_transcription(
 def _verify_ws_api_key(websocket: WebSocket, api_key: Optional[str]) -> bool:
     """Verify an in-band API key, including the manual inference opt-in.
 
-    WebSocket connections from browsers cannot carry an Authorization
-    header, so the key arrives inside the {"type": "start"} message.
+    Non-browser clients send the key inside the {"type": "start"} message.
     """
     from omlx.server import _server_state, allows_unauthenticated_inference
 
@@ -649,13 +648,18 @@ async def realtime_transcription(websocket: WebSocket) -> None:
     """Push-based realtime transcription over WebSocket.
 
     Protocol:
-      client → {"type": "start", "model": ..., "api_key": ..., "language"?: ...}
+      browser → {"type": "start", "model": ..., "language"?: ...}
+      non-browser → the same object with "api_key"
       server → {"type": "ready"} or {"type": "error", "detail": ...}
       client → binary frames: 16 kHz mono little-endian Int16 PCM
       server → {"type": "transcript.delta", "delta": ...} as text commits
       client → {"type": "stop"} (or closes the socket to abandon)
       server → remaining deltas, then {"type": "transcript.done", "text": ...}
     """
+    from omlx.admin.auth import verify_websocket_session
+
+    browser_session = verify_websocket_session(websocket)
+    browser_origin = websocket.headers.get("origin")
     await websocket.accept()
 
     async def _reject(detail: str, close_code: int = 1008) -> None:
@@ -677,11 +681,16 @@ async def realtime_transcription(websocket: WebSocket) -> None:
     if not isinstance(start, dict) or start.get("type") != "start":
         await _reject("First message must be a {'type': 'start'} object")
         return
-    try:
-        key_ok = _verify_ws_api_key(websocket, start.get("api_key"))
-    except HTTPException as exc:
-        await _reject(str(exc.detail))
+    if browser_origin is not None and not browser_session:
+        await _reject("Invalid WebSocket origin or session")
         return
+    key_ok = browser_session
+    if not key_ok:
+        try:
+            key_ok = _verify_ws_api_key(websocket, start.get("api_key"))
+        except HTTPException as exc:
+            await _reject(str(exc.detail))
+            return
     if not key_ok:
         await _reject("Invalid API key")
         return

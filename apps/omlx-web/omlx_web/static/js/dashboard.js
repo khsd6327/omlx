@@ -171,7 +171,7 @@
                 usage: { usage_history: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
-                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, allow_unauthenticated_inference: false, sub_keys: [] },
+                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, allow_unauthenticated_inference: false, web_admin_auth_mode: 'api_key', sub_keys: [] },
                 claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null, desktop_enabled: false },
                 integrations: {
                     copilot_model: null,
@@ -1473,6 +1473,7 @@
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
                             allow_unauthenticated_inference: this.globalSettings.auth.allow_unauthenticated_inference,
+                            web_admin_auth_mode: this.globalSettings.auth.web_admin_auth_mode,
                             idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
                         }),
                     });

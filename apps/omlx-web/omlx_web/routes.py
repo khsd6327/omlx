@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 
@@ -25,6 +25,10 @@ class WebUIHost:
     is_admin: Callable[[Request], bool]
     ui_language: Callable[[], str]
     main_api_key: Callable[[], str | None]
+    # Returns a login response for trusted-network peers, else None.
+    trusted_login: Callable[[Request], Response | None] = lambda request: None
+    # Returns how the current browser session authenticated.
+    auth_source: Callable[[Request], str] = lambda request: "api_key"
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -120,6 +124,10 @@ async def login_page(request: Request):
     if _host.is_admin(request):
         return RedirectResponse(url="/admin/dashboard", status_code=302)
 
+    trusted_response = _host.trusted_login(request)
+    if trusted_response is not None:
+        return trusted_response
+
     _sync_locale()
     return templates.TemplateResponse(
         request,
@@ -139,7 +147,9 @@ async def dashboard_page(request: Request, is_admin: bool = Depends(require_admi
         HTML dashboard page with server status and model list.
     """
     _sync_locale()
-    return templates.TemplateResponse(request, "dashboard.html", {})
+    return templates.TemplateResponse(
+        request, "dashboard.html", {"auth_source": _host.auth_source(request)}
+    )
 
 
 @router.get("/chat", response_class=HTMLResponse)
@@ -147,17 +157,14 @@ async def chat_page(request: Request, is_admin: bool = Depends(require_admin)):
     """
     Render the chat page for interacting with models.
 
-    Requires admin authentication via session cookie.
-    The API key is injected into the template context so that
-    the chat page can auto-set it in localStorage, bypassing
-    the manual API key entry modal.
+    Requires admin authentication via session cookie. The page calls the
+    API with that same-origin session, so no API key reaches the browser.
 
     Returns:
         HTML chat page.
     """
     _sync_locale()
-    api_key = _host.main_api_key()
-    return templates.TemplateResponse(request, "chat.html", {"api_key": api_key or ""})
+    return templates.TemplateResponse(request, "chat.html", {})
 
 
 @router.get("/static/{path:path}")

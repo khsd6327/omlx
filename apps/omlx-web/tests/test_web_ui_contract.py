@@ -114,12 +114,12 @@ class TestProtectedPages:
         assert __version__ in resp.text
         assert "/admin/static/js/dashboard.js?v=" in resp.text
 
-    def test_chat_injects_main_key(self, web):
+    def test_chat_never_injects_main_key(self, web):
         client, _ = web
         _login(client)
         resp = client.get("/admin/chat", headers=HTML)
         assert resp.status_code == 200
-        assert f'const serverApiKey = "{MAIN_KEY}";' in resp.text
+        assert MAIN_KEY not in resp.text
 
     def test_language_change_applies_to_next_render(self, web):
         client, _ = web
@@ -166,7 +166,7 @@ class TestSessionFlows:
         cookie = _login(client).headers["set-cookie"]
         assert "omlx_admin_session=" in cookie
         assert "HttpOnly" in cookie
-        assert "SameSite=lax" in cookie
+        assert "SameSite=strict" in cookie
         assert "Max-Age=86400" in cookie
 
     def test_remember_login_extends_cookie(self, web):
@@ -174,15 +174,15 @@ class TestSessionFlows:
         cookie = _login(client, remember=True).headers["set-cookie"]
         assert "Max-Age=2592000" in cookie
 
-    def test_auto_login_with_main_key(self, web):
+    def test_auto_login_ignores_main_key(self, web):
+        # Fork: auto-login trusts only the TCP peer network, never a URL key.
         client, _ = web
         resp = client.get(
             "/admin/auto-login",
             params={"key": MAIN_KEY, "redirect": "/admin/chat"},
         )
         assert resp.status_code == 302
-        assert resp.headers["location"] == "/admin/chat"
-        assert "omlx_admin_session=" in resp.headers["set-cookie"]
+        assert resp.headers["location"] == "/admin"
 
     @pytest.mark.parametrize("key", [SUB_KEY, "wrong-key", ""])
     def test_auto_login_rejects_other_keys(self, web, key):

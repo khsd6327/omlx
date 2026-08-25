@@ -107,11 +107,12 @@ from . import model_recommender
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
-    KeyLockout,
     check_api_key,
     compare_keys,
     create_session_token,
+    is_trusted_web_client,
     require_admin,
+    session_auth_source,
     validate_api_key,
     verify_any_api_key,
     verify_api_key,
@@ -794,6 +795,7 @@ class GlobalSettingsRequest(BaseModel):
     api_key: str | None = None
     skip_api_key_verification: bool | None = None
     allow_unauthenticated_inference: bool | None = None
+    web_admin_auth_mode: Literal["api_key", "trusted_networks"] | None = None
 
     @field_validator("idle_timeout_seconds", mode="before")
     @classmethod
@@ -1705,6 +1707,29 @@ def is_admin_request(request: Request) -> bool:
     )
 
 
+def trusted_network_login(request: Request) -> Response | None:
+    """Log a trusted-network browser in with a trusted_network session.
+
+    Returns a redirect to the dashboard that sets the session cookie, or None
+    when the peer is not on a trusted network (or sits behind a proxy).
+    """
+    if not is_trusted_web_client(request):
+        return None
+    response = RedirectResponse(url="/admin/dashboard", status_code=302)
+    _set_session_cookie(
+        response,
+        request,
+        create_session_token(auth_source="trusted_network"),
+        SESSION_MAX_AGE,
+    )
+    return response
+
+
+def request_auth_source(request: Request) -> str:
+    """Return how the browser session was authenticated."""
+    return session_auth_source(request) or "api_key"
+
+
 def configured_api_key() -> str | None:
     """Return the main API key, or None when none is configured."""
     global_settings = _get_global_settings()
@@ -1868,8 +1893,24 @@ def get_system_memory_info() -> dict:
 # =============================================================================
 
 
+def _set_session_cookie(
+    response: Response, request: Request | None, token: str, max_age: int
+) -> None:
+    response.set_cookie(
+        key="omlx_admin_session",
+        value=token,
+        httponly=True,
+        secure=bool(request is not None and request.url.scheme == "https"),
+        samesite="strict",
+        path="/",
+        max_age=max_age,
+    )
+
+
 @router.post("/api/login")
-async def login(request: LoginRequest, response: Response, http_request: Request):
+async def login(
+    payload: LoginRequest, response: Response, request: Request = None
+):
     """
     Authenticate with API key and create session.
 
@@ -1877,9 +1918,9 @@ async def login(request: LoginRequest, response: Response, http_request: Request
     is configured, returns 400 directing the user to set one up first.
 
     Args:
-        request: LoginRequest containing the API key.
+        payload: LoginRequest containing the API key.
         response: FastAPI response object for setting cookies.
-        http_request: Incoming request, used for the client's key budget.
+        request: Incoming request, used for the client's key budget.
 
     Returns:
         JSON response with success status.
@@ -1900,7 +1941,7 @@ async def login(request: LoginRequest, response: Response, http_request: Request
 
     # Main key only — sub keys must not grant admin login
     if not check_api_key(
-        http_request, lambda: verify_api_key(request.api_key, server_api_key)
+        request, lambda: verify_api_key(payload.api_key, server_api_key)
     ):
         raise HTTPException(
             status_code=401,
@@ -1908,14 +1949,13 @@ async def login(request: LoginRequest, response: Response, http_request: Request
         )
 
     # Create session token and set cookie
-    token = create_session_token(remember=request.remember)
-    cookie_max_age = REMEMBER_ME_MAX_AGE if request.remember else SESSION_MAX_AGE
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=cookie_max_age,
+    token = create_session_token(remember=payload.remember, auth_source="api_key")
+    cookie_max_age = REMEMBER_ME_MAX_AGE if payload.remember else SESSION_MAX_AGE
+    _set_session_cookie(
+        response,
+        request,
+        token,
+        cookie_max_age,
     )
 
     return {"success": True}
@@ -1993,14 +2033,8 @@ async def setup_api_key(
     logger.info("API key configured via initial setup")
 
     # Create session token and set cookie (auto-login after setup)
-    token = create_session_token()
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400,  # 24 hours
-    )
+    token = create_session_token(auth_source="api_key")
+    _set_session_cookie(response, http_request, token, SESSION_MAX_AGE)
 
     return {"success": True, "message": "API key configured successfully"}
 
@@ -2021,18 +2055,14 @@ async def logout(response: Response):
 
 
 @router.get("/auto-login")
-async def auto_login(
-    http_request: Request, key: str = "", redirect: str = "/admin/dashboard"
-):
+async def auto_login(request: Request, redirect: str = "/admin/dashboard"):
     """
-    Auto-login using API key and redirect to the target admin page.
+    Auto-login from a directly connected trusted network peer.
 
     Used by the macOS menubar app to open admin pages with automatic
     authentication, bypassing the manual login form.
 
     Args:
-        http_request: Incoming request, used for the client's key budget.
-        key: The API key for authentication.
         redirect: The path to redirect to after login. Must start with /admin.
 
     Returns:
@@ -2043,30 +2073,12 @@ async def auto_login(
     if not redirect.startswith("/admin"):
         raise HTTPException(status_code=400, detail="Invalid redirect path")
 
-    global_settings = _get_global_settings()
-    server_api_key = global_settings.auth.api_key if global_settings else None
-
-    # Main key only — sub keys must not grant admin login
-    try:
-        key_ok = (
-            bool(key)
-            and bool(server_api_key)
-            and check_api_key(http_request, lambda: verify_api_key(key, server_api_key))
-        )
-    except KeyLockout:
-        key_ok = False
-    if not key_ok:
+    if not is_trusted_web_client(request):
         return RedirectResponse(url="/admin", status_code=302)
 
-    token = create_session_token()
+    token = create_session_token(auth_source="trusted_network")
     response = RedirectResponse(url=redirect, status_code=302)
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400,
-    )
+    _set_session_cookie(response, request, token, SESSION_MAX_AGE)
     return response
 
 
@@ -4700,6 +4712,7 @@ def _global_settings_response(global_settings):
             "allow_unauthenticated_inference": (
                 global_settings.auth.allow_unauthenticated_inference
             ),
+            "web_admin_auth_mode": global_settings.auth.web_admin_auth_mode,
             "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
         },
         "claude_code": {
@@ -5855,6 +5868,9 @@ async def update_global_settings(
             request.allow_unauthenticated_inference
         )
         runtime_applied.append("allow_unauthenticated_inference")
+    if request.web_admin_auth_mode is not None:
+        global_settings.auth.web_admin_auth_mode = request.web_admin_auth_mode
+        runtime_applied.append("web_admin_auth_mode")
 
     if pending_embedding_batch_size is not None:
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
