@@ -3,6 +3,7 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 from unittest.mock import MagicMock
 
 # Note: These tests need a mock server setup since the actual server requires models
@@ -13,6 +14,28 @@ def _mock_request(headers=None):
     req = MagicMock()
     req.headers = headers or {}
     return req
+
+
+def _browser_request(token, origin="http://omlx.local:8000", fetch_site="same-origin"):
+    headers = {
+        "host": "omlx.local:8000",
+        "cookie": f"omlx_admin_session={token}",
+        "origin": origin,
+        "sec-fetch-site": fetch_site,
+    }
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/models",
+            "scheme": "http",
+            "server": ("omlx.local", 8000),
+            "client": ("8.8.8.8", 12345),
+            "headers": [
+                (key.encode(), value.encode()) for key, value in headers.items()
+            ],
+        }
+    )
 
 
 class TestVerifyApiKey:
@@ -82,6 +105,43 @@ class TestVerifyApiKey:
             credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="correct-key")
             result = asyncio.run(verify_api_key(request=_mock_request(), credentials=credentials))
             assert result is True
+        finally:
+            _server_state.api_key = original_key
+
+    def test_same_origin_admin_session_is_accepted(self):
+        import asyncio
+
+        from omlx.admin.auth import create_session_token
+        from omlx.server import _server_state, verify_api_key
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+        try:
+            token = create_session_token(auth_source="api_key")
+            result = asyncio.run(
+                verify_api_key(request=_browser_request(token), credentials=None)
+            )
+            assert result is True
+        finally:
+            _server_state.api_key = original_key
+
+    def test_cross_origin_admin_session_is_rejected(self):
+        import asyncio
+
+        from fastapi import HTTPException
+        from omlx.admin.auth import create_session_token
+        from omlx.server import _server_state, verify_api_key
+
+        original_key = _server_state.api_key
+        _server_state.api_key = "correct-key"
+        try:
+            token = create_session_token(auth_source="api_key")
+            request = _browser_request(
+                token, origin="https://evil.example", fetch_site="cross-site"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(verify_api_key(request=request, credentials=None))
+            assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key
 

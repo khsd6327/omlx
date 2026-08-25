@@ -6,12 +6,13 @@ and API key verification for admin panel access.
 """
 
 import hashlib
+import ipaddress
 import os
 import secrets
-from typing import Optional
+from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
-from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 # Session configuration
@@ -30,6 +31,21 @@ _serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # Global settings getter (set by init_auth)
 _get_global_settings = None
+
+TRUSTED_WEB_NETWORKS = tuple(
+    ipaddress.ip_network(network)
+    for network in (
+        "127.0.0.0/8",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "fc00::/7",
+        "fe80::/10",
+    )
+)
+FORWARDED_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip")
 
 
 def init_auth(secret_key: str, global_settings_getter=None) -> None:
@@ -51,7 +67,9 @@ def init_auth(secret_key: str, global_settings_getter=None) -> None:
         _get_global_settings = global_settings_getter
 
 
-def create_session_token(remember: bool = False) -> str:
+def create_session_token(
+    remember: bool = False, auth_source: str = "api_key"
+) -> str:
     """Create a signed session token for admin authentication.
 
     Args:
@@ -66,8 +84,36 @@ def create_session_token(remember: bool = False) -> str:
         >>> verify_session_token(token)
         True
     """
-    payload = {"admin": True, "remember": remember}
+    if auth_source not in {"api_key", "trusted_network"}:
+        raise ValueError("Invalid admin session auth source")
+    payload = {
+        "admin": True,
+        "remember": remember,
+        "auth_source": auth_source,
+    }
     return _serializer.dumps(payload)
+
+
+def decode_session_token(
+    token: str, max_age: int = SESSION_MAX_AGE
+) -> dict[str, Any] | None:
+    """Decode a valid session token, treating legacy tokens as API-key sessions."""
+    try:
+        data = _serializer.loads(token, max_age=None)
+        if data.get("admin", False) is not True:
+            return None
+        effective_max_age = (
+            REMEMBER_ME_MAX_AGE if data.get("remember", False) else max_age
+        )
+        data = _serializer.loads(token, max_age=effective_max_age)
+        if data.get("admin", False) is not True:
+            return None
+        data.setdefault("auth_source", "api_key")
+        if data["auth_source"] not in {"api_key", "trusted_network"}:
+            return None
+        return data
+    except (BadSignature, SignatureExpired):
+        return None
 
 
 def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
@@ -92,22 +138,68 @@ def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
         >>> verify_session_token("invalid_token")
         False
     """
-    try:
-        # First load without max_age check to read the remember flag
-        data = _serializer.loads(token, max_age=None)
-        if data.get("admin", False) is not True:
-            return False
+    return decode_session_token(token, max_age=max_age) is not None
 
-        # Determine the appropriate max_age based on remember flag
-        effective_max_age = (
-            REMEMBER_ME_MAX_AGE if data.get("remember", False) else max_age
-        )
 
-        # Re-validate with the correct max_age
-        data = _serializer.loads(token, max_age=effective_max_age)
-        return data.get("admin", False) is True
-    except (BadSignature, SignatureExpired):
+def trusted_web_auth_enabled() -> bool:
+    if _get_global_settings is None:
         return False
+    settings = _get_global_settings()
+    return bool(
+        settings is not None
+        and settings.auth.web_admin_auth_mode == "trusted_networks"
+    )
+
+
+def is_trusted_web_client(connection: Any) -> bool:
+    """Check the actual TCP peer against the explicitly trusted networks."""
+    if not trusted_web_auth_enabled():
+        return False
+    if any(connection.headers.get(name) is not None for name in FORWARDED_HEADERS):
+        return False
+    client = getattr(connection, "client", None)
+    host = getattr(client, "host", None)
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    return any(address in network for network in TRUSTED_WEB_NETWORKS)
+
+
+def _origin_matches_connection(connection: Any) -> bool:
+    origin = connection.headers.get("origin")
+    if not origin:
+        return False
+    parsed = urlsplit(origin)
+    host = connection.headers.get("host")
+    if not parsed.scheme or not parsed.netloc or not host:
+        return False
+    connection_scheme = getattr(getattr(connection, "url", None), "scheme", "")
+    if connection_scheme == "ws":
+        connection_scheme = "http"
+    elif connection_scheme == "wss":
+        connection_scheme = "https"
+    return parsed.scheme == connection_scheme and parsed.netloc == host
+
+
+def verify_same_origin_session(request: Request) -> bool:
+    """Allow an admin cookie on browser API calls from the same origin only."""
+    if not verify_session(request):
+        return False
+    fetch_site = request.headers.get("sec-fetch-site")
+    if fetch_site is not None and fetch_site != "same-origin":
+        return False
+    origin = request.headers.get("origin")
+    if origin is not None and not _origin_matches_connection(request):
+        return False
+    return fetch_site == "same-origin" or origin is not None
+
+
+def verify_websocket_session(websocket: Any) -> bool:
+    """Validate a browser WebSocket using its admin cookie and Origin."""
+    return verify_session(websocket) and _origin_matches_connection(websocket)
 
 
 def compare_keys(provided_key: str, expected_key: str) -> bool:
@@ -249,9 +341,26 @@ def verify_session(request: Request) -> bool:
         True if the session is valid, False otherwise.
     """
     token = request.cookies.get(SESSION_COOKIE_NAME)
-    if not token:
+    if not isinstance(token, str) or not token:
         return False
-    return verify_session_token(token)
+    data = decode_session_token(token)
+    if data is None:
+        return False
+    if data["auth_source"] == "trusted_network":
+        return is_trusted_web_client(request)
+    return True
+
+
+def session_auth_source(request: Request) -> str | None:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not isinstance(token, str) or not token:
+        return None
+    data = decode_session_token(token)
+    if data is None:
+        return None
+    if data["auth_source"] == "trusted_network" and not is_trusted_web_client(request):
+        return None
+    return data["auth_source"]
 
 
 async def require_admin(request: Request) -> bool:
