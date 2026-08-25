@@ -238,6 +238,54 @@ WS_PATH = "/v1/audio/transcriptions/realtime"
 
 
 class TestRealtimeWebSocket:
+    def test_browser_session_does_not_send_api_key(self):
+        from omlx.admin.auth import SESSION_COOKIE_NAME, create_session_token
+
+        stub = _StubRealtimeSession(final=["done"])
+        engine = _make_realtime_engine(stub)
+        p1, p2, p3, client = _ws_client(engine)
+        client.cookies.set(
+            SESSION_COOKIE_NAME,
+            create_session_token(auth_source="api_key"),
+        )
+        with (
+            p1,
+            p2,
+            p3,
+            client,
+            client.websocket_connect(
+                WS_PATH, headers={"origin": "http://testserver"}
+            ) as ws,
+        ):
+            ws.send_json({"type": "start", "model": "whisper-tiny"})
+            assert ws.receive_json() == {"type": "ready"}
+            ws.send_json({"type": "stop"})
+            assert ws.receive_json()["type"] == "transcript.delta"
+            assert ws.receive_json()["type"] == "transcript.done"
+
+    def test_browser_session_with_cross_origin_is_rejected(self):
+        from omlx.admin.auth import SESSION_COOKIE_NAME, create_session_token
+
+        engine = _make_realtime_engine(_StubRealtimeSession())
+        p1, p2, p3, client = _ws_client(engine)
+        client.cookies.set(
+            SESSION_COOKIE_NAME,
+            create_session_token(auth_source="api_key"),
+        )
+        with (
+            p1,
+            p2,
+            p3,
+            client,
+            client.websocket_connect(
+                WS_PATH, headers={"origin": "https://evil.example"}
+            ) as ws,
+        ):
+            ws.send_json({"type": "start", "model": "whisper-tiny"})
+            message = ws.receive_json()
+            assert message["type"] == "error"
+            assert "origin" in message["detail"].lower()
+
     def test_happy_path_delta_stop_done(self):
         stub = _StubRealtimeSession(polls=[["hello "]], final=["world"])
         engine = _make_realtime_engine(stub)

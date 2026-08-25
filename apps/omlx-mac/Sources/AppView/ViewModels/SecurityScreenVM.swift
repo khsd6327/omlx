@@ -6,6 +6,7 @@ final class SecurityScreenVM {
     var apiKeySet: Bool = false
     var apiKey: String?
     var skipApiKeyVerification: Bool = false
+    var webAdminAuthMode: String = "api_key"
     var subKeys: [SubKeyDTO] = []
     var lastError: String?
 
@@ -29,6 +30,7 @@ final class SecurityScreenVM {
             self.apiKeySet = settings.auth?.apiKeySet ?? false
             self.apiKey = settings.auth?.apiKey
             self.skipApiKeyVerification = settings.auth?.skipApiKeyVerification ?? false
+            self.webAdminAuthMode = settings.auth?.webAdminAuthMode ?? "api_key"
             self.subKeys = settings.auth?.subKeys ?? []
             self.lastError = nil
         } catch {
@@ -80,6 +82,17 @@ final class SecurityScreenVM {
         do {
             _ = try await client.updateGlobalSettings(
                 GlobalSettingsPatch(skipApiKeyVerification: skipApiKeyVerification)
+            )
+            self.lastError = nil
+        } catch {
+            self.lastError = error.omlxDescription
+        }
+    }
+
+    func saveWebAdminAuthMode(client: OMLXClient) async {
+        do {
+            _ = try await client.updateGlobalSettings(
+                GlobalSettingsPatch(webAdminAuthMode: webAdminAuthMode)
             )
             self.lastError = nil
         } catch {
