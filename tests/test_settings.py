@@ -636,6 +636,7 @@ class TestAuthSettings:
         settings = AuthSettings()
         assert settings.api_key is None
         assert settings.secret_key is None
+        assert settings.web_admin_auth_mode == "api_key"
         assert settings.sub_keys == []
 
     def test_custom_values(self):
@@ -652,6 +653,7 @@ class TestAuthSettings:
             "api_key": "my-key",
             "secret_key": None,
             "skip_api_key_verification": False,
+            "web_admin_auth_mode": "api_key",
             "sub_keys": [],
         }
 
@@ -674,7 +676,14 @@ class TestAuthSettings:
         settings = AuthSettings.from_dict(data)
         assert settings.api_key == "loaded-key"
         assert settings.secret_key == "loaded-secret"
+        assert settings.web_admin_auth_mode == "api_key"
         assert settings.sub_keys == []
+
+    def test_from_dict_with_trusted_networks(self):
+        settings = AuthSettings.from_dict(
+            {"web_admin_auth_mode": "trusted_networks"}
+        )
+        assert settings.web_admin_auth_mode == "trusted_networks"
 
     def test_from_dict_with_sub_keys(self):
         """Test creation from dictionary with sub keys."""

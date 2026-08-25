@@ -775,10 +775,6 @@
     }
 
     /* API Key Modal */
-    .api-key-modal.hidden {
-        display: none;
-    }
-
     /* Drag and drop state */
     .input-container.drag-over {
         border-color: var(--text-tertiary) !important;
@@ -996,24 +992,6 @@
 </script>
 <div class="chat-shell flex overflow-hidden" x-data="chatApp()" x-init="init()"
     @keydown.window="handleGlobalKeydown($event)">
-    <!-- API Key Modal -->
-    <div class="api-key-modal fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
-        :class="{ 'hidden': apiKeySet }" x-cloak>
-        <div class="bg-surface rounded-2xl p-8 max-w-[400px] w-[90%] shadow-2xl">
-            <h2 class="text-xl font-bold mb-2">{{ t('login.login.label_api_key') }}</h2>
-            <p class="text-sm text-fg-tertiary mb-4">{{ t('chat.api_key_prompt') }}</p>
-            <input type="password" x-model="apiKeyInput" @keydown.enter="saveApiKey"
-                placeholder="{{ t('chat.api_key_placeholder') }}"
-                class="w-full px-4 py-3 border border-line rounded-xl mb-4 focus:outline-none focus:border-line-strong"
-                style="background: var(--bg-primary); color: var(--text-primary);">
-            <button @click="saveApiKey"
-                class="w-full bg-accent text-accent-fg px-6 py-3 rounded-xl font-medium transition-all hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
-                :disabled="!apiKeyInput.trim()">
-                {{ t('chat.api_key_continue') }}
-            </button>
-        </div>
-    </div>
-
     <!-- Sidebar Overlay (mobile) -->
     <div class="sidebar-overlay" :class="{ 'hidden': !sidebarOpen }" @click="sidebarOpen = false" x-cloak></div>
 
@@ -1816,27 +1794,27 @@
                     <div class="flex items-end">
                         <!-- Image upload button (only for VLM models) -->
                         <button x-show="hasVisionSupport()" @click="$refs.imageInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || imageLimitReached()"
+                            :disabled="!currentModel || isCurrentChatStreaming() || imageLimitReached()"
                             class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                         </button>
                         <button x-show="hasDocumentSupport() && !hasAsrSupport()" @click="$refs.documentInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || uploadDocuments.length >= markitdownSettings.max_files_per_request"
+                            :disabled="!currentModel || isCurrentChatStreaming() || uploadDocuments.length >= markitdownSettings.max_files_per_request"
                             class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_document')">
                             <i data-lucide="file-text" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                         </button>
                         <!-- Audio attach button (only for ASR models) -->
                         <button x-show="hasAsrSupport()" @click="$refs.audioInput.click()"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || micActive() || uploadAudio"
+                            :disabled="!currentModel || isCurrentChatStreaming() || micActive() || uploadAudio"
                             class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_audio')">
                             <i data-lucide="audio-lines" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                         </button>
                         <!-- Realtime microphone (only for realtime-capable ASR models) -->
                         <button x-show="hasAsrSupport() && isRealtimeSttModel()" @click="toggleMicTranscription()"
-                            :disabled="!apiKeySet || !currentModel || (isCurrentChatStreaming() && !micActive()) || uploadAudio"
+                            :disabled="!currentModel || (isCurrentChatStreaming() && !micActive()) || uploadAudio"
                             class="w-10 h-10 m-1 shrink-0 rounded-full border transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :class="micActive() ? 'bg-surface border-accent' : 'bg-surface-muted hover:bg-surface border-line'"
                             :title="window.t(micActive() ? 'chat.stop_recording' : 'chat.record_audio')">
@@ -1847,7 +1825,7 @@
                             style="color: var(--text-danger);" x-text="formatRecordingTime(micSeconds)"></span>
                         <!-- Web search toggle -->
                         <button x-show="!hasAsrSupport()" @click="chatSettings.webSearchEnabled = !chatSettings.webSearchEnabled; saveChatSettings()"
-                            :disabled="!apiKeySet || !currentModel"
+                            :disabled="!currentModel"
                             class="w-10 h-10 m-1 shrink-0 rounded-full border transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :class="chatSettings.webSearchEnabled ? 'bg-surface border-accent' : 'bg-surface-muted hover:bg-surface border-line'"
                             :title="window.t(chatSettings.webSearchEnabled ? 'chat.web_search_on' : 'chat.web_search_off')">
@@ -1860,12 +1838,12 @@
                             @keydown.enter="onComposerEnter($event)"
                             @input="autoResize($event.target)" @paste="handlePaste($event)"
                             :placeholder="hasAsrSupport() ? window.t('chat.input_placeholder_asr') : (isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder'))"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || hasAsrSupport()" rows="1"
+                            :disabled="!currentModel || isCurrentChatStreaming() || hasAsrSupport()" rows="1"
                             class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
                             style="color: var(--text-primary);"></textarea>
                         <div class="relative flex-shrink-0">
                             <button x-show="!isCurrentChatStreaming()" @click="sendMessage()"
-                                :disabled="(hasAsrSupport() ? (!uploadAudio || micActive()) : (!inputMessage.trim() && uploadImages.length === 0 && uploadDocuments.length === 0)) || hasPendingUploads() || !apiKeySet || !currentModel"
+                                :disabled="(hasAsrSupport() ? (!uploadAudio || micActive()) : (!inputMessage.trim() && uploadImages.length === 0 && uploadDocuments.length === 0)) || hasPendingUploads() || !currentModel"
                                 class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center">
                                 <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
                             </button>
@@ -2520,7 +2498,6 @@
     const CHAT_UNTITLED_I18N_KEY = 'chat.untitled_title';
     const MAX_CHAT_HISTORY_SIZE = 100;
     const CHAT_HISTORY_STORAGE_KEY = 'omlx_chat_history';
-    const API_KEY_STORAGE_KEY = 'omlx_chat_api_key';
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ALLOW_SVG_STORAGE_KEY = 'omlx-chat-allow-svg';
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
@@ -2541,10 +2518,6 @@
 
     function chatApp() {
         return {
-            // API Key
-            apiKeySet: false,
-            apiKeyInput: '',
-
             // UI State
             // Touch/coarse-pointer devices (phones, tablets) — NOT just narrow windows.
             // Governs Enter-to-send vs newline, so a narrow desktop window still sends on Enter.
@@ -3921,23 +3894,13 @@
             async init() {
 
         this.loadPromptProfiles();
-
-                const serverApiKey = {{ api_key | tojson }};
-
-        if (serverApiKey) {
-            localStorage.setItem(API_KEY_STORAGE_KEY, serverApiKey);
+        localStorage.removeItem('omlx_chat_api_key');
+        await this.loadModels();
+        if (this.currentModel) {
+            await this.loadModelCapabilities(this.currentModel);
         }
-
-        const storedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
-        if (storedKey) {
-            this.apiKeySet = true;
-            await this.loadModels();
-            if (this.currentModel) {
-                await this.loadModelCapabilities(this.currentModel);
-            }
-            this.loadChatHistory();
-            this.fetchMcpTools();
-        }
+        this.loadChatHistory();
+        this.fetchMcpTools();
 
         this.applyTheme();
         this.checkForUpdate();
@@ -3983,7 +3946,7 @@
         // Refresh model list when returning to chat (e.g. after HF download on dashboard).
         this._modelsVisibilityTimer = null;
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState !== 'visible' || !this.apiKeySet) return;
+            if (document.visibilityState !== 'visible') return;
             clearTimeout(this._modelsVisibilityTimer);
             this._modelsVisibilityTimer = setTimeout(async () => {
                 try {
@@ -4003,9 +3966,7 @@
 
             async fetchModelTypes() {
         try {
-            const resp = await fetch('/v1/models/status', {
-                headers: { 'Authorization': `Bearer ${this.getApiKey()}` }
-            });
+            const resp = await this.apiFetch('/v1/models/status');
             if (!resp.ok) return;
             const data = await resp.json();
             const map = {};
@@ -4066,9 +4027,7 @@
 
             async fetchMcpTools() {
         try {
-            const resp = await fetch('/v1/mcp/tools', {
-                headers: { 'Authorization': `Bearer ${this.getApiKey()}` }
-            });
+            const resp = await this.apiFetch('/v1/mcp/tools');
             if (!resp.ok) return;
             const data = await resp.json();
             this.mcpTools = (data.tools || []).map(t => ({
@@ -4666,24 +4625,15 @@
         reader.readAsText(file);
     },
 
-    async saveApiKey() {
-        if (!this.apiKeyInput.trim()) return;
-        localStorage.setItem(API_KEY_STORAGE_KEY, this.apiKeyInput.trim());
-        this.apiKeySet = true;
-        this.apiKeyInput = '';
-        try {
-            await this.loadModels();
-            if (this.currentModel) {
-                await this.loadModelCapabilities(this.currentModel);
-            }
-        } catch (e) {
-            console.error('Failed to load models after saving API key:', e);
+    async apiFetch(resource, options = {}) {
+        const response = await fetch(resource, {
+            ...options,
+            credentials: 'same-origin',
+        });
+        if (response.status === 401) {
+            window.location.assign('/admin');
         }
-        this.loadChatHistory();
-    },
-
-    getApiKey() {
-        return localStorage.getItem(API_KEY_STORAGE_KEY) || '';
+        return response;
     },
 
     combineAbortSignals(signals) {
@@ -4723,9 +4673,6 @@
             async loadModels() {
         try {
             this._adminModelsList = null;
-            const apiHeaders = this.getApiKey()
-                ? { 'Authorization': `Bearer ${this.getApiKey()}` }
-                : {};
             // Fetch models, admin model list, active cluster handles, server
             // health, and integration settings in parallel.
             const [
@@ -4735,11 +4682,10 @@
                 healthResponse,
                 settingsResponse,
             ] = await Promise.all([
-                fetch('/v1/models', { headers: apiHeaders }),
-                fetch('/admin/api/models', { credentials: 'same-origin', headers: apiHeaders }),
+                this.apiFetch('/v1/models'),
+                fetch('/admin/api/models', { credentials: 'same-origin' }),
                 fetch('/admin/api/cluster/deployments', {
                     credentials: 'same-origin',
-                    headers: apiHeaders,
                 }),
                 fetch('/health'),
                 fetch('/admin/api/global-settings', { credentials: 'same-origin' })
@@ -4747,11 +4693,6 @@
 
             if (!modelsResponse.ok) {
                 if (modelsResponse.status === 401) {
-                    alert(window.t('chat.error.incorrect_api_key'));
-                    localStorage.removeItem(API_KEY_STORAGE_KEY);
-                    this.apiKeySet = false;
-                    this.messages = [];
-                    this.currentChatId = null;
                     return;
                 }
                 throw new Error('Failed to load models');
@@ -5655,10 +5596,9 @@
 
         let finalText = null;
         try {
-            const response = await fetch('/v1/audio/transcriptions', {
+            const response = await this.apiFetch('/v1/audio/transcriptions', {
                 method: 'POST',
                 // No Content-Type header: the browser must set the multipart boundary
-                headers: { 'Authorization': `Bearer ${this.getApiKey()}` },
                 body: form,
                 signal: stream.abortController.signal,
             });
@@ -5854,7 +5794,6 @@
             ws.send(JSON.stringify({
                 type: 'start',
                 model: requestModel,
-                api_key: this.getApiKey(),
             }));
         };
         ws.onmessage = async (event) => {
@@ -6149,11 +6088,10 @@
         this.startPrefillPolling(context.chatId);
 
         try {
-            const response = await fetch('/v1/chat/completions', {
+            const response = await this.apiFetch('/v1/chat/completions', {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${this.getApiKey()}`
+                    'Content-Type': 'application/json'
                 },
                 body: JSON.stringify(requestBody),
                 signal: stream.abortController.signal
@@ -6410,9 +6348,9 @@
                         const webRoute = this.builtinWebRoute(toolName);
                         let execResp;
                         try {
-                            execResp = await fetch(webRoute || '/v1/mcp/execute', {
+                            execResp = await this.apiFetch(webRoute || '/v1/mcp/execute', {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.getApiKey()}` },
+                                headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify(webRoute ? args : { tool_name: toolName, arguments: args }),
                                 signal: combinedSignal,
                             });

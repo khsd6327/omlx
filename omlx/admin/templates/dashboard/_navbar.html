@@ -336,6 +336,7 @@
                 </div>
 
                 <!-- Logout Button -->
+                {% if auth_source != 'trusted_network' %}
                 <button
                     @click="logout"
                     class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600
@@ -344,6 +345,7 @@
                     <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
                     {{ t('navbar.logout') }}
                 </button>
+                {% endif %}
             </div>
         </div>
 
@@ -425,11 +427,13 @@
                             <i data-lucide="moon" class="w-4 h-4"></i>
                         </button>
                     </div>
+                    {% if auth_source != 'trusted_network' %}
                     <button @click="logout"
                             class="inline-flex items-center px-4 py-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 rounded-full transition-all">
                         <i data-lucide="log-out" class="w-4 h-4 mr-2"></i>
                         {{ t('navbar.logout') }}
                     </button>
+                    {% endif %}
                 </div>
                 <button
                     type="button"

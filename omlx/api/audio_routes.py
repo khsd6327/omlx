@@ -622,8 +622,7 @@ async def create_transcription(
 def _verify_ws_api_key(api_key: Optional[str]) -> bool:
     """Verify an in-band API key with the same rules as verify_api_key.
 
-    WebSocket connections from browsers cannot carry an Authorization
-    header, so the key arrives inside the {"type": "start"} message.
+    Non-browser clients send the key inside the {"type": "start"} message.
     """
     from omlx.server import _server_state
 
@@ -646,13 +645,18 @@ async def realtime_transcription(websocket: WebSocket) -> None:
     """Push-based realtime transcription over WebSocket.
 
     Protocol:
-      client → {"type": "start", "model": ..., "api_key": ..., "language"?: ...}
+      browser → {"type": "start", "model": ..., "language"?: ...}
+      non-browser → the same object with "api_key"
       server → {"type": "ready"} or {"type": "error", "detail": ...}
       client → binary frames: 16 kHz mono little-endian Int16 PCM
       server → {"type": "transcript.delta", "delta": ...} as text commits
       client → {"type": "stop"} (or closes the socket to abandon)
       server → remaining deltas, then {"type": "transcript.done", "text": ...}
     """
+    from omlx.admin.auth import verify_websocket_session
+
+    browser_session = verify_websocket_session(websocket)
+    browser_origin = websocket.headers.get("origin")
     await websocket.accept()
 
     async def _reject(detail: str, close_code: int = 1008) -> None:
@@ -674,7 +678,10 @@ async def realtime_transcription(websocket: WebSocket) -> None:
     if not isinstance(start, dict) or start.get("type") != "start":
         await _reject("First message must be a {'type': 'start'} object")
         return
-    if not _verify_ws_api_key(start.get("api_key")):
+    if browser_origin is not None and not browser_session:
+        await _reject("Invalid WebSocket origin or session")
+        return
+    if not browser_session and not _verify_ws_api_key(start.get("api_key")):
         await _reject("Invalid API key")
         return
     model_id = start.get("model")
