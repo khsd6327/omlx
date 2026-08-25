@@ -629,6 +629,7 @@ class AuthSettings:
     api_key: str | None = None
     secret_key: str | None = None
     skip_api_key_verification: bool = False
+    web_admin_auth_mode: str = "api_key"
     sub_keys: list[SubKeyEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -637,6 +638,7 @@ class AuthSettings:
             "api_key": self.api_key,
             "secret_key": self.secret_key,
             "skip_api_key_verification": self.skip_api_key_verification,
+            "web_admin_auth_mode": self.web_admin_auth_mode,
             "sub_keys": [sk.to_dict() for sk in self.sub_keys],
         }
 
@@ -647,6 +649,7 @@ class AuthSettings:
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
             skip_api_key_verification=data.get("skip_api_key_verification", False),
+            web_admin_auth_mode=data.get("web_admin_auth_mode", "api_key"),
             sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
@@ -1749,6 +1752,11 @@ class GlobalSettings:
             errors.append(
                 f"Invalid initial_cache_blocks: "
                 f"{self.cache.initial_cache_blocks} (must be > 0)"
+            )
+
+        if self.auth.web_admin_auth_mode not in {"api_key", "trusted_networks"}:
+            errors.append(
+                "web_admin_auth_mode must be one of: api_key, trusted_networks"
             )
 
         # Sampling validation
