@@ -12,11 +12,20 @@ Pytest configuration and fixtures for oMLX tests.
 This module provides common fixtures used across test files.
 """
 
+import os
+import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
 import pytest
+
+# Numerical equivalence tests require full float32, not MLX's reduced-precision
+# matmul/attention path. Set this before any MLX imports initialize the backend.
+# An explicit MLX_ENABLE_TF32=1 still allows testing the production fast path.
+# https://ml-explore.github.io/mlx/build/html/usage/precision.html
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
 
 # Install the torch stub before any test imports xgrammar (e.g. via @patch
 # decorators that resolve the target at collection time). When real torch is
@@ -54,6 +63,18 @@ def cluster_home(tmp_path, monkeypatch):
     monkeypatch.setattr(ssh_keys, "_SSH_KEY_PATH", ssh_dir / "omlx_cluster")
     monkeypatch.setattr(ssh_keys, "_SSH_PUBKEY_PATH", ssh_dir / "omlx_cluster.pub")
     return home
+
+
+def pytest_report_header(config):
+    try:
+        mlx_version = version("mlx")
+    except PackageNotFoundError:
+        mlx_version = "not installed"
+    return [
+        f"oMLX test environment: {sys.prefix}",
+        f"MLX {mlx_version}; MLX_ENABLE_TF32={os.environ['MLX_ENABLE_TF32']} "
+        "(test process only)",
+    ]
 
 
 class MockTokenizer:
