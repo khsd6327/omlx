@@ -636,6 +636,41 @@ class PagedCacheManager(CacheManager):
     # Block Allocation (vLLM style)
     # =========================================================================
 
+    def _reclaim_parked_blocks(self, needed: int) -> int:
+        """fork: return ref-0 "parked" cached blocks to the free queue.
+
+        release_for_eviction() parks finished requests' blocks at ref 0 in
+        allocated_blocks (kept findable for prefix reuse) but nothing on the
+        production path ever returns them to the free queue. Once the pool
+        reaches max_blocks, allocation would otherwise fail permanently
+        ("Out of cache blocks" forever — ~25.6M cached tokens at the SSD-mode
+        default). Sweeps LRU-first in batches to amortize. Caller must hold
+        self._lock (RLock).
+
+        Returns the number of blocks returned to the free queue.
+        """
+        candidates = [
+            b
+            for b in self.allocated_blocks.values()
+            if b.ref_count == 0 and not b.is_null
+        ]
+        if not candidates:
+            return 0
+        candidates.sort(key=lambda b: b.last_access)
+        target = max(needed, 64)
+        evicted = 0
+        for block in candidates[:target]:
+            if self.evict_block_permanently(block.block_id):
+                evicted += 1
+        if evicted:
+            logger.info(
+                "Reclaimed %d parked ref-0 cache blocks (pool at %d/%d)",
+                evicted,
+                self._current_allocated_count,
+                self.max_blocks,
+            )
+        return evicted
+
     def allocate_block(self) -> Optional[CacheBlock]:
         """
         Allocate a new cache block.
@@ -647,7 +682,9 @@ class PagedCacheManager(CacheManager):
             if self.free_block_queue.num_free_blocks == 0:
                 # Try to grow the block pool dynamically
                 grown = self._grow_blocks(min(256, self.max_blocks - self._current_allocated_count))
-                if grown == 0:
+                # fork: at max_blocks, sweep parked ref-0 blocks before
+                # giving up (see _reclaim_parked_blocks).
+                if grown == 0 and self._reclaim_parked_blocks(1) == 0:
                     logger.warning("Out of cache blocks (max reached)")
                     return None
 
@@ -684,6 +721,13 @@ class PagedCacheManager(CacheManager):
                 # Try to grow the block pool dynamically
                 needed = num_blocks - self.free_block_queue.num_free_blocks
                 self._grow_blocks(needed + 128)  # Extra buffer for future allocations
+
+            if num_blocks > self.free_block_queue.num_free_blocks:
+                # fork: at max_blocks, sweep parked ref-0 blocks before
+                # failing (see _reclaim_parked_blocks).
+                self._reclaim_parked_blocks(
+                    num_blocks - self.free_block_queue.num_free_blocks + 128
+                )
 
             if num_blocks > self.free_block_queue.num_free_blocks:
                 raise ValueError(
@@ -953,62 +997,6 @@ class PagedCacheManager(CacheManager):
                 self.stats.misses += 1
             return block
 
-    def cache_full_blocks(
-        self,
-        blocks: List[CacheBlock],
-        token_ids: List[int],
-        num_cached_blocks: int,
-        num_full_blocks: int,
-        extra_keys: Optional[Tuple[Any, ...]] = None,
-    ) -> None:
-        """
-        Cache full blocks for prefix caching (vLLM style).
-
-        Computes chain hashes and adds blocks to the cache.
-
-        Args:
-            blocks: All blocks for the request
-            token_ids: All token IDs for the request
-            num_cached_blocks: Number of blocks already cached
-            num_full_blocks: Number of full blocks to cache
-            extra_keys: Additional keys for hash (e.g., VLM image hash)
-        """
-        if not self.enable_caching:
-            return
-
-        if num_cached_blocks >= num_full_blocks:
-            return
-
-        with self._lock:
-            # Get parent hash from last cached block
-            parent_hash = None
-            if num_cached_blocks > 0:
-                parent_hash = blocks[num_cached_blocks - 1].block_hash
-
-            for i in range(num_cached_blocks, num_full_blocks):
-                block = blocks[i]
-                if block.block_hash is not None:
-                    parent_hash = block.block_hash
-                    continue  # Already cached
-
-                # Get tokens for this block
-                start = i * self.block_size
-                end = start + self.block_size
-                block_tokens = token_ids[start:end]
-
-                # Compute chain hash
-                block_hash = compute_block_hash(
-                    parent_hash, block_tokens,
-                    extra_keys=extra_keys, model_name=self.model_name,
-                )
-                block.block_hash = block_hash
-                block.token_count = len(block_tokens)
-
-                # Add to cache
-                self.cached_block_hash_to_block.insert(block_hash, block)
-
-                parent_hash = block_hash
-
     def get_computed_blocks(
         self,
         token_ids: List[int],
@@ -1165,13 +1153,6 @@ class PagedCacheManager(CacheManager):
         with self._lock:
             return self.request_tables.get(request_id)
 
-    def get_or_create_block_table(self, request_id: str) -> BlockTable:
-        """Get or create block table for a request."""
-        with self._lock:
-            if request_id not in self.request_tables:
-                self.request_tables[request_id] = BlockTable(request_id=request_id)
-            return self.request_tables[request_id]
-
     def delete_block_table(self, request_id: str) -> None:
         """Delete block table and free associated blocks."""
         with self._lock:
@@ -1179,19 +1160,6 @@ class PagedCacheManager(CacheManager):
             if table:
                 for block_id in table.block_ids:
                     self.free_block(block_id)
-
-    def add_block_to_table(
-        self,
-        table: BlockTable,
-        block: CacheBlock,
-        tokens_in_block: int,
-    ) -> None:
-        """Add a block to a block table."""
-        with self._lock:
-            table.block_ids.append(block.block_id)
-            block.token_count = tokens_in_block
-            table.num_tokens += tokens_in_block
-            self.stats.total_tokens_cached += tokens_in_block
 
     # =========================================================================
     # Prefix Sharing & COW
@@ -1468,44 +1436,6 @@ class PagedCacheManager(CacheManager):
 
             return candidates[:count]
 
-    def mark_block_cold(self, block_id: int) -> bool:
-        """
-        Mark a block as evicted (metadata preserved).
-
-        In paged SSD-only mode, this is a no-op since block data is always on paged SSD.
-        Kept for API compatibility.
-
-        Args:
-            block_id: Block ID to mark.
-
-        Returns:
-            True if successful, False if block not found or has data users.
-        """
-        with self._lock:
-            block = self.blocks[block_id] if block_id < len(self.blocks) else None
-            if block is None:
-                logger.warning(f"Block {block_id} not found")
-                return False
-
-            if block.ref_count > 0:
-                logger.warning(
-                    f"Cannot mark block {block_id}: ref_count={block.ref_count}"
-                )
-                return False
-
-            if block.is_null:
-                logger.warning(f"Cannot mark null block")
-                return False
-
-            # In paged SSD-only mode, data is already on paged SSD
-            self.stats.evictions += 1
-
-            logger.debug(
-                f"Marked block {block_id} "
-                f"(hash={block.block_hash.hex()[:16] if block.block_hash else 'None'}...)"
-            )
-            return True
-
     def evict_block_permanently(self, block_id: int) -> bool:
         """
         Evict a block permanently (removes from metadata index).
@@ -1561,99 +1491,11 @@ class PagedCacheManager(CacheManager):
             logger.debug(f"Permanently evicted block {block_id}")
             return True
 
-    def restore_block(
-        self,
-        block_id: int,
-        cache_data: List[Tuple[Any, Any]],
-    ) -> bool:
-        """
-        Restore block data from cold storage.
-
-        In paged SSD-only mode, this is a no-op since data is always loaded
-        directly from paged SSD when needed. Kept for API compatibility.
-
-        Args:
-            block_id: Block ID to restore.
-            cache_data: KV cache data (unused in paged SSD-only mode).
-
-        Returns:
-            True if successful, False if block not found.
-        """
-        with self._lock:
-            block = self.blocks[block_id] if block_id < len(self.blocks) else None
-            if block is None:
-                logger.warning(f"Block {block_id} not found for restoration")
-                return False
-
-            block.touch()
-
-            logger.debug(
-                f"Block {block_id} touched "
-                f"(hash={block.block_hash.hex()[:16] if block.block_hash else 'None'}...)"
-            )
-            return True
-
-    def get_cold_blocks(self) -> List[CacheBlock]:
-        """
-        Get all blocks that have data on paged SSD.
-
-        In paged SSD-only mode, returns all blocks with block_hash set
-        (i.e., blocks that have data stored on paged SSD).
-
-        Returns:
-            List of blocks with paged SSD data.
-        """
-        with self._lock:
-            return [b for b in self.blocks if b.block_hash is not None and not b.is_null]
-
     @property
     def cold_block_count(self) -> int:
         """Number of blocks with data on paged SSD."""
         with self._lock:
             return sum(1 for b in self.blocks if b.block_hash is not None and not b.is_null)
-
-    def get_ref_count_distribution(self) -> Dict[int, int]:
-        """
-        Get distribution of blocks by ref_count.
-
-        Returns:
-            Dict mapping ref_count -> number of blocks with that count.
-            Only includes ref_counts that have at least one block.
-        """
-        with self._lock:
-            distribution: Dict[int, int] = {}
-            for block in self.allocated_blocks.values():
-                rc = block.ref_count
-                distribution[rc] = distribution.get(rc, 0) + 1
-            return distribution
-
-    def get_ref_count_summary(self) -> str:
-        """
-        Get a compact string summary of ref_count distribution.
-
-        Returns:
-            String like "rc0=5(ssd=3),rc1=100" showing counts per ref_count.
-            In paged SSD-only mode, all blocks have data on paged SSD.
-        """
-        dist = self.get_ref_count_distribution()
-        if not dist:
-            return "rc=none"
-
-        # Count blocks with paged SSD data (blocks with block_hash)
-        ssd_count = 0
-        with self._lock:
-            for block in self.allocated_blocks.values():
-                if block.ref_count == 0 and block.block_hash is not None:
-                    ssd_count += 1
-
-        parts = []
-        for k, v in sorted(dist.items()):
-            if k == 0:
-                # Show paged SSD count for rc0
-                parts.append(f"rc0={v}(ssd={ssd_count})")
-            else:
-                parts.append(f"rc{k}={v}")
-        return ",".join(parts)
 
     # =========================================================================
     # CacheManager ABC Interface Implementation
