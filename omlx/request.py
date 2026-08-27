@@ -77,6 +77,11 @@ class SamplingParams:
     # Thinking budget (None = unlimited thinking)
     thinking_budget: Optional[int] = None
 
+    # When False (default), streaming RequestOutput objects carry
+    # output_token_ids only on the final chunk to avoid O(N^2) cumulative-list
+    # copies. Set True for internal callers that need cumulative ids per chunk.
+    include_output_token_ids: bool = False
+
     # Compiled grammar for constrained decoding (xgrammar CompiledGrammar).
     # Typed as Any to avoid a hard dependency on xgrammar at import time.
     compiled_grammar: Any = None
@@ -292,7 +297,8 @@ class RequestOutput:
     # New tokens generated in this step
     new_token_ids: List[int] = field(default_factory=list)
     new_text: str = ""
-    # Cumulative output
+    # Cumulative output. By default output_token_ids is populated only on the
+    # final output chunk; see SamplingParams.include_output_token_ids.
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
     # Status
