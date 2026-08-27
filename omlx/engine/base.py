@@ -12,8 +12,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-import mlx.core as mx
-
 from omlx.engine_core import get_mlx_executor
 
 logger = logging.getLogger(__name__)
@@ -44,6 +42,19 @@ async def _close_engine_core(engine) -> bool:
             cancelled = True
     task.result()
     return cancelled
+
+
+def sync_and_clear_mlx_cache(stream=None) -> None:
+    """Run the scheduler-owned safe Metal cache reclaim helper.
+
+    Non-scheduler engines share the process-wide MLX allocator with batched
+    engines and async cache-store workers. Keep every reclaim on the same
+    locked helper used by Scheduler/EnginePool so clear_cache cannot race a
+    buffer-protocol read or an in-flight engine stream.
+    """
+    from ..scheduler import _sync_and_clear_cache
+
+    _sync_and_clear_cache(stream)
 
 
 def _clear_teardown_references(
@@ -656,15 +667,12 @@ class ActivityTrackingMixin:
         Always clears per request. Gating the clear on `_active_count == 0`
         caused unbounded Metal pool growth under concurrent workloads (#684),
         because indexing clients keep the active count above zero indefinitely.
-        `mx.synchronize()` is required before `mx.clear_cache()` to avoid
-        Metal buffer races on M3/M4 (#300, #888, #1106).
+        Reclaim goes through Scheduler's locked helper to avoid Metal buffer
+        races on M3/M4 (#300, #888, #1106).
         """
         self._end_activity(activity_id)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(),
-            lambda: (mx.synchronize(), mx.clear_cache()),
-        )
+        await loop.run_in_executor(get_mlx_executor(), sync_and_clear_mlx_cache)
 
     def get_activity_snapshot(self) -> Dict[str, Any]:
         """Return active non-streaming operations for admin display."""
