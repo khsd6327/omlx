@@ -44,6 +44,9 @@ def get_max_image_side_length() -> int:
     return settings.server.max_image_side_length
 
 
+# fork: cap decoded image data before allocating the base64 payload.
+
+
 _IMAGE_INPUT_ERROR = (
     "Image inputs must be base64 data URIs "
     "(data:image/...;base64,...). Remote URLs and local file paths are not supported."

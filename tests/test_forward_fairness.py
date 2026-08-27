@@ -226,7 +226,8 @@ class EmbeddingEngineCacheClearTests(unittest.TestCase):
 
     Uses a fake model so no weights load; the real global MLX executor
     runs the forward, the mx module is replaced per import site (the
-    engine's synchronize/clear_cache and the gate's memory getters).
+    engine's synchronize and the gate's memory getters). Cache reclamation
+    is checked through the shared safe reclaim helper.
     """
 
     def _engine(self):
@@ -253,10 +254,13 @@ class EmbeddingEngineCacheClearTests(unittest.TestCase):
     def test_uncontended_forward_clears_cache(self):
         get_decode_activity().clear()
         engine = self._engine()
-        with patch("omlx.engine.embedding.mx") as engine_mx:
+        with (
+            patch("omlx.engine.embedding.mx") as engine_mx,
+            patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear,
+        ):
             self._run_embed(engine)
             engine_mx.synchronize.assert_called()
-            engine_mx.clear_cache.assert_called()
+            clear.assert_called_once()
 
     def test_contended_forward_skips_clear_below_watermark(self):
         _publish_other_decode()
@@ -265,12 +269,13 @@ class EmbeddingEngineCacheClearTests(unittest.TestCase):
         with (
             patch("omlx.engine.embedding.mx") as engine_mx,
             patch("omlx.engine.forward_fairness.mx") as fair_mx,
+            patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear,
         ):
             fair_mx.get_active_memory.return_value = 1024
             fair_mx.get_cache_memory.return_value = 1024
             self._run_embed(engine)
             engine_mx.synchronize.assert_called()
-            engine_mx.clear_cache.assert_not_called()
+            clear.assert_not_called()
 
     def test_contended_forward_clears_under_memory_pressure(self):
         _publish_other_decode()
@@ -279,6 +284,7 @@ class EmbeddingEngineCacheClearTests(unittest.TestCase):
         with (
             patch("omlx.engine.embedding.mx") as engine_mx,
             patch("omlx.engine.forward_fairness.mx") as fair_mx,
+            patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear,
         ):
             fair_mx.get_active_memory.return_value = 1 * 1024**3
             with patch(
@@ -286,11 +292,14 @@ class EmbeddingEngineCacheClearTests(unittest.TestCase):
                 return_value=3 * 1024**3,
             ):
                 self._run_embed(engine)
-            engine_mx.clear_cache.assert_called()
+            clear.assert_called_once()
 
     def test_contended_forward_clears_without_watermark(self):
         _publish_other_decode()
         engine = self._engine()
-        with patch("omlx.engine.embedding.mx") as engine_mx:
+        with (
+            patch("omlx.engine.embedding.mx") as engine_mx,
+            patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear,
+        ):
             self._run_embed(engine)
-            engine_mx.clear_cache.assert_called()
+            clear.assert_called_once()

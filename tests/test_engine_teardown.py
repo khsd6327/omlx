@@ -7,7 +7,7 @@ import subprocess
 import sys
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import mlx.core as mx
 import pytest
@@ -310,6 +310,7 @@ async def test_cancelled_wrapper_finishes_close_and_clears_references(wrapper_cl
         stop=AsyncMock(), engine=SimpleNamespace(close=close)
     )
     wrapper._vision_cache = None
+    wrapper._media_executor = MagicMock()
     wrapper._diffusion_cancel_events = set()
     task = asyncio.create_task(wrapper.stop())
     for _ in range(100):
@@ -325,3 +326,7 @@ async def test_cancelled_wrapper_finishes_close_and_clears_references(wrapper_cl
         await task
     assert wrapper._engine is None
     assert wrapper._loaded is False
+    if wrapper_class is VLMBatchedEngine:
+        wrapper._media_executor.shutdown.assert_called_once_with(
+            wait=False, cancel_futures=True
+        )
