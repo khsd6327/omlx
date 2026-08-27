@@ -315,6 +315,16 @@ class TestPagedSSDCacheStats:
 
         assert stats.save_rate == 0.0
 
+    def test_write_latency_average(self):
+        """Test SSD write latency average calculation."""
+        stats = PagedSSDCacheStats(
+            ssd_write_attempts=2,
+            ssd_write_latency_total_ms=12.0,
+            ssd_write_latency_max_ms=8.0,
+        )
+
+        assert stats.ssd_write_latency_avg_ms == pytest.approx(6.0)
+
     def test_record_save(self):
         """Test recording a save operation."""
         stats = PagedSSDCacheStats()
@@ -378,6 +388,7 @@ class TestPagedSSDCacheStats:
         assert d["saves"] == 90
         assert d["errors"] == 10
         assert d["save_rate"] == pytest.approx(0.9)
+        assert d["ssd_write_latency_avg_ms"] == 0.0
         assert d["total_size_bytes"] == 1024
 
 
