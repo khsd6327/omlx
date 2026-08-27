@@ -267,6 +267,7 @@ def run_vlm_mtp_decode(
     token_dtype: mx.Dtype = mx.int32,
     eos_token_ids: Optional[Set[int]] = None,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    clear_cache: Optional[Callable[[], None]] = None,
 ) -> Generator[Union[int, List[Optional[int]]], None, None]:
     """Stream decoded tokens via mlx-vlm's MTP rounds.
 
@@ -319,7 +320,10 @@ def run_vlm_mtp_decode(
             # stream covers the verify forwards while the default-stream
             # drain covers the engine stream the scheduler advances this
             # generator under (``with mx.stream(self._stream)``).
-            _sync_and_clear_cache(_vlm_generation_stream)
+            if clear_cache is None:
+                _sync_and_clear_cache(_vlm_generation_stream)
+            else:
+                clear_cache()
             yield tokens
         return
 
@@ -345,5 +349,8 @@ def run_vlm_mtp_decode(
         token_dtype=token_dtype,
     ):
         # Same two-stream drain as the batched branch above.
-        _sync_and_clear_cache(_vlm_generation_stream)
+        if clear_cache is None:
+            _sync_and_clear_cache(_vlm_generation_stream)
+        else:
+            clear_cache()
         yield tok

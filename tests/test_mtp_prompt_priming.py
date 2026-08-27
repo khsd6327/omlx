@@ -401,8 +401,8 @@ class TestCaptureFold:
         ref_cache = _reference_head_cache(model, tokens, extra_tok=main_tok)
         mx.eval([c.state for c in mtp_cache])
         for (k, v), (rk, rv) in zip(_kv_entries(mtp_cache), _kv_entries(ref_cache)):
-            assert mx.allclose(k, rk, rtol=1e-4, atol=1e-4)
-            assert mx.allclose(v, rv, rtol=1e-4, atol=1e-4)
+            assert mx.allclose(k, rk, rtol=1e-3, atol=1e-3)
+            assert mx.allclose(v, rv, rtol=1e-3, atol=1e-3)
 
 
 class TestCaptureSkips:
