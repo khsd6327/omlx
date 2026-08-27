@@ -402,6 +402,34 @@ class EngineCore:
     async def stop(self) -> None:
         """Stop the engine loop."""
         self._running = False
+        # fork: fail outstanding waiters before tearing the loop down.
+        # generate() awaits its finished event with no timeout and
+        # stream_outputs() awaits collector.get(timeout=None); stopping an
+        # engine with requests in flight otherwise left those HTTP requests
+        # hung until the client gave up (close() clears the dicts but the
+        # waiters hold their own references).
+        pending = list(self._output_collectors.keys())
+        for rid in pending:
+            collector = self._output_collectors.get(rid)
+            if collector is not None:
+                collector.put(
+                    RequestOutput(
+                        request_id=rid,
+                        finished=True,
+                        finish_reason="error",
+                        error=(
+                            "Request aborted: the engine was stopped "
+                            "(model unloaded or server shutting down)."
+                        ),
+                    )
+                )
+            event = self._finished_events.get(rid)
+            if event is not None:
+                event.set()
+        if pending:
+            logger.warning(
+                "Engine stop: failed %d in-flight request(s)", len(pending)
+            )
         if self._wake_event is not None:
             self._wake_event.set()
         if self._task:
@@ -1012,19 +1040,6 @@ class EngineCore:
         self._finished_events.pop(request_id, None)
         self._finished_at.pop(request_id, None)
 
-    async def _delayed_cleanup(self, request_id: str, delay: float = 5.0) -> None:
-        """
-        Cleanup request after delay if not already cleaned.
-
-        This handles the case where a client disconnects before consuming
-        the stream_outputs() generator, which would prevent the finally
-        block from running.
-        """
-        await asyncio.sleep(delay)
-        if request_id in self._output_collectors:
-            logger.debug(f"Delayed cleanup for request {request_id}")
-            self._cleanup_request(request_id)
-
     async def stream_outputs(
         self,
         request_id: str,
@@ -1153,59 +1168,6 @@ class EngineCore:
 
         final_output.first_token_at = first_token_at
         return final_output
-
-    def generate_batch_sync(
-        self,
-        prompts: List[Union[str, List[int]]],
-        sampling_params: Optional[SamplingParams] = None,
-    ) -> List[RequestOutput]:
-        """
-        Generate responses synchronously for maximum throughput.
-
-        This bypasses the async engine loop entirely, running the scheduler
-        directly for optimal batching performance. Use this when you don't
-        need streaming and want maximum throughput.
-
-        Args:
-            prompts: List of input prompts
-            sampling_params: Generation parameters (same for all)
-
-        Returns:
-            List of RequestOutput in same order as prompts
-        """
-        import uuid as uuid_module
-
-        from .request import Request
-
-        if sampling_params is None:
-            sampling_params = SamplingParams()
-
-        # Add all requests to scheduler
-        request_ids = []
-        for prompt in prompts:
-            request_id = str(uuid_module.uuid4())
-            request = Request(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params=sampling_params,
-            )
-            self.scheduler.add_request(request)
-            request_ids.append(request_id)
-
-        # Process until all done - direct scheduler access, no async overhead
-        results: Dict[str, RequestOutput] = {}
-        while self.scheduler.has_requests():
-            output = self.scheduler.step()
-            for req_output in output.outputs:
-                if req_output.finished:
-                    results[req_output.request_id] = req_output
-
-        # Cleanup
-        for rid in request_ids:
-            self.scheduler.remove_finished_request(rid)
-
-        # Return in original order
-        return [results[rid] for rid in request_ids]
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
@@ -1413,6 +1375,9 @@ class AsyncEngineCore:
         config: Optional[EngineConfig] = None,
     ):
         self.engine = EngineCore(model, tokenizer, config)
+        # fork: hold the fire-and-forget start task so it isn't GC'd mid-flight
+        # and its exceptions aren't silently dropped (see start()).
+        self._start_task: Optional[asyncio.Task] = None
         # Drop wrapper-local aliases after EngineCore takes ownership.
         model = None
         tokenizer = None
@@ -1430,8 +1395,26 @@ class AsyncEngineCore:
         await self.stop()
 
     def start(self) -> None:
-        """Start engine (creates task in current loop)."""
-        asyncio.create_task(self.engine.start())
+        """Start engine (creates task in current loop).
+
+        Kept synchronous for backward compat (callers rely on it not being a
+        coroutine). fork: store the task on self so it isn't garbage-collected
+        before it runs, and attach a done-callback that surfaces a failed
+        engine.start() instead of swallowing the exception. Prefer
+        ``async with AsyncEngineCore(...)`` (which awaits start) when you need
+        to know startup actually completed.
+        """
+        task = asyncio.create_task(self.engine.start())
+        self._start_task = task
+
+        def _log_start_result(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error("AsyncEngineCore.start() failed: %s", exc, exc_info=exc)
+
+        task.add_done_callback(_log_start_result)
 
     async def stop(self) -> None:
         """Stop the engine."""

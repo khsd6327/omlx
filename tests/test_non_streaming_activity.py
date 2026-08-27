@@ -59,7 +59,7 @@ async def test_finish_activity_clears_mlx_cache_unconditionally():
     """
     engine = DummyNonStreamingEngine()
 
-    with patch("omlx.engine.base.mx") as mock_mx:
+    with patch("omlx.engine.base.sync_and_clear_mlx_cache") as clear_cache:
         # Two overlapping activities — neither drains active_count to 0
         # before the other finishes, but both must still clear.
         a = engine._begin_activity("embedding")
@@ -68,6 +68,5 @@ async def test_finish_activity_clears_mlx_cache_unconditionally():
         await engine._finish_activity(a)
         await engine._finish_activity(b)
 
-        assert mock_mx.synchronize.call_count == 2
-        assert mock_mx.clear_cache.call_count == 2
+        assert clear_cache.call_count == 2
         assert engine._active_count == 0
