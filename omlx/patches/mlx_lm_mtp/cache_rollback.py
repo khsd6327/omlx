@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import types
 
 logger = logging.getLogger(__name__)
 
@@ -190,10 +191,20 @@ def apply() -> bool:
     module-level flag — keeps the patch consistent with the rest of
     mlx_lm_mtp after the #1388 self-healing refactor.
     """
+    root = sys.modules.get("mlx_lm")
+    if root is not None and (
+        not isinstance(root, types.ModuleType) or not hasattr(root, "__path__")
+    ):
+        logger.debug("mlx_lm root is not a package; skipping rollback_state")
+        return False
+
     try:
         from mlx_lm.models.cache import ArraysCache
     except ImportError:
         logger.debug("mlx_lm.models.cache not importable; skipping rollback_state")
+        return False
+    if not isinstance(ArraysCache, type):
+        logger.debug("mlx_lm.models.cache.ArraysCache is not a class; skipping rollback_state")
         return False
 
     _attach_rotating_undo()
