@@ -2121,7 +2121,7 @@ async def test_shutdown_persists_snapshot_on_generation_thread(
     monkeypatch.setattr(batched, "BatchedEngine", lambda **kwargs: fallback)
     memory = iter((2, 1))
     monkeypatch.setattr(dflash.mx, "get_active_memory", lambda: next(memory))
-    monkeypatch.setattr(dflash.mx, "synchronize", lambda: None)
+    monkeypatch.setattr(dflash.mx, "synchronize", lambda stream=None: None)
     monkeypatch.setattr(dflash.mx, "clear_cache", lambda: None)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
