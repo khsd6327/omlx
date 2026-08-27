@@ -24,6 +24,7 @@ Usage:
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import copy
 import importlib
@@ -33,6 +34,7 @@ import logging
 import os
 import threading
 from collections.abc import AsyncIterator
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,6 +57,7 @@ from ..utils.image import (
     compute_per_image_hashes,
     extract_images_from_messages,
 )
+from ..utils.tokenizer import get_tokenizer_config
 from .base import (
     BaseEngine,
     GenerationOutput,
@@ -62,6 +65,7 @@ from .base import (
     _close_engine_core,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
+    sync_and_clear_mlx_cache,
 )
 
 logger = logging.getLogger(__name__)
@@ -1713,10 +1717,110 @@ class VLMBatchedEngine(BaseEngine):
         # Holds the loaded gemma4_assistant drafter when vlm_mtp_enabled.
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
+        # fork: dedicated single-thread executor for image/audio extraction
+        # (URL download with up to 30s timeout, base64 decode, PIL
+        # open/EXIF/convert). This used to run on _mlx_executor — the SAME
+        # thread that runs every scheduler.step() decode burst — so one slow
+        # remote image froze all token generation on this engine. A single
+        # worker serializes media prep per model (PIL/HF processors are not
+        # guaranteed thread-safe) without touching the decode thread.
+        self._media_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vlm-media"
+        )
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
         self._diffusion_active_requests = 0
         self._diffusion_cancel_events: set[threading.Event] = set()
+
+    def _get_media_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """fork: lazily (re)create the media-prep executor.
+
+        stop() shuts it down, but a stopped engine instance can be
+        restarted in place via start() (chat() calls start() when
+        _loaded is False), so recreate on demand.
+        """
+        ex = self._media_executor
+        if ex is None or getattr(ex, "_shutdown", False):
+            ex = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vlm-media"
+            )
+            self._media_executor = ex
+        return ex
+
+    async def _extract_chat_media_async(self, messages: list[dict[str, Any]]):
+        """fork: run image/audio extraction off the MLX executor thread.
+
+        Base64 decode and PIL open/EXIF/convert are CPU work with no mx
+        involvement. Running them on _mlx_executor stalled decode on this
+        engine for the duration.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._get_media_executor(),
+            partial(extract_images_from_messages, messages),
+        )
+
+    def _tokenizer_executor(self):
+        engine = getattr(self._engine, "engine", None)
+        return getattr(engine, "_mlx_executor", None)
+
+    async def _run_tokenizer_async(self, func, /, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._tokenizer_executor(),
+            partial(func, *args, **kwargs),
+        )
+
+    def _encode_prompt_sync(self, prompt: str) -> list[int]:
+        return list(self._tokenizer.encode(prompt))
+
+    async def _encode_prompt_async(self, prompt: str) -> list[int]:
+        return await self._run_tokenizer_async(self._encode_prompt_sync, prompt)
+
+    async def _count_chat_tokens_async(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> int:
+        return await self._run_tokenizer_async(
+            self.count_chat_tokens,
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
+    def _specprefill_system_end_sync(
+        self,
+        messages: list[dict[str, Any]],
+        prompt_token_count: int,
+    ) -> int | None:
+        non_system = [
+            m for m in messages if m.get("role") not in ("system", "developer")
+        ]
+        if len(non_system) >= len(messages) or not non_system:
+            return None
+        non_system_prompt = self._tokenizer.apply_chat_template(
+            non_system,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        non_system_tokens = len(self._tokenizer.encode(non_system_prompt))
+        system_end = prompt_token_count - non_system_tokens
+        return system_end if system_end > 0 else None
+
+    async def _specprefill_system_end_async(
+        self,
+        messages: list[dict[str, Any]],
+        prompt_token_count: int,
+    ) -> int | None:
+        return await self._run_tokenizer_async(
+            self._specprefill_system_end_sync,
+            messages,
+            prompt_token_count,
+        )
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -2698,6 +2802,10 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
         self._loaded = False
+        # fork: stop accepting media-prep work; don't wait for an in-flight
+        # download (cancel_futures drops queued items, the worker thread is
+        # a daemon-style pool member that exits after its current task).
+        self._media_executor.shutdown(wait=False, cancel_futures=True)
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError
@@ -4223,6 +4331,9 @@ class VLMBatchedEngine(BaseEngine):
             )
 
         loop = asyncio.get_running_loop()
+        # fork: fetch/decode media off the MLX thread first; only template +
+        # vision encode run on the MLX executor.
+        media = await self._extract_chat_media_async(messages)
         (
             prompt,
             vlm_embeds,
@@ -4232,10 +4343,13 @@ class VLMBatchedEngine(BaseEngine):
             image_cache_key_ranges,
         ) = await loop.run_in_executor(
             self._engine._mlx_executor,
-            self._process_chat_messages,
-            messages,
-            tools,
-            kwargs,
+            partial(
+                self._process_chat_messages,
+                messages,
+                tools,
+                kwargs,
+                preextracted_media=media,
+            ),
         )
 
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
@@ -4323,12 +4437,8 @@ class VLMBatchedEngine(BaseEngine):
         # strips images first via ``extract_images_from_messages`` (see
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
-        text_messages, images, _ = extract_images_from_messages(messages)
-        prompt = self._apply_chat_template(
-            text_messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
+        _, images, _ = await asyncio.to_thread(
+            extract_images_from_messages, messages
         )
         # Tokenizer errors propagate as 500 today regardless of where they
         # fire; the real chat path's add_request → tokenize call has no
@@ -4337,7 +4447,12 @@ class VLMBatchedEngine(BaseEngine):
         # the real chat path surface the same error through the existing
         # handler chain.
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = await self._count_chat_tokens_async(
+                messages,
+                tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
+            )
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
@@ -4384,7 +4499,7 @@ class VLMBatchedEngine(BaseEngine):
             )
             return
         try:
-            num_tokens = len(self._tokenizer.encode(prompt))
+            num_tokens = len(await self._encode_prompt_async(prompt))
         except Exception as e:
             logger.warning(
                 "VLMBatchedEngine.preflight_completion: tokenizer.encode "
@@ -4450,7 +4565,9 @@ class VLMBatchedEngine(BaseEngine):
         # the event loop.  Blocking here (synchronous mx.eval) prevents
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
+        # fork: media fetch/decode happens off the MLX thread first.
         loop = asyncio.get_running_loop()
+        media = await self._extract_chat_media_async(messages)
         (
             prompt,
             vlm_embeds,
@@ -4460,14 +4577,32 @@ class VLMBatchedEngine(BaseEngine):
             image_cache_key_ranges,
         ) = await loop.run_in_executor(
             self._engine._mlx_executor,
-            self._process_chat_messages,
-            messages,
-            tools,
-            kwargs,
+            partial(
+                self._process_chat_messages,
+                messages,
+                tools,
+                kwargs,
+                preextracted_media=media,
+            ),
         )
 
-        # SpecPrefill: protect the system-prompt region from token dropping.
-        self._inject_specprefill_system_end(messages, prompt, kwargs)
+        # SpecPrefill: compute system prompt token count for protection.
+        # Can't template system-only messages (most templates require user),
+        # so compute by subtracting non-system from full prompt tokens.
+        specprefill_model_enabled = (
+            getattr(self._model_settings, "specprefill_enabled", False)
+            if self._model_settings
+            else False
+        )
+        if specprefill_model_enabled and kwargs.get("specprefill") is not False:
+            try:
+                system_end = await self._specprefill_system_end_async(
+                    messages, len(prompt)
+                )
+                if system_end is not None:
+                    kwargs["specprefill_system_end"] = system_end
+            except Exception as e:
+                logger.debug(f"SpecPrefill: system_end calc failed: {e}")
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -4548,17 +4683,26 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None,
         kwargs: dict,
+        preextracted_media: tuple | None = None,
     ) -> Tuple[
         str | list[int], Any, dict | None, str | None, int, List[Tuple[int, str]]
     ]:
         """
         Process chat messages, extracting images and preparing VLM inputs.
 
+        fork: pass preextracted_media (the extract_images_from_messages
+        result, fetched on the media executor via
+        _extract_chat_media_async) so the network/PIL work doesn't run on
+        the MLX executor thread this method is dispatched to.
+
         Returns:
             Tuple of (prompt_or_token_ids, vlm_embeds, vlm_kwargs, image_hash)
         """
-        # Extract images from messages
-        text_messages, images, audio = extract_images_from_messages(messages)
+        # Extract media from messages
+        if preextracted_media is not None:
+            text_messages, images, audio = preextracted_media
+        else:
+            text_messages, images, audio = extract_images_from_messages(messages)
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
@@ -4586,8 +4730,14 @@ class VLMBatchedEngine(BaseEngine):
 
         if images:
             # Free Metal intermediates from vision encoding.
-            mx.synchronize()
-            mx.clear_cache()
+            # fork: VLMBatchedEngine has no `scheduler` attribute — the old
+            # getattr(self, "scheduler") always returned None, so this clear
+            # never synchronized this engine's own stream before clearing
+            # the shared buffer pool (same race class as #300/#888).
+            engine_core = getattr(self._engine, "engine", None)
+            scheduler = getattr(engine_core, "scheduler", None)
+            stream = getattr(scheduler, "_stream", None)
+            sync_and_clear_mlx_cache(stream)
 
         return (
             token_ids,

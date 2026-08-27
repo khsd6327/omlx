@@ -702,12 +702,17 @@ async def test_contract_error_isolated_in_engine_loop(
         bad_output = await asyncio.wait_for(bad_collector.get(), 5)
         if not peer_waiting:
             peer_output = await asyncio.wait_for(peer_collector.get(), 5)
+        else:
+            assert peer in scheduler.waiting
+            assert peer_collector.get_nowait() is None
         await engine.stop()
         assert bad_output.finish_reason == "error"
         assert bad_output.error == "sample_target called without positions"
         if peer_waiting:
             assert peer in scheduler.waiting
-            assert peer_collector.get_nowait() is None
+            stopped_output = peer_collector.get_nowait()
+            assert stopped_output.finish_reason == "error"
+            assert "engine was stopped" in stopped_output.error
         else:
             assert not peer_output.error
             assert peer.num_output_tokens >= 1
