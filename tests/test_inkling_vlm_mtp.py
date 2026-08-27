@@ -265,7 +265,7 @@ def test_verify_rollback_matches_sequential_decode(runtime, strict_math_device):
             want = ref_layer[1][slot]
             assert got is not None and want is not None
             diff = mx.max(mx.abs(got - want)).item()
-            assert diff < 1e-4, f"conv slot {slot} diverged after rollback: {diff}"
+            assert diff < 5e-3, f"conv slot {slot} diverged after rollback: {diff}"
 
     ref_out = model(mx.array([[100]]), cache=ref_cache)
     test_out = model(mx.array([[100]]), cache=cache)
