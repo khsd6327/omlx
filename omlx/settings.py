@@ -519,6 +519,10 @@ class MemorySettings:
     # aborted via the same cleanup path the hard-limit RuntimeError uses.
     prefill_safe_zone_ratio: float = 0.80
     prefill_min_chunk_tokens: int = 32
+    # Last-resort active-request brake once process memory exceeds the final
+    # ceiling. Margin is bytes over the ceiling; polls is consecutive checks.
+    emergency_over_ceiling_margin_bytes: int = 2 * 1024**3
+    emergency_over_ceiling_polls: int = 2
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -530,6 +534,10 @@ class MemorySettings:
             "hard_threshold": self.hard_threshold,
             "prefill_safe_zone_ratio": self.prefill_safe_zone_ratio,
             "prefill_min_chunk_tokens": self.prefill_min_chunk_tokens,
+            "emergency_over_ceiling_margin_bytes": (
+                self.emergency_over_ceiling_margin_bytes
+            ),
+            "emergency_over_ceiling_polls": self.emergency_over_ceiling_polls,
         }
 
     @classmethod
@@ -548,6 +556,12 @@ class MemorySettings:
             hard_threshold=float(data.get("hard_threshold", 0.95)),
             prefill_safe_zone_ratio=float(data.get("prefill_safe_zone_ratio", 0.80)),
             prefill_min_chunk_tokens=int(data.get("prefill_min_chunk_tokens", 32)),
+            emergency_over_ceiling_margin_bytes=int(
+                data.get("emergency_over_ceiling_margin_bytes", 2 * 1024**3)
+            ),
+            emergency_over_ceiling_polls=int(
+                data.get("emergency_over_ceiling_polls", 2)
+            ),
         )
 
 
@@ -1537,6 +1551,16 @@ class GlobalSettings:
             errors.append(
                 f"prefill_min_chunk_tokens must be in [1, 1024], "
                 f"got {self.memory.prefill_min_chunk_tokens}"
+            )
+        if self.memory.emergency_over_ceiling_margin_bytes < 0:
+            errors.append(
+                "emergency_over_ceiling_margin_bytes must be >= 0, "
+                f"got {self.memory.emergency_over_ceiling_margin_bytes}"
+            )
+        if not 1 <= self.memory.emergency_over_ceiling_polls <= 60:
+            errors.append(
+                "emergency_over_ceiling_polls must be in [1, 60], "
+                f"got {self.memory.emergency_over_ceiling_polls}"
             )
 
         # Scheduler validation
