@@ -350,6 +350,25 @@ class TestBoundarySnapshotSSDStore:
         assert detached_path.parent == self.store._snapshot_root / "_promote"
         assert detached_path.read_bytes() == b"checkpoint"
 
+    def test_take_staged_file_preserves_directory_for_next_writer(self):
+        """Promotion must not remove a directory another writer just created."""
+        request_id = "req-next-writer"
+        staged_path = self.store._file_path(request_id, 1024)
+        staged_path.parent.mkdir(parents=True)
+        staged_path.write_bytes(b"checkpoint")
+
+        # The next writer has completed mkdir but has not opened its temp file.
+        next_path = self.store._file_path(request_id, 2048)
+        next_path.parent.mkdir(parents=True, exist_ok=True)
+        detached_path = self.store.take_staged_file(request_id, 1024)
+        assert detached_path is not None
+        assert detached_path.read_bytes() == b"checkpoint"
+        next_path.write_bytes(b"next checkpoint")
+
+        self.store.cleanup_request(request_id)
+        assert not next_path.parent.exists()
+        assert detached_path.read_bytes() == b"checkpoint"
+
     def test_load_from_disk_after_pending_writes_cleared(self):
         """After background writer completes, load should read from disk."""
         import time

@@ -796,6 +796,29 @@ _ST_DTYPE_TO_NP = {
 }
 
 
+# fork: optional lock serializing mx-buffer access (view+eval and
+# buffer-protocol reads) against buffer-pool clears. The scheduler injects
+# its module-level _mx_buffer_access_lock at import time. Previously the
+# async store-cache worker held that lock across the ENTIRE multi-block
+# store (seconds for long contexts), so any step() needing
+# _sync_and_clear_cache froze token generation for all running requests
+# until the store finished. Holding it only around the per-block extraction
+# preserves the #1106 invariant (no buffer-protocol read concurrent with
+# mx.clear_cache) while letting clears interleave between blocks.
+_mx_buffer_access_lock: Any = None
+
+
+def set_mx_buffer_access_lock(lock: Any) -> None:
+    """Install the lock used to serialize tensor-byte extraction."""
+    global _mx_buffer_access_lock
+    _mx_buffer_access_lock = lock
+
+
+def _buffer_access_guard():
+    lock = _mx_buffer_access_lock
+    return lock if lock is not None else contextlib.nullcontext()
+
+
 def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     """Extract raw bytes from an mx.array.
 
@@ -815,16 +838,51 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     Returns:
         Tuple of (raw_bytes, safetensors_dtype_string, shape_list).
     """
-    mx.eval(arr)
-    dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
-    shape = list(arr.shape)
-    if arr.dtype == mx.bfloat16:
-        u16 = arr.view(mx.uint16)
-        mx.eval(u16)
-        raw = bytes(memoryview(u16))
-    else:
-        raw = bytes(memoryview(arr))
-    return raw, dtype_str, shape
+    # fork: guarded per-call so callers no longer wrap whole stores.
+    with _buffer_access_guard():
+        mx.eval(arr)
+        dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
+        shape = list(arr.shape)
+        if arr.dtype == mx.bfloat16:
+            u16 = arr.view(mx.uint16)
+            mx.eval(u16)
+            raw = bytes(memoryview(u16))
+        else:
+            raw = bytes(memoryview(arr))
+        return raw, dtype_str, shape
+
+
+def _extract_tensors_batch(
+    arrays: dict[str, mx.array],
+) -> dict[str, tuple[bytes, str, list[int]]]:
+    """fork: batched variant of _extract_tensor_bytes.
+
+    One mx.eval for all arrays (plus one for the bf16 uint16 views) instead
+    of 1-2 GPU sync round-trips per tensor — ~80-160 per block on deep
+    models, paid on the store-cache worker while it holds
+    _mx_buffer_access_lock. Semantics identical to looping
+    _extract_tensor_bytes (same race-history rationale: #978/#1040/#1106).
+    """
+    if not arrays:
+        return {}
+    # fork: the lock is held per BLOCK (one batch), not per store — clears
+    # can interleave between blocks of a long-context store.
+    with _buffer_access_guard():
+        mx.eval(*arrays.values())
+        views: dict[str, mx.array] = {}
+        for name, arr in arrays.items():
+            if arr.dtype == mx.bfloat16:
+                views[name] = arr.view(mx.uint16)
+        if views:
+            mx.eval(*views.values())
+        extracted: dict[str, tuple[bytes, str, list[int]]] = {}
+        for name, arr in arrays.items():
+            dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
+            shape = list(arr.shape)
+            view = views.get(name)
+            raw = bytes(memoryview(view if view is not None else arr))
+            extracted[name] = (raw, dtype_str, shape)
+        return extracted
 
 
 def _restore_tensor_from_bytes(
@@ -1726,6 +1784,9 @@ class PagedSSDCacheManager(CacheManager):
             "preload_time_ms": 0.0,
             "ssd_write_drops": 0,
             "ssd_inline_write_fallbacks": 0,
+            "ssd_write_attempts": 0,
+            "ssd_write_latency_total_ms": 0.0,
+            "ssd_write_latency_max_ms": 0.0,
         }
 
         # --- Hot cache (in-memory raw-bytes tier) ---
@@ -2002,9 +2063,8 @@ class PagedSSDCacheManager(CacheManager):
         Returns True when the entry was retained, False on failure.
         """
         try:
-            promoted_raw = {}
-            for name, arr in arrays.items():
-                promoted_raw[name] = _extract_tensor_bytes(arr)
+            # fork: batched extraction (one eval, not per tensor).
+            promoted_raw = _extract_tensors_batch(arrays)
             entry = {
                 "tensors_raw": promoted_raw,
                 "file_metadata": (
@@ -2987,6 +3047,7 @@ class PagedSSDCacheManager(CacheManager):
     ) -> bool:
         """Write one serialized block to disk from raw tensor bytes."""
         temp_path = None
+        write_start = time.perf_counter()
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
@@ -3002,6 +3063,19 @@ class PagedSSDCacheManager(CacheManager):
             # success even if the post-rename eviction check below unlinks it.
             self._stats["saves_persisted"] += 1
             self._index.update_file_size(block_hash, actual_size)
+
+            # The bytes we just persisted are now clean. If the live hot-cache
+            # entry still holds *these exact* bytes (identity match on the
+            # tensors_raw dict we wrote), clear its dirty flag so a later
+            # evict spill won't re-write already-persisted content (write
+            # amplification, issue noted alongside #1777). If the entry is gone
+            # or has been superseded by a newer save_block (different
+            # tensors_raw object), leave it untouched. Only the hot-cache lock
+            # is taken here, preserving the _hot_cache_lock -> *_lock ordering.
+            with self._hot_cache_lock:
+                live = self._hot_cache.get(block_hash)
+                if live is not None and live.get("tensors_raw") is tensors_raw:
+                    live["dirty"] = False
 
             # Check if block was evicted while write was pending.
             if not self._index.contains(block_hash):
@@ -3052,6 +3126,14 @@ class PagedSSDCacheManager(CacheManager):
                     if p is not None and isinstance(p, Path) and p.exists():
                         p.unlink()
             return False
+        finally:
+            elapsed_ms = (time.perf_counter() - write_start) * 1000.0
+            self._stats["ssd_write_attempts"] += 1
+            self._stats["ssd_write_latency_total_ms"] += elapsed_ms
+            self._stats["ssd_write_latency_max_ms"] = max(
+                self._stats["ssd_write_latency_max_ms"],
+                elapsed_ms,
+            )
 
     def _clear_pending_write(
         self, block_hash: bytes, *, remove_hot_cache: bool = False
@@ -3409,16 +3491,15 @@ class PagedSSDCacheManager(CacheManager):
             # Merge CacheList sub_count metadata
             metadata.update(cache_list_meta)
 
-            # Last-mile materialization happens in _extract_tensor_bytes.
+            # Last-mile materialization happens in _extract_tensors_batch.
             # scheduler._cleanup_finished still pre-dispatches real KV arrays,
             # but store_cache creates additional lazy slices, clones, and
             # placeholders here after that collection step. Evaluate those
             # derived arrays before memoryview() so the buffer protocol never
             # becomes the first MLX eval site on the store-cache worker thread.
             # Race history: #978/#1040/#1106/#1437/#1558.
-            tensors_raw = {}
-            for name, arr in arrays.items():
-                tensors_raw[name] = _extract_tensor_bytes(arr)
+            # fork: batched (one eval for the whole block, not per tensor).
+            tensors_raw = _extract_tensors_batch(arrays)
 
             # Estimate file size: raw tensor bytes + safetensors header.
             # The header is JSON-encoded per tensor (name + dtype + shape +
@@ -4859,6 +4940,11 @@ class PagedSSDCacheManager(CacheManager):
                 ],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
+                ssd_write_attempts=self._stats["ssd_write_attempts"],
+                ssd_write_latency_total_ms=self._stats[
+                    "ssd_write_latency_total_ms"
+                ],
+                ssd_write_latency_max_ms=self._stats["ssd_write_latency_max_ms"],
             )
 
     @property
@@ -4940,6 +5026,11 @@ class PagedSSDCacheManager(CacheManager):
                 ],
                 ssd_write_drops=self._stats["ssd_write_drops"],
                 ssd_inline_write_fallbacks=self._stats["ssd_inline_write_fallbacks"],
+                ssd_write_attempts=self._stats["ssd_write_attempts"],
+                ssd_write_latency_total_ms=self._stats[
+                    "ssd_write_latency_total_ms"
+                ],
+                ssd_write_latency_max_ms=self._stats["ssd_write_latency_max_ms"],
             )
 
     def get_stats_dict(self) -> dict[str, Any]:

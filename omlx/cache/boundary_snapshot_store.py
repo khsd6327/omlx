@@ -482,7 +482,7 @@ class BoundarySnapshotSSDStore:
         request_id: str,
         token_count: int,
         *,
-        timeout_s: float = 30.0,
+        timeout_s: float = 60.0,
     ) -> Path | None:
         """Detach a completed staging file for durable sidecar promotion.
 
@@ -503,6 +503,11 @@ class BoundarySnapshotSSDStore:
             while pw_key in self._pending_writes:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    logger.warning(
+                        "Timed out waiting for boundary snapshot promotion %s/%d",
+                        request_id,
+                        token_count,
+                    )
                     return None
                 self._pending_cond.wait(timeout=remaining)
 
@@ -536,8 +541,8 @@ class BoundarySnapshotSSDStore:
             if not self._is_safe_snapshot_path(detached_path):
                 return None
             os.replace(file_path, detached_path)
-            with suppress(OSError):
-                file_path.parent.rmdir()
+            # Another boundary writer may be between mkdir and opening its
+            # temp file. Only request/session cleanup may remove this directory.
             return detached_path
         except Exception as e:
             logger.debug(
