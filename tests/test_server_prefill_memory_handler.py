@@ -470,8 +470,10 @@ class TestStreamingErrorPayload:
         assert body["error"]["omlx_code"] == "prefill_memory_aborted"
         assert "aborted this request mid-prefill" in body["error"]["message"]
 
-    def test_generic_exception_stays_flat_server_error(self):
+    def test_generic_exception_stays_flat_sanitized_server_error(self):
         import omlx.server as srv
 
         body = srv._streaming_error_payload(ValueError("boom"), "chat streaming")
-        assert body == {"error": {"message": "boom", "type": "server_error"}}
+        assert body == {
+            "error": {"message": "Internal server error", "type": "server_error"}
+        }
