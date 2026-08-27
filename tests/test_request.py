@@ -84,6 +84,7 @@ class TestSamplingParams:
         assert params.stop_token_ids == []
         assert params.logprobs is False
         assert params.top_logprobs is None
+        assert params.include_output_token_ids is False
 
     def test_custom_values(self):
         """Test custom sampling parameter values."""
