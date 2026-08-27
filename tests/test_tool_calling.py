@@ -3504,6 +3504,82 @@ class TestToolCallStreamFilterGemma4StrayClose:
         assert result == " extra"
 
 
+class _GemmaDegradedTok:
+    """Gemma-4 tokenizer whose native parser fails (forcing the fallback path),
+    used to exercise degraded/unpaired open-envelope recovery (fork patch)."""
+
+    has_tool_calling = True
+    tool_call_start = "<|tool_call>"
+    tool_call_end = "<tool_call|>"
+
+    def tool_parser(self, text, tools=None):
+        raise ValueError("native parser unavailable")
+
+
+class TestGemma4DegradedEnvelopeRecovery:
+    """fork: gemma-4 MoE degrades the open envelope (<| tool_call>, <|tool_call|>)
+    or emits an unpaired open on continuation turns; the canonical paired regex
+    misses it and the markup leaked into content. Recovery must restore the call
+    WITHOUT fabricating calls from prose."""
+
+    @staticmethod
+    def _names(calls):
+        return [c.function.name for c in (calls or [])]
+
+    def test_recovers_spaced_open_spelling(self):
+        cleaned, calls = parse_tool_calls(
+            "I will check.<| tool_call>call:canvas_due_soon{}<tool_call|>",
+            _GemmaDegradedTok(),
+            tools=None,
+        )
+        assert self._names(calls) == ["canvas_due_soon"]
+        assert "tool_call" not in cleaned
+        assert cleaned == "I will check."
+
+    def test_recovers_double_pipe_open(self):
+        cleaned, calls = parse_tool_calls(
+            "x<|tool_call|>call:canvas_due_soon{}<tool_call|>",
+            _GemmaDegradedTok(),
+            tools=None,
+        )
+        assert self._names(calls) == ["canvas_due_soon"]
+
+    def test_recovers_unpaired_open_no_close(self):
+        cleaned, calls = parse_tool_calls(
+            'x<|tool_call>call:canvas_assignments{"course_id": 33127}',
+            _GemmaDegradedTok(),
+            tools=None,
+        )
+        assert self._names(calls) == ["canvas_assignments"]
+        assert calls[0].function.arguments == '{"course_id": 33127}'
+
+    def test_canonical_paired_envelope_still_parses(self):
+        cleaned, calls = parse_tool_calls(
+            "ok<|tool_call>call:canvas_todo{}<tool_call|>",
+            _GemmaDegradedTok(),
+            tools=None,
+        )
+        assert self._names(calls) == ["canvas_todo"]
+        assert cleaned == "ok"
+
+    def test_prose_with_braces_does_not_fabricate(self):
+        for prose in [
+            "Use the config{retries: 3} block.",
+            "def f(): pass",
+            "{x : x > 0}",
+            "I would emit <|tool_call> here normally.",
+        ]:
+            cleaned, calls = parse_tool_calls(prose, _GemmaDegradedTok(), tools=None)
+            assert not calls, f"fabricated a call from prose: {prose!r}"
+
+    def test_non_gemma_start_marker_does_not_trigger_recovery(self):
+        tok = _GemmaDegradedTok()
+        tok.tool_call_start = "<tool_call>"
+        tok.tool_call_end = "</tool_call>"
+        cleaned, calls = parse_tool_calls("plain answer, no tools", tok, tools=None)
+        assert not calls
+
+
 class TestSchemaAwareFallbackCoercion:
     """Regression tests for issue #2332.
 

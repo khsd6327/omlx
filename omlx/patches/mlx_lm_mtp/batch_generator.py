@@ -72,6 +72,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
+import types
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -128,10 +130,20 @@ def apply() -> bool:
     not touched by dflash so the leftover-class-patch risk that motivates
     self-healing elsewhere doesn't apply here.
     """
+    root = sys.modules.get("mlx_lm")
+    if root is not None and (
+        not isinstance(root, types.ModuleType) or not hasattr(root, "__path__")
+    ):
+        logger.debug("mlx_lm root is not a package")
+        return False
+
     try:
         from mlx_lm.generate import BatchGenerator, GenerationBatch
     except ImportError:
         logger.debug("mlx_lm.generate GenerationBatch/BatchGenerator not importable")
+        return False
+    if not isinstance(GenerationBatch, type):
+        logger.debug("mlx_lm.generate.GenerationBatch is not a class")
         return False
 
     if not hasattr(GenerationBatch, "_omlx_mtp_patched"):

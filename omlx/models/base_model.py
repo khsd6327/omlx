@@ -59,6 +59,33 @@ def mean_pooling(hidden_states: mx.array, attention_mask: mx.array) -> mx.array:
     return sum_embeddings / sum_mask
 
 
+def max_pooling(hidden_states: mx.array, attention_mask: mx.array) -> mx.array:
+    """
+    Perform max pooling over sequence with attention mask.
+
+    Masked tokens are assigned a very negative value before the sequence max.
+    """
+    mask_expanded = attention_mask[:, :, None].astype(hidden_states.dtype)
+    masked_hidden = mx.where(
+        mask_expanded > 0,
+        hidden_states,
+        mx.ones_like(hidden_states) * -1e9,
+    )
+    return mx.max(masked_hidden, axis=1)
+
+
+def mean_sqrt_len_pooling(
+    hidden_states: mx.array, attention_mask: mx.array
+) -> mx.array:
+    """
+    Perform mean-sqrt-length pooling over sequence with attention mask.
+    """
+    mask_expanded = attention_mask[:, :, None].astype(hidden_states.dtype)
+    sum_embeddings = mx.sum(hidden_states * mask_expanded, axis=1)
+    sum_mask = mx.clip(mx.sum(mask_expanded, axis=1), a_min=1e-9, a_max=None)
+    return sum_embeddings / mx.sqrt(sum_mask)
+
+
 def last_token_pool(
     hidden_states: mx.array, attention_mask: Optional[mx.array] = None
 ) -> mx.array:
@@ -99,4 +126,9 @@ def normalize_embeddings(embeddings: mx.array) -> mx.array:
     Returns:
         Normalized embeddings with same shape
     """
-    return embeddings / mx.linalg.norm(embeddings, axis=-1, keepdims=True)
+    norm = mx.clip(
+        mx.linalg.norm(embeddings, axis=-1, keepdims=True),
+        a_min=1e-12,
+        a_max=None,
+    )
+    return embeddings / norm

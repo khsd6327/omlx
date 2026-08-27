@@ -49,6 +49,8 @@ The patch is intentionally limited to ``mlx_lm.models.qwen3_5``; mlx-vlm's
 from __future__ import annotations
 
 import logging
+import sys
+import types
 from typing import Any, Optional
 
 from ..dflash_lifecycle import get_dflash_guard_base, set_dflash_guard_base
@@ -79,10 +81,37 @@ def apply() -> bool:
     No module-level "patched once" flag so dflash → mtp transitions in
     the same process re-establish ownership (issue #1388).
     """
+    root = sys.modules.get("mlx_lm")
+    if root is not None and (
+        not isinstance(root, types.ModuleType) or not hasattr(root, "__path__")
+    ):
+        logger.debug("mlx_lm root is not a package; skipping MTP patch")
+        return False
+
     try:
         from mlx_lm.models import qwen3_5 as q35
     except ImportError:
         logger.debug("mlx_lm.models.qwen3_5 not importable; skipping MTP patch")
+        return False
+    if not isinstance(q35, types.ModuleType):
+        logger.debug("mlx_lm.models.qwen3_5 is not a module; skipping MTP patch")
+        return False
+    required_classes = (
+        "TextModelArgs",
+        "GatedDeltaNet",
+        "DecoderLayer",
+        "Qwen3_5TextModel",
+        "TextModel",
+        "Model",
+    )
+    missing = [
+        name for name in required_classes if not isinstance(getattr(q35, name, None), type)
+    ]
+    if missing:
+        logger.debug(
+            "mlx_lm.models.qwen3_5 missing expected classes for MTP patch: %s",
+            ", ".join(missing),
+        )
         return False
 
     # Skip if upstream already merged PR 990: TextModel already has mtp_forward.

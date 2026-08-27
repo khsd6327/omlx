@@ -12,11 +12,9 @@ import gc
 import logging
 from typing import Any, Dict, List, Optional, Union
 
-import mlx.core as mx
-
 from ..engine_core import get_mlx_executor
 from ..models.embedding import EmbeddingOutput, MLXEmbeddingModel
-from .base import BaseNonStreamingEngine
+from .base import BaseNonStreamingEngine, sync_and_clear_mlx_cache
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +114,8 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         self._model = None
 
         gc.collect()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(get_mlx_executor(), sync_and_clear_mlx_cache)
         logger.info(f"Embedding engine stopped: {self._model_name}")
 
     async def embed(
@@ -178,8 +178,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                             truncation=truncation,
                         )
                     finally:
-                        mx.synchronize()
-                        mx.clear_cache()
+                        sync_and_clear_mlx_cache()
 
                 output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
                 embeddings.extend(output.embeddings)

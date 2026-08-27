@@ -1021,6 +1021,59 @@ class TestOutputParserFactory:
         assert content == "Four"
 
 
+class TestGemma4HeadlessThoughtMarker:
+    """fork: on a tool-continuation turn the chat template fails to prime
+    `<|channel>thought`, so gemma-4 emits a HEADLESS `thought\\n…<channel|>`
+    (leading `<|channel>` open token absent). The parser must treat a leading
+    `thought\\n` as an implicit thought-open so reasoning is separated, WITHOUT
+    misfiring on legitimate content that merely starts with the word "thought"."""
+
+    @staticmethod
+    def _run(token_map, ids):
+        tokenizer = GemmaTokenizer(token_map)
+        session = Gemma4OutputParserSession(tokenizer)
+        stream = []
+        for tid in ids:
+            stream.append(session.process_token(tid).stream_text)
+        stream.append(session.finalize().stream_text)
+        return "".join(stream)
+
+    def test_headless_thought_is_separated(self):
+        out = self._run(
+            {1: "thought\n", 2: "the user wants X", 3: "<channel|>", 4: "Real answer."},
+            [1, 2, 3, 4],
+        )
+        assert out == "<think>\nthe user wants X</think>\nReal answer."
+        assert "thought" not in out.split("</think>")[1]
+
+    def test_headless_thought_with_leading_newline(self):
+        out = self._run(
+            {1: "\nthought\n", 2: "reasoning", 3: "<channel|>", 4: "answer"},
+            [1, 2, 3, 4],
+        )
+        assert out == "<think>\nreasoning</think>\nanswer"
+
+    def test_headless_thought_split_across_tokens(self):
+        out = self._run(
+            {1: "thou", 2: "ght\nreasoning", 3: "<channel|>", 4: "answer"},
+            [1, 2, 3, 4],
+        )
+        assert out == "<think>\nreasoning</think>\nanswer"
+
+    def test_content_starting_with_thought_word_is_not_reasoning(self):
+        # "thoughts about" must NOT be treated as a thought-open (no newline).
+        out = self._run({1: "thoughts about cats are nice"}, [1])
+        assert out == "thoughts about cats are nice"
+        assert "<think>" not in out
+
+    def test_canonical_open_still_works_with_head_guard(self):
+        out = self._run(
+            {1: "<|channel>", 2: "thought\n", 3: "reasoning", 4: "<channel|>", 5: "ans"},
+            [1, 2, 3, 4, 5],
+        )
+        assert out == "<think>\nreasoning</think>\nans"
+
+
 class InklingTokenizer:
     def __init__(self, token_map: dict[int, str]):
         self._token_map = token_map

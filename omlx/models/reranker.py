@@ -419,6 +419,25 @@ class MLXRerankerModel:
             )
             return native_affixes
 
+        # Older Qwen reranker conversions may ignore every supplied content
+        # slot and render an empty reranker scaffold. The scaffold still gives
+        # us exact affix boundaries, so recover them without tying the fallback
+        # to a model name or repository layout.
+        empty_content_block = (
+            f"<Instruct>: {self._CAUSAL_LM_SYSTEM_PROMPT}\n"
+            "<Query>: \n<Document>: "
+        )
+        legacy_parts = standard_rendered.split(empty_content_block)
+        if len(legacy_parts) == 2:
+            suffix = legacy_parts[1]
+            if "<think>" not in suffix:
+                suffix += "<think>\n\n</think>\n\n"
+            logger.info(
+                "Using empty reranker-scaffold chat template fallback for "
+                f"{self.model_name}"
+            )
+            return legacy_parts[0], suffix
+
         raise ValueError(
             f"Could not extract CausalLM reranker prompt affixes for "
             f"{self.model_name}. "

@@ -39,7 +39,7 @@ async def test_vlm_chat_forwards_specprefill_threshold_and_keep_pct():
     engine._engine.stream_outputs = _one_output_stream
 
     # Mock _process_chat_messages to skip mlx-vlm template processing
-    def _mock_process(messages, tools, kwargs):
+    def _mock_process(messages, tools, kwargs, preextracted_media=None):
         return "<prompt>", None, {}, None, None, []
 
     with patch.object(engine, "_process_chat_messages", side_effect=_mock_process):
@@ -151,7 +151,7 @@ class TestVLMEngineSpecPrefillForwarding:
         engine._tokenizer.apply_chat_template.return_value = "USER_ONLY"
         engine._tokenizer.encode.side_effect = lambda text, **kwargs: [0] * 4
 
-        def _mock_process(messages, tools, kwargs):
+        def _mock_process(messages, tools, kwargs, preextracted_media=None):
             return list(range(10)), None, None, None, 0, []
 
         messages = [
@@ -180,7 +180,7 @@ class TestVLMEngineSpecPrefillForwarding:
         engine._tokenizer.apply_chat_template.return_value = "USER_ONLY"
         engine._tokenizer.encode.side_effect = lambda text, **kwargs: [0] * 4
 
-        def _mock_process(messages, tools, kwargs):
+        def _mock_process(messages, tools, kwargs, preextracted_media=None):
             return list(range(8)), None, None, None, 0, []
 
         messages = [

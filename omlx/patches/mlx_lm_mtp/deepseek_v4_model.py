@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import types
 from typing import Any, Dict
 
 from . import deepseek_v4_dspark, prompt_priming
@@ -46,8 +47,19 @@ def apply() -> bool:
     Self-healing: re-runs sub-patches when class state has drifted (see
     qwen35_model.apply for the same pattern).
     """
+    root = sys.modules.get("mlx_lm")
+    if root is not None and (
+        not isinstance(root, types.ModuleType) or not hasattr(root, "__path__")
+    ):
+        logger.debug("mlx_lm root is not a package; skipping DeepSeek-V4 MTP patch")
+        return False
+
     dsv4 = sys.modules.get("mlx_lm.models.deepseek_v4")
-    if dsv4 is None or not hasattr(dsv4, "Model"):
+    if (
+        dsv4 is None
+        or not isinstance(dsv4, types.ModuleType)
+        or not isinstance(getattr(dsv4, "Model", None), type)
+    ):
         # Base DeepSeek-V4 patch hasn't registered the module yet. This
         # branch only hits when MTP is enabled on a non-DeepSeek model —
         # log and skip cleanly.

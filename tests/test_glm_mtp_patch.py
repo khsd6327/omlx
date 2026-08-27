@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.utils as mu
 import pytest
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
 from omlx.patches.mlx_lm_mtp import apply_mlx_lm_mtp_patch, set_mtp_active
 
@@ -62,6 +63,10 @@ TINY_CFG = dict(
     indexer_types=["full", "shared"],
     num_nextn_predict_layers=1,
 )
+
+# M5 NAX matmuls use a different reduction order than earlier Apple GPUs.
+# Keep the original strict tolerance everywhere else.
+_SMALL_L_ROUTING_ATOL = 5e-4 if is_nax_available() else 2e-5
 
 
 @pytest.fixture()
@@ -566,7 +571,7 @@ class TestSmallLRouting:
             legacy = run(L, 1)
             absorbed = run(L, 8)
             diff = float(mx.abs(legacy - absorbed).max())
-            assert diff < 2e-5, f"L={L}: {diff}"
+            assert diff < _SMALL_L_ROUTING_ATOL, f"L={L}: {diff}"
 
     def test_topk_gather_matches_masked_reference(
         self, glm, mtp_active, strict_math_device
@@ -607,4 +612,4 @@ class TestSmallLRouting:
             idx, prefix = gm._parse_topk_state(state)
             assert idx is not None and idx.shape[2] == L and prefix == 0
             diff = float(mx.abs(legacy - gathered).max())
-            assert diff < 2e-5, f"L={L}: {diff}"
+            assert diff < _SMALL_L_ROUTING_ATOL, f"L={L}: {diff}"
