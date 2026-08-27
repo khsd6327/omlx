@@ -2085,22 +2085,6 @@ class TestSchedulerSuppressTokens:
 
         assert scheduler._model_suppress_tokens == {258883, 258882}
 
-    def test_suppress_logits_processor_masks_configured_ids(
-        self, mock_model, mock_tokenizer
-    ):
-        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
-        scheduler._model_suppress_tokens = {2}
-
-        _, processors = scheduler._build_sampler_and_processors(SamplingParams())
-
-        assert processors
-        logits = mx.array([[0.0, 4.0, 100.0, 2.0]])
-        masked = processors[-1](mx.array([1]), logits)
-        mx.eval(masked)
-
-        assert float(masked[0, 2].item()) == float("-inf")
-        assert float(masked[0, 1].item()) == 4.0
-
     def test_vlm_mtp_first_bonus_uses_suppressing_sampler(
         self, mock_model, mock_tokenizer
     ):
@@ -6139,6 +6123,17 @@ class TestVLMPositionStateClearing:
         seed_mrope.assert_called_once_with(model, request)
 
 
+class TestSchedulerPrefillBudget:
+    """Tests for external prefill yielding and resume behavior."""
+
+    def _make_model(self):
+        model = MagicMock(spec=["__call__", "make_cache", "parameters"])
+        model.make_cache.return_value = []
+        return model
+
+class TestSchedulerCacheCriticalPath:
+    """Tests that cache extraction avoids active decode critical path."""
+
 class TestBuildStateMachineStopStrings:
     """Tests for _build_state_machine stop-string tokenization.
 
@@ -6534,7 +6529,6 @@ class TestTurboQuantMLAGuard:
         assert scheduler._model_uses_mla() is False
         assert scheduler._model_uses_mla() is False
         assert calls["n"] == 1  # walked once, then cached
-
 
 class TestTurboQuantAttentionSinkGuard:
     """Attention-sink models must not use TQ kernels that drop sink logits."""

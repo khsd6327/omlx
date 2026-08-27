@@ -12,6 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -166,6 +167,12 @@ class BlockCacheEntry:
     last_access: float
 
 
+# fork: cap on _prefix_index entries (each stores a block-id tuple, so the
+# unbounded dict grew quadratically with stored sequence length and was
+# never evicted).
+_PREFIX_INDEX_MAX_ENTRIES = 4096
+
+
 class BlockAwarePrefixCache(CacheManager):
     """
     Prefix cache that uses PagedCacheManager for block-based storage.
@@ -228,7 +235,14 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Hash table for quick prefix lookup
         # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
-        self._prefix_index: dict[bytes, tuple[int, tuple[int, ...], int]] = {}
+        # fork: bounded LRU (entries were never evicted — B(B+1)/2 ints per
+        # stored sequence, a steady metadata leak on a 24/7 server) and
+        # guarded by a lock (fetch runs on the MLX executor thread, store on
+        # the async-store thread).
+        self._prefix_index: OrderedDict[bytes, tuple[int, tuple[int, ...], int]] = (
+            OrderedDict()
+        )
+        self._prefix_index_lock = threading.Lock()
 
         # Tie the index lifecycle to the paged cache's hash associations.
         # Without these hooks the index only ever grew (entries were dropped
@@ -710,7 +724,8 @@ class BlockAwarePrefixCache(CacheManager):
                 if block is None:
                     # Chain broken: self-heal the stale index entry so the
                     # next lookup does not walk the same dead chain.
-                    self._prefix_index.pop(chain_hashes[num_blocks - 1], None)
+                    with self._prefix_index_lock:
+                        self._prefix_index.pop(chain_hashes[num_blocks - 1], None)
                     break
                 acquired.append(block)
 
@@ -4692,8 +4707,7 @@ class BlockAwarePrefixCache(CacheManager):
             Tuple of (prefix_len, block_ids, num_blocks, chain_hashes) where
             chain_hashes holds the per-block chain hash for each matched
             block, or None when nothing matched. The hashes let the caller
-            re-validate that the indexed blocks still hold the content they
-            were indexed for before reusing them.
+            identify the matched block chain.
         """
         best_match = None
         best_len = 0
@@ -4719,7 +4733,10 @@ class BlockAwarePrefixCache(CacheManager):
             num_blocks += 1
             chain_hashes.append(parent_hash)
 
-            entry = self._prefix_index.get(parent_hash)
+            with self._prefix_index_lock:
+                entry = self._prefix_index.get(parent_hash)
+                if entry is not None:
+                    self._prefix_index.move_to_end(parent_hash)
             if entry and entry[0] == prefix_len and prefix_len > best_len:
                 best_match = entry
                 best_len = prefix_len
@@ -4764,11 +4781,16 @@ class BlockAwarePrefixCache(CacheManager):
 
             parent_hash = block_hash
             prefix_len += len(block_tokens)
-            self._prefix_index[block_hash] = (
-                prefix_len,
-                tuple(block_ids[: i + 1]),
-                i + 1,
-            )
+            # fork: bounded LRU insert (see __init__).
+            with self._prefix_index_lock:
+                self._prefix_index[block_hash] = (
+                    prefix_len,
+                    tuple(block_ids[: i + 1]),
+                    i + 1,
+                )
+                self._prefix_index.move_to_end(block_hash)
+                while len(self._prefix_index) > _PREFIX_INDEX_MAX_ENTRIES:
+                    self._prefix_index.popitem(last=False)
 
     def _on_block_hash_dropped(self, block_hash: bytes) -> None:
         """Drop the prefix-index entry for a dead block-hash association.
@@ -4778,13 +4800,15 @@ class BlockAwarePrefixCache(CacheManager):
         association ceases to exist. dict.pop is GIL-atomic, so this is safe
         from any thread; it must not call back into the paged cache.
         """
-        self._prefix_index.pop(block_hash, None)
+        with getattr(self, "_prefix_index_lock", nullcontext()):
+            self._prefix_index.pop(block_hash, None)
         with self._mtp_prefix_snapshot_lock:
             self._mtp_prefix_snapshots.pop(block_hash, None)
 
     def _on_hash_map_cleared(self) -> None:
         """Drop all prefix-index entries after a wholesale hash-map clear."""
-        self._prefix_index.clear()
+        with getattr(self, "_prefix_index_lock", nullcontext()):
+            self._prefix_index.clear()
         with self._mtp_prefix_snapshot_lock:
             self._mtp_prefix_snapshots.clear()
 
@@ -4886,7 +4910,6 @@ class BlockAwarePrefixCache(CacheManager):
                 return None
             self._mtp_prefix_snapshots.move_to_end(tip)
             return entry[1]
-
     def get_stats(self) -> PrefixCacheStats:
         """
         Get cache statistics.
@@ -4989,7 +5012,8 @@ class BlockAwarePrefixCache(CacheManager):
             len(self._request_tables) + len(self._prefix_index) + mtp_snapshot_count
         )
         self._request_tables.clear()
-        self._prefix_index.clear()
+        with getattr(self, "_prefix_index_lock", nullcontext()):
+            self._prefix_index.clear()
         with self._mtp_prefix_snapshot_lock:
             self._mtp_prefix_snapshots.clear()
         self.paged_cache.clear()

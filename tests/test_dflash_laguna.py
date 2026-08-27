@@ -494,5 +494,11 @@ def test_target_ops_logits_last_only_slices_before_lm_head():
         logits_last_only=True,
     )
     assert last_only.shape == (1, 1, full.shape[-1])
-    _assert_close(last_only, full[:, -1:, :])
+    # MLX may select a different head-matmul frame for [1, 1, H] than for
+    # [B, L, H]. The M5 GPU path is still token-equivalent but can diverge by
+    # roughly 1e-3, so keep this hardware-portable and pin greedy parity too.
+    _assert_close(last_only, full[:, -1:, :], atol=2e-3)
+    assert int(mx.argmax(last_only[0, 0]).item()) == int(
+        mx.argmax(full[0, -1]).item()
+    )
     assert set(captured) == {1, -1}

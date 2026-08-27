@@ -240,6 +240,16 @@ class _StopOutputState:
     pending: deque[tuple[int, RequestOutput]] = field(default_factory=deque)
 
 
+# fork: install the lock at the actual mx-buffer access site (per-block
+# tensor extraction in the SSD save path) so the store worker no longer has
+# to hold it across an entire multi-GB store_cache call — which froze
+# step()'s _sync_and_clear_cache (and thus ALL decode) for seconds after
+# every long-context completion.
+from .cache import paged_ssd_cache as _paged_ssd_cache_mod  # noqa: E402
+
+_paged_ssd_cache_mod.set_mx_buffer_access_lock(_mx_buffer_access_lock)
+
+
 def _safe_sync_stream(stream=None):
     """mx.synchronize(stream) that tolerates cross-thread calls.
 
@@ -2083,6 +2093,9 @@ class Scheduler:
         # Track in-flight store futures per request_id for lookup wait /
         # shutdown wait.
         self._inflight_store_futures: dict[str, concurrent.futures.Future] = {}
+        # fork: count async store-cache submit failures so silent cache-store
+        # loss is observable (bumped where the submit except-handler logs).
+        self._async_store_submit_failures: int = 0
         self._inflight_store_info: dict[str, _InflightStoreInfo] = {}
         # Admission-only cache freshness waits. A waiting request can pause at
         # the front of the queue for a relevant in-flight store without
@@ -2310,10 +2323,7 @@ class Scheduler:
             self._phase_count[phase] += 1
 
     def get_phase_stats(self) -> dict[str, dict[str, float]]:
-        """Return accumulated phase timings for diagnostics.
-
-        Returns dict of phase -> {total_ms, count, avg_ms}.
-        """
+        """Return accumulated phase timings for diagnostics."""
         result = {}
         for phase, total in self._phase_total_ms.items():
             count = self._phase_count.get(phase, 0)
@@ -2439,10 +2449,10 @@ class Scheduler:
           work); correctness no longer depends on its cross-thread
           mx.synchronize, whose "no Stream" RuntimeError it tolerantly
           swallows.
-        - All mx-buffer access here is held under _mx_buffer_access_lock,
-          serializing the bf16 view+eval and the buffer-protocol reads
-          against inference-thread _sync_and_clear_cache (which also takes
-          that lock), so mx.clear_cache cannot reclaim a buffer mid-read.
+        - mx-buffer access is serialized at the tensor extraction boundary
+          inside paged_ssd_cache, so mx.clear_cache cannot reclaim a buffer
+          mid-read without holding the lock across an entire multi-block
+          store.
         - batch_generator.remove(uid) is deferred until this worker
           completes (handled by _drain_pending_async_removes).
 
@@ -2450,38 +2460,29 @@ class Scheduler:
         threading.RLock so concurrent access from main and worker is safe.
         """
         try:
-            # Hold _mx_buffer_access_lock across the worker's mx-buffer
-            # access. store_cache eventually drives _extract_tensor_bytes,
-            # which reads raw bytes via the buffer protocol; serializing
-            # against inference-thread mx.clear_cache / mx.synchronize calls
-            # prevents a SIGABRT when those reclaim the underlying Metal
-            # buffer pool mid-read (#1106).
-            with _mx_buffer_access_lock:
-                with self._phase_timer("store_cache_worker_sync"):
-                    _safe_sync_stream(self._stream)
-                if hot_cache_write_back:
-                    block_table = self.block_aware_cache.store_cache(
-                        request_id,
-                        token_sequence_to_store,
-                        cache_to_store,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=intermediate_snapshots,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                    )
-                else:
-                    block_table = self.block_aware_cache.store_cache(
-                        request_id,
-                        token_sequence_to_store,
-                        cache_to_store,
-                        model_cache_config=model_cache_config,
-                        boundary_snapshots=intermediate_snapshots,
-                        extra_keys=extra_keys,
-                        extra_key_token_start=extra_key_token_start,
-                        extra_key_ranges=extra_key_ranges,
-                        hot_cache_write_back=False,
-                    )
+            # fork: _mx_buffer_access_lock is no longer held across the
+            # whole store. The #1106 invariant (no buffer-protocol read /
+            # bf16 view+eval concurrent with mx.clear_cache) is enforced at
+            # the per-block extraction site inside paged_ssd_cache
+            # (_extract_tensors_batch via set_mx_buffer_access_lock), so a
+            # deferred clear in step() can interleave between blocks instead
+            # of blocking all decode for the duration of a multi-GB store.
+            with self._phase_timer("store_cache_worker_sync"):
+                _safe_sync_stream(self._stream)
+            store_kwargs = {}
+            if not hot_cache_write_back:
+                store_kwargs["hot_cache_write_back"] = False
+            block_table = self.block_aware_cache.store_cache(
+                request_id,
+                token_sequence_to_store,
+                cache_to_store,
+                model_cache_config=model_cache_config,
+                boundary_snapshots=intermediate_snapshots,
+                extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+                **store_kwargs,
+            )
             if block_table is None and self.paged_cache_manager is not None:
                 block_table = self.paged_cache_manager.get_block_table(request_id)
             if block_table and self.paged_cache_manager is not None:
@@ -2981,15 +2982,15 @@ class Scheduler:
         because internal state (byte buffers) can leak between requests even after
         finalize()/reset(), causing text corruption (e.g., spaces inserted in paths,
         character swaps like 'features' -> 'featurse').
+
         """
         if request_id not in self._request_detokenizers:
-            # Always create a fresh detokenizer - no pooling to prevent state contamination
+            # Always create a fresh detokenizer to prevent state contamination.
             detok = create_streaming_detokenizer(
                 self.tokenizer,
                 model_path=self.config.model_path,
             )
             if detok is None:
-                # Fallback: return None, we'll use decode([token])
                 return None
             detok.reset()
             self._request_detokenizers[request_id] = detok
@@ -8781,6 +8782,7 @@ class Scheduler:
                 draft_block_size=self._vlm_mtp_draft_block_size,
                 token_dtype=mx.int32,
                 eos_token_ids=eos_ids or None,
+                clear_cache=lambda: _sync_and_clear_cache(self._stream),
             )
         except Exception as e:
             logger.warning(
@@ -9352,8 +9354,23 @@ class Scheduler:
                 r for r in self.prefilling if r.request_id != request_id
             )
 
+        # fork: a same-step abort must NOT tear down the batch/uid maps while an
+        # async store_cache worker is still slicing this request's KV buffers
+        # under _mx_buffer_access_lock. _cleanup_finished defers the
+        # batch_generator.remove + uid-map deletion to _drain_pending_async_removes
+        # (which runs AFTER _process_pending_aborts in step()). If we removed the
+        # uid here we'd race the worker (Metal 'prepare count underflow') and the
+        # later drain would double-free / leak the store gate. So when this
+        # request has an in-flight store future (or is already queued for a
+        # deferred remove), skip the teardown below and let the drain finalize it.
+        has_inflight_store = (
+            request.request_id in self._inflight_store_futures
+            or any(
+                rid == request.request_id for _uid, rid, _f in self._pending_async_removes
+            )
+        )
         # Remove from running (BatchGenerator)
-        if request.request_id in self.request_id_to_uid:
+        if request.request_id in self.request_id_to_uid and not has_inflight_store:
             uid = self.request_id_to_uid[request.request_id]
             # Synchronize in-flight GPU work before modifying batch state.
             # batch_generator.remove() triggers lazy KV cache array slicing
@@ -9380,27 +9397,33 @@ class Scheduler:
         # Restore RoPE if this was the active specprefill request. Aborted
         # requests never flow through _cleanup_finished, so without this the
         # wrapper leaks and the specprefill guard defers all other requests
-        # forever (#766).
+        # forever.
         self._cleanup_specprefill(request_id)
 
-        # Release blocks for eviction (same as _cleanup_finished)
-        if self.paged_cache_manager is not None:
-            block_table = self.paged_cache_manager.get_block_table(request_id)
-            if block_table is None and hasattr(request, "block_table"):
-                block_table = request.block_table
-            if block_table:
-                released = self.paged_cache_manager.release_for_eviction(
-                    block_table.block_ids
-                )
-                if released > 0:
-                    logger.debug(
-                        f"Released {released} blocks for eviction on abort "
-                        f"(request {request_id})"
+        # fork: when an async store_cache future is in flight, the deferred
+        # _drain_pending_async_removes path is the single owner of block
+        # release, boundary-snapshot rmtree, and the self.requests pop (it must
+        # keep _extracted_cache / blocks alive until the worker finishes). Skip
+        # those teardown steps here and let the drain finalize them.
+        if not has_inflight_store:
+            # Release blocks for eviction (same as _cleanup_finished)
+            if self.paged_cache_manager is not None:
+                block_table = self.paged_cache_manager.get_block_table(request_id)
+                if block_table is None and hasattr(request, "block_table"):
+                    block_table = request.block_table
+                if block_table:
+                    released = self.paged_cache_manager.release_for_eviction(
+                        block_table.block_ids
                     )
+                    if released > 0:
+                        logger.debug(
+                            f"Released {released} blocks for eviction on abort "
+                            f"(request {request_id})"
+                        )
 
-        # Clear request entry from block_aware_cache
-        if self.block_aware_cache is not None:
-            self.block_aware_cache.clear_request_entry(request_id)
+            # Clear request entry from block_aware_cache
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.clear_request_entry(request_id)
 
         # Clean up streaming detokenizer to prevent state contamination
         self._cleanup_detokenizer(request_id)
@@ -9414,9 +9437,12 @@ class Scheduler:
         if hasattr(self.model, "clear_pending_embeddings"):
             self.model.clear_pending_embeddings()
 
-        # Drop any boundary snapshot for this request.
+        # Drop any boundary snapshot for this request. The in-memory dict pop is
+        # always safe; the on-disk rmtree races the worker's load() calls, so
+        # fork: defer cleanup_request to _drain_pending_async_removes when a
+        # store future is in flight (mirrors _cleanup_finished).
         self._boundary_cache_snapshots.pop(request_id, None)
-        if self._boundary_snapshot_store is not None:
+        if self._boundary_snapshot_store is not None and not has_inflight_store:
             self._boundary_snapshot_store.cleanup_request(request_id)
 
         # Remove from prefill progress tracker.
@@ -9430,10 +9456,16 @@ class Scheduler:
         # MLX arrays promptly (mirrors _cleanup_finished behavior).
         # _cleanup_request (engine_core) no longer calls remove_finished_request,
         # so this is the single cleanup point for aborted requests.
-        req_to_remove = self.requests.pop(request_id, None)
-        if req_to_remove is not None:
-            req_to_remove._extracted_cache = None
-            req_to_remove.prompt_cache = None
+        # fork: but if an async store_cache worker is still reading this
+        # request's KV buffers, popping it (and nulling _extracted_cache /
+        # prompt_cache) would free buffers mid-slice. Leave the request in
+        # self.requests so reachability keeps the buffers alive; the matching
+        # _pending_async_removes entry finalizes the pop + gate note_done.
+        if not has_inflight_store:
+            req_to_remove = self.requests.pop(request_id, None)
+            if req_to_remove is not None:
+                req_to_remove._extracted_cache = None
+                req_to_remove.prompt_cache = None
 
         # Schedule the deferred Metal clear that _cleanup_finished would have
         # scheduled: aborts free KV/activation arrays into MLX's buffer pool
@@ -9536,6 +9568,15 @@ class Scheduler:
         Returns:
             List of failed request IDs.
         """
+        # fork: restore SpecPrefill RoPE patches before tearing requests
+        # down. If the active specprefill request is among the failures the
+        # finished-path cleanup never runs, leaving the offset RoPE patched
+        # model-wide and the admission gate wedged (mirrors
+        # _recover_from_generation_overflow_error).
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
+
         failed_ids: list[str] = []
         for request_id in list(self.running):
             failed_ids.append(request_id)
@@ -10675,7 +10716,27 @@ class Scheduler:
                     self.request_id_to_uid.pop(request.request_id, None)
                     self._release_paged_cache_for_request(request.request_id)
                     get_prefill_tracker().remove(request.request_id)
-                    self._pause_for_prefill_eviction(request, e.request)
+                    # fork: _do_external_prefill advances request.prompt_cache
+                    # in place chunk by chunk. Pausing without a reset lets the
+                    # retry re-prefill the full remaining_tokens into the
+                    # already-advanced cache (duplicate KV / shifted
+                    # positions), with block_table still pointing at the
+                    # blocks released above. Restore the stashed mRoPE deltas
+                    # (the normal post-prefill restore never ran), drop any
+                    # SpecPrefill patch so the retry re-scores cleanly, and
+                    # reset to a clean pre-prefill state.
+                    saved = getattr(request, "_prefill_saved_rope_deltas", None)
+                    if saved is not None:
+                        lm = getattr(self.model, "_language_model", None)
+                        if lm is not None and hasattr(lm, "_rope_deltas"):
+                            lm._rope_deltas = saved
+                        request._prefill_saved_rope_deltas = None
+                    self._cleanup_specprefill(request.request_id)
+                    self._pause_for_prefill_eviction(
+                        request,
+                        e.request,
+                        reset_chunked_state=True,
+                    )
                     break
                 except PrefillMemoryExceededError as e:
                     logger.error(
@@ -11469,8 +11530,16 @@ class Scheduler:
                                 )
                             self.block_aware_cache.clear_request_entry(request_id)
                         except Exception as e:
-                            logger.debug(
-                                f"Failed to submit async store for {request_id}: {e}"
+                            # fork: a failed store submit silently drops the
+                            # request's KV cache (cache-store loss). Surface at
+                            # warning + bump a counter so it is observable.
+                            self._async_store_submit_failures += 1
+                            logger.warning(
+                                "Failed to submit async store for %s: %s "
+                                "(total submit failures=%d)",
+                                request_id,
+                                e,
+                                self._async_store_submit_failures,
                             )
                     else:
                         # No extracted_cache to store, but ensure block leak guard.
@@ -11638,6 +11707,14 @@ class Scheduler:
         self._cache_rate_tracker.clear()
         self._boundary_snapshot_diagnostics.clear()
         self._last_prefix_cache_lookup = None
+
+        # fork: restore SpecPrefill RoPE patches; recovery reschedules all
+        # requests for re-prefill, and a stale offset RoPE would corrupt
+        # positions on the retry (mirrors
+        # _recover_from_generation_overflow_error).
+        active_specprefill = self._specprefill_active_request_id
+        if active_specprefill is not None:
+            self._cleanup_specprefill(active_specprefill)
 
         # Clear UID mappings
         _unregister_uid_rows_for_model(self.model)
@@ -11923,9 +12000,10 @@ class Scheduler:
         self._reclaim_prefill_headroom()
 
         # Clear any SpecPrefill RoPE patch tied to this request so the retry
-        # re-scores cleanly.
-        if self._specprefill_active_request_id == request.request_id:
-            self._specprefill_active_request_id = None
+        # re-scores cleanly. fork: must go through _cleanup_specprefill —
+        # clearing only the id would leave the _OffsetAdjustedRoPE wrappers
+        # installed on every attention layer.
+        self._cleanup_specprefill(request.request_id)
 
         # Restore mRoPE deltas if an external VLM prefill was interrupted before
         # its own restore ran (value stashed on the request in
@@ -12364,6 +12442,37 @@ class Scheduler:
         # Drain any pending deferred aborts
         self._pending_abort_ids.clear()
 
+        # fork: drain in-flight async store_cache futures BEFORE aborting, the
+        # same way shutdown() does. Two reasons: (1) _do_abort_request now skips
+        # teardown for requests with an in-flight store future (FIX 1), so
+        # without a drain those requests would never be finalized and the bare
+        # _pending_async_removes.clear() below would leak the store gate counter
+        # (no note_done) and drop Request refs while the worker still slices
+        # their KV buffers; (2) draining + _drain_pending_async_removes runs the
+        # Metal-safe deferred remove and note_done for each entry. After this,
+        # _pending_async_removes / _inflight_store_futures are empty and the
+        # abort loop takes the normal (non-deferred) path.
+        if self._inflight_store_futures:
+            inflight = list(self._inflight_store_futures.values())
+            logger.info(
+                "reset(): waiting for %d inflight async store_cache future(s)...",
+                len(inflight),
+            )
+            _done, not_done = concurrent.futures.wait(
+                inflight, timeout=FATAL_TEARDOWN_TIMEOUT_S
+            )
+            if not_done:
+                logger.warning(
+                    "reset(): %d async store_cache future(s) did not finish "
+                    "within %.0fs; finalizing remaining drain entries anyway",
+                    len(not_done),
+                    FATAL_TEARDOWN_TIMEOUT_S,
+                )
+        # Run the deferred-remove finalizer so each pending entry gets its
+        # Metal-safe batch_generator.remove + uid-map cleanup + gate note_done.
+        if self._pending_async_removes:
+            self._drain_pending_async_removes()
+
         # Abort all requests directly (reset is synchronous)
         for request_id in list(self.requests.keys()):
             self._do_abort_request(request_id)
@@ -12381,6 +12490,12 @@ class Scheduler:
         # Async store_cache bookkeeping. shutdown() drains these before us,
         # but clear here too so reset() is safe to call standalone (e.g. tests
         # or recovery paths) without leaking Request refs through stale futures.
+        # fork: account for any straggler entries the drain above couldn't
+        # finalize (a future that timed out) so the bare clear() doesn't leak
+        # the store gate counter (which would wedge admission backpressure).
+        if self._pending_async_removes and self._store_cache_gate is not None:
+            for _uid, _rid, _future in self._pending_async_removes:
+                self._store_cache_gate.note_done()
         self._pending_async_removes.clear()
         self._inflight_store_futures.clear()
         self._inflight_store_info.clear()
@@ -13120,109 +13235,6 @@ class Scheduler:
         # All KV cache data is on paged SSD, so no GPU memory pressure from PagedCache
         pass
 
-    def _evict_blocks_permanently(self, bytes_to_free: int) -> int:
-        """
-        Evict LRU blocks permanently (metadata cleanup).
-
-        In paged SSD-only mode, blocks don't store data in GPU memory.
-        This method just removes block metadata to free up slots.
-
-        Args:
-            bytes_to_free: Target bytes to free (used for estimation).
-
-        Returns:
-            Number of bytes freed (estimated).
-        """
-        if self.paged_cache_manager is None or self.memory_monitor is None:
-            return 0
-
-        # Estimate how many blocks to evict
-        block_size = self.config.paged_cache_block_size
-        num_blocks_to_evict = self.memory_monitor.estimate_blocks_to_free(
-            bytes_to_free, block_size
-        )
-
-        # Get evictable blocks in LRU order
-        evictable = self.paged_cache_manager.get_evictable_blocks(num_blocks_to_evict)
-
-        if not evictable:
-            logger.debug("No evictable blocks found for permanent eviction")
-            return 0
-
-        freed = 0
-        evicted_count = 0
-
-        for block in evictable:
-            # In paged SSD-only mode, just clear metadata (data is on paged SSD)
-            if self.paged_cache_manager.evict_block_permanently(block.block_id):
-                freed += self.memory_monitor.estimate_block_memory(block_size)
-                evicted_count += 1
-
-            if freed >= bytes_to_free:
-                break
-
-        if evicted_count > 0:
-            logger.info(
-                f"Evicted {evicted_count} blocks permanently "
-                f"(~{self._format_bytes(freed)} estimated)"
-            )
-
-        return freed
-
-    def _evict_blocks_to_cold(self, bytes_to_free: int) -> int:
-        """
-        Evict LRU blocks (with paged SSD cache configured).
-
-        In paged SSD-only mode, data is already on paged SSD, so this just evicts
-        block metadata from the index. The data remains on paged SSD and can
-        be re-discovered if the same token sequence is requested.
-
-        Args:
-            bytes_to_free: Target bytes to free (used for estimation).
-
-        Returns:
-            Number of bytes freed (estimated).
-        """
-        if self.paged_cache_manager is None or self.paged_ssd_cache_manager is None:
-            return 0
-
-        if self.memory_monitor is None:
-            return 0
-
-        # Estimate how many blocks to evict
-        block_size = self.config.paged_cache_block_size
-        num_blocks_to_evict = self.memory_monitor.estimate_blocks_to_free(
-            bytes_to_free, block_size
-        )
-
-        # Get evictable blocks in LRU order
-        evictable = self.paged_cache_manager.get_evictable_blocks(num_blocks_to_evict)
-
-        if not evictable:
-            logger.debug("No evictable blocks found")
-            return 0
-
-        evicted_count = 0
-
-        for block in evictable:
-            # In paged SSD-only mode, data is already on paged SSD
-            # Just evict the block metadata
-            if self.paged_cache_manager.evict_block_permanently(block.block_id):
-                evicted_count += 1
-
-        # Estimate bytes freed based on block count
-        estimated_freed = evicted_count * self.memory_monitor.estimate_block_memory(
-            block_size
-        )
-
-        if evicted_count > 0:
-            logger.info(
-                f"Evicted {evicted_count} blocks from index "
-                f"(data preserved on paged SSD, ~{self._format_bytes(estimated_freed)} metadata freed)"
-            )
-
-        return estimated_freed
-
     def _restore_block_from_cold(self, block_id: int, block_hash: bytes) -> bool:
         """
         Restore a block from cold storage (deprecated in paged SSD-only mode).
@@ -13260,39 +13272,6 @@ class Scheduler:
             f"Block {block_id} verified on paged SSD (hash={block_hash.hex()[:16]}...)"
         )
         return True
-
-    def restore_cold_blocks_for_request(self, request_id: str) -> int:
-        """
-        Verify all blocks needed for a request exist on paged SSD.
-
-        In paged SSD-only mode, blocks don't store cache_data. This method
-        just verifies that blocks exist on paged SSD.
-
-        Args:
-            request_id: Request ID.
-
-        Returns:
-            Number of blocks verified on paged SSD.
-        """
-        if self.paged_cache_manager is None or self.paged_ssd_cache_manager is None:
-            return 0
-
-        if self.block_aware_cache is None:
-            return 0
-
-        # Get block table for request
-        block_table = self.paged_cache_manager.request_tables.get(request_id)
-        if block_table is None:
-            return 0
-
-        verified = 0
-        for block_id in block_table.block_ids:
-            block = self.paged_cache_manager.blocks[block_id]
-            if block.block_hash is not None:
-                if self._restore_block_from_cold(block_id, block.block_hash):
-                    verified += 1
-
-        return verified
 
     def _collect_cache_counters(self) -> dict[str, int] | None:
         if self.block_aware_cache is None:
