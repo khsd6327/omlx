@@ -118,6 +118,8 @@
   "status.speed.token_generation": "Generování tokenů",
   "status.active_models.section_label": "Aktivní modely",
   "status.active_models.no_models": "Žádné načtené modely",
+  "status.active_models.residual_memory": "Nejsou načteny žádné modely, ale {memory} nativní paměti je stále obsazeno",
+  "status.active_models.residual_memory_hint": "Pokud se to po uvolnění mezipaměti nevyčistí, restartujte oMLX.",
   "status.active_models.active": "Aktivní",
   "status.active_models.waiting": "Čeká",
   "status.active_models.req": "pož.",

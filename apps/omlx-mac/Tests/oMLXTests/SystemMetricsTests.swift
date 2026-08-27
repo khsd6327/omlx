@@ -130,6 +130,8 @@ final class SystemMetricsTests: XCTestCase {
                 models: [],
                 modelMemoryUsed: nil,
                 modelMemoryMax: nil,
+                untrackedNativeMemory: nil,
+                untrackedNativeMemoryFormatted: nil,
                 totalActiveRequests: active,
                 totalWaitingRequests: 0
             ),
