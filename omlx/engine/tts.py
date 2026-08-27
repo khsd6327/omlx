@@ -22,7 +22,7 @@ from ..engine_core import get_mlx_executor
 from ..patches.mlx_audio_sampling import ensure_uncompiled_tts_samplers
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
-from .base import BaseNonStreamingEngine
+from .base import BaseNonStreamingEngine, sync_and_clear_mlx_cache
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +155,7 @@ class TTSEngine(BaseNonStreamingEngine):
 
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+        await loop.run_in_executor(get_mlx_executor(), sync_and_clear_mlx_cache)
         logger.info(f"TTS engine stopped: {self._model_name}")
 
     async def synthesize(

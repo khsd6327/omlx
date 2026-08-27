@@ -862,7 +862,7 @@ class TestBatchGeneratorDispatch:
             set_mtp_active(False)
             # Non-MTP model never triggers the MTP path.
             assert _is_mtp_eligible(_GenBatch(_NonMtpModel(), uids=[1])) is False
-            # Has mtp_forward but no attached head → still off.
+            # Has mtp_forward but no attached head -> still off.
             assert (
                 _is_mtp_eligible(_GenBatch(_MtpModelWithoutHead(), uids=[1])) is False
             )

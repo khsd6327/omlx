@@ -159,8 +159,8 @@ class TestEmbeddingModels:
         assert response.model == "all-MiniLM-L6-v2"
 
 
-class TestEmbeddingUtils:
-    """Tests for embedding utility functions."""
+class TestEmbeddingEncoding:
+    """Tests for embedding encoding helpers."""
 
     def test_encode_embedding_base64(self):
         """Test base64 encoding of embeddings."""
@@ -171,6 +171,45 @@ class TestEmbeddingUtils:
         decoded = base64.b64decode(encoded)
         values = struct.unpack(f"<{len(embedding)}f", decoded)
         assert list(values) == embedding
+
+
+class TestEmbeddingUtils:
+    """Tests for embedding utility and pooling helpers."""
+
+    def test_max_and_mean_sqrt_pooling_honor_attention_mask(self):
+        """Pooling helpers should ignore padded tokens."""
+        import mlx.core as mx
+
+        from omlx.models.base_model import max_pooling, mean_sqrt_len_pooling
+
+        hidden = mx.array(
+            [
+                [
+                    [1.0, 2.0],
+                    [3.0, 1.0],
+                    [100.0, 100.0],
+                ]
+            ]
+        )
+        mask = mx.array([[1, 1, 0]])
+
+        maxed = max_pooling(hidden, mask)
+        mean_sqrt = mean_sqrt_len_pooling(hidden, mask)
+
+        assert maxed.tolist() == [[3.0, 2.0]]
+        expected = [[4.0 / math.sqrt(2), 3.0 / math.sqrt(2)]]
+        assert np.allclose(np.array(mean_sqrt), np.array(expected), atol=1e-6)
+
+    def test_normalize_embeddings_clamps_zero_norm(self):
+        """Zero embeddings should normalize without NaN."""
+        import mlx.core as mx
+
+        from omlx.models.base_model import normalize_embeddings
+
+        normalized = normalize_embeddings(mx.array([[0.0, 0.0]]))
+
+        assert np.isfinite(np.array(normalized)).all()
+        assert normalized.tolist() == [[0.0, 0.0]]
 
     def test_encode_embedding_base64_empty(self):
         """Test base64 encoding of empty embedding."""
@@ -1057,7 +1096,7 @@ class TestEmbeddingEngine:
         engine = EmbeddingEngine("test-model")
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx") as mock_mx:
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear_cache:
             mock_model = MagicMock()
             mock_model.embed.return_value = EmbeddingOutput(
                 embeddings=[[0.1, 0.2]],
@@ -1069,8 +1108,7 @@ class TestEmbeddingEngine:
             asyncio.run(engine.start())
             asyncio.run(engine.embed(["Hello"]))
 
-            mock_mx.synchronize.assert_called_once()
-            mock_mx.clear_cache.assert_called_once()
+            clear_cache.assert_called_once()
 
     def test_engine_clears_metal_cache_per_concurrent_request(self):
         """Cache clear must fire per request even under concurrency (#684 regression).
@@ -1083,7 +1121,7 @@ class TestEmbeddingEngine:
         concurrency = 4
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx") as mock_mx:
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear_cache:
             mock_model = MagicMock()
             mock_model.embed.return_value = EmbeddingOutput(
                 embeddings=[[0.1, 0.2]],
@@ -1100,8 +1138,7 @@ class TestEmbeddingEngine:
 
             asyncio.run(run_concurrent())
 
-            assert mock_mx.synchronize.call_count == concurrency
-            assert mock_mx.clear_cache.call_count == concurrency
+            assert clear_cache.call_count == concurrency
 
     def test_engine_chunks_large_embedding_requests_and_clears_each_chunk(self):
         """Large embedding requests should not hold the whole batch in MLX memory."""
@@ -1115,7 +1152,7 @@ class TestEmbeddingEngine:
             )
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx") as mock_mx:
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache") as clear_cache:
             mock_model = MagicMock()
             mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model
@@ -1135,8 +1172,7 @@ class TestEmbeddingEngine:
                 ["text-2", "text-3"],
                 ["text-4"],
             ]
-            assert mock_mx.synchronize.call_count == 3
-            assert mock_mx.clear_cache.call_count == 3
+            assert clear_cache.call_count == 3
 
     def test_engine_snapshots_batch_size_per_request(self):
         """Live batch-size updates must not skip or duplicate active request inputs."""
@@ -1154,7 +1190,7 @@ class TestEmbeddingEngine:
             )
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx"):
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache"):
             mock_model = MagicMock()
             mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model
@@ -1188,7 +1224,7 @@ class TestEmbeddingEngine:
             )
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx"):
+             patch("omlx.engine.embedding.sync_and_clear_mlx_cache"):
             mock_model = MagicMock()
             mock_model.embed.side_effect = embed_side_effect
             MockModel.return_value = mock_model
@@ -1603,6 +1639,89 @@ class TestNativeEmbeddingLoading:
         result = model._load_native()
         assert result is False
         assert model._loaded is False
+
+    def test_resolve_pooling_mode_from_1_pooling_config(self, tmp_path):
+        """1_Pooling/config.json maps boolean keys to pooling_mode strings."""
+        from omlx.models.embedding import _resolve_pooling_mode
+
+        # bge-m3 style: CLS pooling.
+        (tmp_path / "1_Pooling").mkdir()
+        (tmp_path / "1_Pooling" / "config.json").write_text(
+            json.dumps(
+                {
+                    "pooling_mode_cls_token": True,
+                    "pooling_mode_mean_tokens": False,
+                    "pooling_mode_max_tokens": False,
+                    "pooling_mode_mean_sqrt_len_tokens": False,
+                }
+            )
+        )
+        assert _resolve_pooling_mode(tmp_path) == "cls"
+
+    def test_resolve_pooling_mode_mean_and_missing_and_malformed(self, tmp_path):
+        """Mean keys resolve to 'mean'; missing/malformed configs return None."""
+        from omlx.models.embedding import _resolve_pooling_mode
+
+        # Missing dir -> None (mean default).
+        assert _resolve_pooling_mode(tmp_path) is None
+
+        # Mean pooling.
+        (tmp_path / "1_Pooling").mkdir()
+        cfg = tmp_path / "1_Pooling" / "config.json"
+        cfg.write_text(
+            json.dumps(
+                {"pooling_mode_cls_token": False, "pooling_mode_mean_tokens": True}
+            )
+        )
+        assert _resolve_pooling_mode(tmp_path) == "mean"
+
+        # Malformed -> None, must not raise.
+        cfg.write_text("{not valid json")
+        assert _resolve_pooling_mode(tmp_path) is None
+
+    def test_load_native_passes_cls_pooling_to_model_args(self, tmp_path):
+        """bge-m3's 1_Pooling/config.json must populate pooling_config=cls."""
+        from safetensors.numpy import save_file
+
+        config = {
+            "model_type": "xlm-roberta",
+            "architectures": ["XLMRobertaModel"],
+            "hidden_size": 768,
+            "num_hidden_layers": 12,
+            "vocab_size": 250002,
+            "num_attention_heads": 12,
+            "intermediate_size": 3072,
+            "max_position_embeddings": 514,
+            "pad_token_id": 1,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "1_Pooling").mkdir()
+        (tmp_path / "1_Pooling" / "config.json").write_text(
+            json.dumps({"pooling_mode_cls_token": True})
+        )
+        save_file(
+            {"embeddings.word_embeddings.weight": np.zeros((1, 1), dtype=np.float32)},
+            str(tmp_path / "model.safetensors"),
+        )
+
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel(str(tmp_path))
+        tokenizer = self.MockNativeTokenizer(vocab_size=250002)
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=tokenizer,
+        ), patch(
+            "omlx.models.embedding.MLXEmbeddingModel._validate_native_weights",
+            return_value=None,
+        ), patch(
+            "omlx.models.xlm_roberta.Model.load_weights",
+            return_value=None,
+        ):
+            result = model._load_native()
+
+        assert result is True
+        assert model.model.config.pooling_config == {"pooling_mode": "cls"}
 
     def test_embed_produces_normalized_vectors(self, tmp_path):
         """Test that embed produces L2-normalized embedding vectors."""

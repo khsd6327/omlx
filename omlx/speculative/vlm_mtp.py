@@ -104,6 +104,19 @@ logger = logging.getLogger(__name__)
 # dispatcher that picks the correct config class based on ``model_type``.
 # This is safe to call multiple times (idempotent).
 
+def _default_clear_cache() -> None:
+    from ..scheduler import _sync_and_clear_cache
+
+    _sync_and_clear_cache()
+
+
+# What model_type strings count as a gemma4 assistant drafter. Kept as a
+# tuple so we can extend if upstream adds related drafter kinds later.
+GEMMA4_ASSISTANT_MODEL_TYPES: tuple[str, ...] = (
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+)
+
 
 def _patch_qwen35_mtp_config_for_moe() -> None:
     """Make ``qwen3_5_mtp`` module accept MoE ``text_config`` dicts.
@@ -382,6 +395,7 @@ def run_vlm_mtp_decode(
     token_dtype: mx.Dtype = mx.int32,
     eos_token_ids: Optional[Set[int]] = None,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    clear_cache: Optional[Callable[[], None]] = None,
 ) -> Generator[Union[int, List[Optional[int]]], None, None]:
     """Stream decoded tokens via mlx-vlm's MTP rounds.
 
@@ -395,6 +409,7 @@ def run_vlm_mtp_decode(
     already emitted the bonus token before the round loop starts
     (``emitted = 1`` baked in at the top of both helpers).
     """
+    clear_cache_fn = clear_cache or _default_clear_cache
     target_for_rounds = target_language_model
     drafter_model = drafter.model
     adapter_lm = getattr(target_language_model, "_language_model", None)
@@ -434,7 +449,10 @@ def run_vlm_mtp_decode(
             # stream covers the verify forwards while the default-stream
             # drain covers the engine stream the scheduler advances this
             # generator under (``with mx.stream(self._stream)``).
-            _sync_and_clear_cache(_vlm_generation_stream)
+            if clear_cache is None:
+                _sync_and_clear_cache(_vlm_generation_stream)
+            else:
+                clear_cache_fn()
             yield tokens
         return
 
@@ -460,5 +478,8 @@ def run_vlm_mtp_decode(
         token_dtype=token_dtype,
     ):
         # Same two-stream drain as the batched branch above.
-        _sync_and_clear_cache(_vlm_generation_stream)
+        if clear_cache is None:
+            _sync_and_clear_cache(_vlm_generation_stream)
+        else:
+            clear_cache_fn()
         yield tok

@@ -17,6 +17,10 @@ from PIL import Image, ImageOps
 
 from ..exceptions import InvalidRequestError
 
+# fork: cap decoded image data before allocating the base64 payload.
+MAX_IMAGE_BYTES = 64 * 1024 * 1024
+
+
 _IMAGE_INPUT_ERROR = (
     "Image inputs must be base64 data URIs "
     "(data:image/...;base64,...). Remote URLs and local file paths are not supported."
@@ -45,6 +49,14 @@ def _decode_base64_data_uri(value: str, *, field: str) -> bytes:
     ):
         raise InvalidRequestError(
             f"{field} must use a base64 image data URI.",
+            field=field,
+        )
+
+    padding = len(encoded) - len(encoded.rstrip("="))
+    decoded_size = len(encoded) * 3 // 4 - padding
+    if decoded_size > MAX_IMAGE_BYTES:
+        raise InvalidRequestError(
+            f"{field} exceeds the {MAX_IMAGE_BYTES // (1024 * 1024)} MB limit.",
             field=field,
         )
 

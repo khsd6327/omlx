@@ -20,7 +20,13 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 
 from ..utils.image import validate_image_data_uri
-from .base_model import last_token_pool, mean_pooling, normalize_embeddings
+from .base_model import (
+    last_token_pool,
+    max_pooling,
+    mean_pooling,
+    mean_sqrt_len_pooling,
+    normalize_embeddings,
+)
 from .mlx_embeddings_compat import (
     patch_qwen3_vl_processor_for_torch_free_image_loading,
 )
@@ -40,7 +46,24 @@ _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 # Pooling modes whose result depends on the attention mask. CLS reads a fixed
 # position, so it is mask-independent.
-_MASK_AWARE_POOLING_MODES = ("mean", "lasttoken")
+_MASK_AWARE_POOLING_MODES = (
+    "mean",
+    "lasttoken",
+    "max",
+    "mean_sqrt_len_tokens",
+)
+
+
+def _resolve_pooling_mode(model_path: Path) -> Optional[str]:
+    """Resolve the conventional sentence-transformers pooling config."""
+    config_path = model_path / "1_Pooling" / "config.json"
+    try:
+        if config_path.is_file():
+            with open(config_path) as fh:
+                return MLXEmbeddingModel._pooling_mode_from_config(json.load(fh))
+    except (OSError, ValueError, TypeError):
+        logger.debug("Could not read pooling config at %s", config_path)
+    return None
 
 
 @dataclass
@@ -153,6 +176,9 @@ class MLXEmbeddingModel:
                 "mean": "mean",
                 "lasttoken": "lasttoken",
                 "last_token": "lasttoken",
+                "max": "max",
+                "mean_sqrt_len": "mean_sqrt_len_tokens",
+                "mean_sqrt_len_tokens": "mean_sqrt_len_tokens",
             }
             mode = alias.get(declared.strip().lower())
             if mode:
@@ -161,6 +187,8 @@ class MLXEmbeddingModel:
             ("pooling_mode_cls_token", "cls"),
             ("pooling_mode_lasttoken", "lasttoken"),
             ("pooling_mode_mean_tokens", "mean"),
+            ("pooling_mode_max_tokens", "max"),
+            ("pooling_mode_mean_sqrt_len_tokens", "mean_sqrt_len_tokens"),
         ):
             if cfg.get(key):
                 return mode
@@ -249,6 +277,21 @@ class MLXEmbeddingModel:
                 k: v for k, v in config_dict.items() if k in known_fields
             }
             model_config["architectures"] = architectures
+
+            # bge-m3 (and other sentence-transformers models) keep their pooling
+            # mode in 1_Pooling/config.json, not config.json. Resolve it here so
+            # the native model can honor CLS pooling; without this, pooling_config
+            # stays None and bge-m3 dense vectors are silently mean-pooled.
+            resolved_pooling_mode = _resolve_pooling_mode(model_path)
+            if resolved_pooling_mode is not None:
+                model_config["pooling_config"] = {
+                    "pooling_mode": resolved_pooling_mode
+                }
+                logger.info(
+                    "Resolved pooling_mode='%s' for %s from 1_Pooling/config.json",
+                    resolved_pooling_mode,
+                    self.model_name,
+                )
 
             config = ModelArgs(**model_config)
             model_instance = Model(config)
@@ -383,6 +426,15 @@ class MLXEmbeddingModel:
             if self._pooling_mode == "mean" and attention_mask is not None:
                 return normalize_embeddings(
                     mean_pooling(last_hidden, attention_mask)
+                )
+            if self._pooling_mode == "max" and attention_mask is not None:
+                return normalize_embeddings(max_pooling(last_hidden, attention_mask))
+            if (
+                self._pooling_mode == "mean_sqrt_len_tokens"
+                and attention_mask is not None
+            ):
+                return normalize_embeddings(
+                    mean_sqrt_len_pooling(last_hidden, attention_mask)
                 )
 
         if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:

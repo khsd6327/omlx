@@ -201,7 +201,7 @@ class TestVLMToolForwarding:
     ]
 
     @staticmethod
-    def _process_chat_messages(*args):
+    def _process_chat_messages(*args, **kwargs):
         return "prompt", None, {}, None, 0, []
 
     @staticmethod
@@ -2600,7 +2600,7 @@ class TestVLMEngineFrequencyPenalty:
             generate=AsyncMock(return_value=self._fake_output()),
         )
 
-        def _mock_process(messages, tools, kwargs):
+        def _mock_process(messages, tools, kwargs, preextracted_media=None):
             return "<prompt>", None, {}, None, 0, []
 
         try:
