@@ -40,16 +40,20 @@ The server provides:
 
 import argparse
 import asyncio
+import hashlib  # fork: grammar compile LRU cache key
 import inspect
 import json
 import logging
 import os
+import threading  # fork: grammar compile LRU cache lock
 import time
 import uuid
+from collections import OrderedDict  # fork: grammar compile LRU cache
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Optional, Union
 
@@ -883,8 +887,7 @@ def _streaming_error_payload(e: Exception, context: str) -> dict:
     if isinstance(e, PrefillMemoryExceededError):
         logger.warning(f"{context} prefill rejected: {e}")
         return _prefill_memory_openai_error_body(e)
-    logger.error(f"Error during {context}: {e}")
-    return {"error": {"message": str(e), "type": "server_error"}}
+    return _stream_error_payload(e, context)
 
 
 def _prefill_memory_openai_error_body(
@@ -1202,7 +1205,8 @@ async def get_engine(
     except ModelBusyError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except EnginePoolError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Engine pool error for model '%s'", model_id)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
     # Validate engine type. If a lease was taken above but validation fails,
     # release it before raising so a rejected request never leaks an in_use
@@ -1855,6 +1859,56 @@ def validate_context_window(
         )
 
 
+async def _encode_tokens_for_engine(engine: BaseEngine, prompt: str) -> list[int]:
+    encode_async = getattr(engine, "_encode_prompt_async", None)
+    if callable(encode_async):
+        return list(await encode_async(prompt))
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(lambda tok, text: list(tok.encode(text)), engine.tokenizer, prompt),
+    )
+
+
+async def _count_prompt_tokens_for_engine(
+    engine: BaseEngine, prompt: str
+) -> int:
+    return len(await _encode_tokens_for_engine(engine, prompt))
+
+
+async def _count_chat_tokens_for_engine(
+    engine: BaseEngine,
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    *,
+    chat_template_kwargs: dict | None = None,
+    is_partial: bool | None = None,
+) -> int:
+    count_async = getattr(engine, "_count_chat_tokens_async", None)
+    if callable(count_async) and inspect.iscoroutinefunction(count_async):
+        return int(
+            await count_async(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=is_partial,
+            )
+        )
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            engine.count_chat_tokens,
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        ),
+    )
+
+
 def init_server(
     model_dirs: str | list[str],
     scheduler_config=None,
@@ -2081,6 +2135,8 @@ def init_server(
     _server_state.oq_manager = OQManager(
         model_dirs=[str(d) for d in dir_list],
         on_complete=_refresh_models_after_download,
+        # fork: lets start_quantization refuse to run while models serve
+        engine_pool_getter=lambda: _server_state.engine_pool,
     )
     set_oq_manager(_server_state.oq_manager)
     logger.info("oQ Quantizer initialized")
@@ -2193,6 +2249,30 @@ async def _safe_anext(ait):
         return _KEEPALIVE_SENTINEL
 
 
+# fork: sanitized error body for mid-stream / post-keepalive error frames.
+# Once streaming has started the registered exception handlers can't run,
+# so these frames are the only error channel — they must not leak raw
+# exception text (paths, model internals), mirroring the non-streaming
+# 500 handling. HTTPException details are client-intended and pass through.
+def _stream_error_payload(e: BaseException, context: str) -> dict:
+    if isinstance(e, HTTPException):
+        detail = e.detail if isinstance(e.detail, str) else "Request failed"
+        return {
+            "error": {
+                "message": detail,
+                "type": "api_error",
+                "code": e.status_code,
+            }
+        }
+    logger.exception("Error during %s", context)
+    return {
+        "error": {
+            "message": "Internal server error",
+            "type": "server_error",
+        }
+    }
+
+
 async def _with_sse_keepalive(
     generator: AsyncIterator[str],
     http_request: Optional["FastAPIRequest"] = None,
@@ -2283,10 +2363,9 @@ async def _with_sse_keepalive(
                         logger.warning(f"SSE generator prefill rejected: {e}")
                         error_data = _prefill_memory_openai_error_body(e)
                     else:
-                        logger.error(f"SSE generator error: {e}")
-                        error_data = {
-                            "error": {"message": str(e), "type": "server_error"}
-                        }
+                        # fork: sanitize non-prefill errors (don't leak raw
+                        # exception text in streaming frames).
+                        error_data = _stream_error_payload(e, "SSE streaming")
                     yield f"data: {json.dumps(error_data)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -2392,11 +2471,19 @@ async def _with_json_keepalive(
             if keepalive_elapsed >= interval:
                 keepalive_elapsed = 0.0
                 yield " "
+        # fork: once the first keepalive byte went out, 200 headers are
+        # committed and exception handlers can't run — without this catch a
+        # failed build coroutine produced "200 OK" with a blank body and the
+        # real error vanished. Emit a parseable error JSON body instead.
         try:
             result = task.result()
         except PrefillMemoryExceededError as e:
             logger.warning(f"JSON keepalive prefill rejected: {e}")
             yield json.dumps(_prefill_memory_openai_error_body(e))
+            return
+        except Exception as e:
+            # fork: sanitize all other errors (no raw exception text).
+            yield json.dumps(_stream_error_payload(e, "non-streaming response"))
             return
         if result is not None:
             yield result
@@ -2494,6 +2581,7 @@ async def health(response: Response):
 
     pool_status = None
     if _server_state.engine_pool is not None:
+        pool = _server_state.engine_pool
         enforcer = _server_state.process_memory_enforcer
         ceiling = 0
         if enforcer is not None:
@@ -2501,11 +2589,22 @@ async def health(response: Response):
                 ceiling = enforcer.get_final_ceiling()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Health memory ceiling unavailable: %s", exc)
+        untracked_native_memory = int(
+            getattr(pool, "untracked_native_memory", 0) or 0
+        )
+        observed_native_memory = int(
+            getattr(pool, "observed_native_memory", 0) or 0
+        )
         pool_status = {
-            "model_count": _server_state.engine_pool.model_count,
-            "loaded_count": _server_state.engine_pool.loaded_model_count,
+            "model_count": pool.model_count,
+            "loaded_count": pool.loaded_model_count,
             "final_ceiling": ceiling,
-            "current_model_memory": _server_state.engine_pool.current_model_memory,
+            "current_model_memory": pool.current_model_memory,
+            "observed_native_memory": observed_native_memory,
+            "untracked_native_memory": untracked_native_memory,
+            "effective_model_memory": (
+                pool.current_model_memory + untracked_native_memory
+            ),
         }
 
     loading = not _server_state.pinned_preload_complete
@@ -2535,6 +2634,9 @@ async def server_status(_: bool = Depends(verify_api_key)):
     models_loaded = 0
     models_loading = 0
     loaded_models = []
+    model_memory_accounted = 0
+    untracked_native_memory = 0
+    observed_native_memory = 0
     model_memory_used = 0
     model_memory_max = None
 
@@ -2542,7 +2644,14 @@ async def server_status(_: bool = Depends(verify_api_key)):
         models_discovered = pool.model_count
         models_loaded = pool.loaded_model_count
         loaded_models = pool.get_loaded_model_ids()
-        model_memory_used = pool.current_model_memory
+        model_memory_accounted = pool.current_model_memory
+        untracked_native_memory = int(
+            getattr(pool, "untracked_native_memory", 0) or 0
+        )
+        observed_native_memory = int(
+            getattr(pool, "observed_native_memory", 0) or 0
+        )
+        model_memory_used = model_memory_accounted + untracked_native_memory
         enforcer = _server_state.process_memory_enforcer
         if enforcer is not None:
             try:
@@ -2556,11 +2665,16 @@ async def server_status(_: bool = Depends(verify_api_key)):
     # Aggregate active/waiting requests across all loaded engines
     active_requests = 0
     waiting_requests = 0
+    runtime_stats = {}
     if pool is not None:
-        for entry in pool._entries.values():
+        for model_id, entry in pool._entries.items():
             engine = entry.engine
             if engine is None:
                 continue
+            try:
+                runtime_stats[model_id] = engine.get_stats()
+            except Exception as e:
+                runtime_stats[model_id] = {"error": str(e)}
             async_core = getattr(engine, "_engine", None)
             if async_core is None:
                 continue
@@ -2591,13 +2705,23 @@ async def server_status(_: bool = Depends(verify_api_key)):
         "avg_prefill_tps": snapshot["avg_prefill_tps"],
         "avg_generation_tps": snapshot["avg_generation_tps"],
         "model_memory_used": model_memory_used,
+        "model_memory_accounted": model_memory_accounted,
+        "observed_native_memory": observed_native_memory,
+        "untracked_native_memory": untracked_native_memory,
         "model_memory_max": model_memory_max,
         "model_memory_used_formatted": (
             format_size(model_memory_used) if model_memory_used else "0B"
         ),
+        "untracked_native_memory_formatted": (
+            format_size(untracked_native_memory)
+            if untracked_native_memory
+            else "0B"
+        ),
         "model_memory_max_formatted": (
             format_size(model_memory_max) if model_memory_max else "unlimited"
         ),
+        # fork: per-model runtime engine stats in the status payload
+        "runtime_stats": runtime_stats,
         "custom_kernels": native_kernel_status(),
         "ane_prefill": _ane_prefill_status(pool),
     }
@@ -2742,7 +2866,8 @@ async def _preprocess_markitdown_files_for_llm(
     except MarkItDownRequestError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        logger.exception("MarkItDown preprocessing failed")
+        raise HTTPException(status_code=500, detail="Internal server error") from exc
     return request.model_copy(update={"messages": messages})
 
 
@@ -2875,7 +3000,8 @@ async def _create_markitdown_chat_completion(
         except MarkItDownRequestError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            logger.exception("MarkItDown preprocessing failed")
+            raise HTTPException(status_code=500, detail="Internal server error") from exc
 
         if not markdown:
             raise HTTPException(
@@ -3049,7 +3175,19 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await _server_state.engine_pool._unload_engine(model_id)
+    # fork: the old direct _unload_engine call bypassed BOTH the pool lock
+    # and every active-request guard — any caller with an inference key
+    # could tear down in-flight generations. Route through the guarded
+    # helper and surface a 409 when the model is busy or pinned.
+    unloaded = await _server_state.engine_pool.unload_if_idle_unpinned(model_id)
+    if not unloaded:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Model busy or pinned: {model_id} "
+                "(has in-flight requests, an active lease, or is pinned)"
+            ),
+        )
     return {"status": "ok", "model_id": model_id}
 
 
@@ -3086,7 +3224,8 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     except EnginePoolError as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        logger.exception("Failed to load model '%s'", model_id)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
 
@@ -3354,7 +3493,7 @@ async def create_completion(
         # Validate context window for each prompt
         prompt_token_ids_by_prompt = []
         for prompt in prompts:
-            prompt_token_ids = list(engine.tokenizer.encode(prompt))
+            prompt_token_ids = await _encode_tokens_for_engine(engine, prompt)
             prompt_token_ids_by_prompt.append(prompt_token_ids)
             validate_context_window(len(prompt_token_ids), request.model)
 
@@ -3688,7 +3827,7 @@ async def create_chat_completion(
         )
         if structured_outputs is not None or response_format:
             await engine.start()
-        compiled_grammar = _compile_grammar_for_request(
+        compiled_grammar = await _compile_grammar_for_request_async(
             engine,
             structured_outputs=structured_outputs,
             response_format=response_format,
@@ -3754,7 +3893,8 @@ async def create_chat_completion(
             unsupported_mid_system_policy=_unsupported_mid_system_policy(),
         )
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens = await _count_chat_tokens_for_engine(
+                engine,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -4418,6 +4558,87 @@ def _compile_grammar_for_request(
     return None
 
 
+# fork: xgrammar compilation of a complex JSON schema takes hundreds of ms
+# to seconds and ran synchronously on the event loop, stalling every
+# concurrent SSE stream. Run it on the default thread pool and cache
+# compiled grammars per engine (lifetime tied to the engine object, so an
+# unload/reload naturally drops the cache). xgrammar's GrammarCompiler and
+# compiled grammars are immutable/thread-safe.
+_GRAMMAR_COMPILE_LRU_MAX = 64
+
+
+def _grammar_cache_key(
+    structured_outputs, response_format, chat_template_kwargs, reasoning_parser
+) -> str:
+    def _norm(obj) -> str:
+        if obj is None:
+            return ""
+        dump = getattr(obj, "model_dump_json", None)
+        if callable(dump):
+            return dump()
+        try:
+            return json.dumps(obj, sort_keys=True, default=repr)
+        except (TypeError, ValueError):
+            return repr(obj)
+
+    raw = "\x1f".join(
+        (
+            _norm(structured_outputs),
+            _norm(response_format),
+            _norm(chat_template_kwargs),
+            str(reasoning_parser or ""),
+        )
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+async def _compile_grammar_for_request_async(
+    engine: BaseEngine,
+    structured_outputs=None,
+    response_format=None,
+    chat_template_kwargs=None,
+    reasoning_parser=None,
+):
+    """Async wrapper for _compile_grammar_for_request: executor + per-engine LRU."""
+    if structured_outputs is None and response_format is None:
+        return None
+
+    key = _grammar_cache_key(
+        structured_outputs, response_format, chat_template_kwargs, reasoning_parser
+    )
+    cache = getattr(engine, "_grammar_compile_lru", None)
+    lock = getattr(engine, "_grammar_compile_lru_lock", None)
+    if cache is None or lock is None:
+        cache = OrderedDict()
+        lock = threading.Lock()
+        engine._grammar_compile_lru = cache
+        engine._grammar_compile_lru_lock = lock
+    with lock:
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+
+    loop = asyncio.get_running_loop()
+    compiled = await loop.run_in_executor(
+        None,
+        partial(
+            _compile_grammar_for_request,
+            engine,
+            structured_outputs=structured_outputs,
+            response_format=response_format,
+            chat_template_kwargs=chat_template_kwargs,
+            reasoning_parser=reasoning_parser,
+        ),
+    )
+    if compiled is not None:
+        with lock:
+            cache[key] = compiled
+            cache.move_to_end(key)
+            while len(cache) > _GRAMMAR_COMPILE_LRU_MAX:
+                cache.popitem(last=False)
+    return compiled
+
+
 def _warn_response_format_not_enforced(response_format, error=None):
     """Log that a ``response_format`` request fell back to prompt injection.
 
@@ -4748,7 +4969,7 @@ async def stream_chat_completion(
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
-    accumulated_text = ""
+    accumulated_text_parts: list[str] = []
     has_tools = bool(kwargs.get("tools"))
     start_in_thinking = False
     try:
@@ -4805,7 +5026,7 @@ async def stream_chat_completion(
                 first_token_time = time.perf_counter()
             last_output = output
             if output.new_text:
-                accumulated_text += output.new_text
+                accumulated_text_parts.append(output.new_text)
 
             if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
@@ -4923,6 +5144,7 @@ async def stream_chat_completion(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    accumulated_text = "".join(accumulated_text_parts)
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
@@ -5190,7 +5412,7 @@ async def stream_anthropic_messages(
     first_token_time = None
 
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    accumulated_text = ""
+    accumulated_text_parts: list[str] = []
 
     # Track content blocks with thinking separation. Some templates open the
     # thinking block in the prompt itself, so the generated text starts with
@@ -5241,16 +5463,13 @@ async def stream_anthropic_messages(
     estimated_input_tokens = 0
     try:
         if hasattr(engine, "tokenizer") and engine.tokenizer is not None:
-            # Build the prompt using chat template
-            template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-            if kwargs.get("tools"):
-                template_kwargs["tools"] = kwargs["tools"]
-            if kwargs.get("chat_template_kwargs"):
-                template_kwargs.update(kwargs["chat_template_kwargs"])
-            prompt = engine.tokenizer.apply_chat_template(messages, **template_kwargs)
-            # Tokenize to count
-            tokens = engine.tokenizer.encode(prompt)
-            estimated_input_tokens = len(tokens)
+            # fork: offload tokenizer work off the request path (f6eb535)
+            estimated_input_tokens = await _count_chat_tokens_for_engine(
+                engine,
+                messages,
+                kwargs.get("tools"),
+                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+            )
     except Exception as e:
         logger.debug(f"Could not estimate input tokens: {e}")
 
@@ -5270,7 +5489,7 @@ async def stream_anthropic_messages(
                 first_token_time = time.perf_counter()
 
             if output.new_text:
-                accumulated_text += output.new_text
+                accumulated_text_parts.append(output.new_text)
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
 
                 # Emit thinking content as thinking block
@@ -5346,8 +5565,8 @@ async def stream_anthropic_messages(
                 "invalid_request_error", _prefill_memory_error_detail(e)
             )
         else:
-            logger.error(f"Error during Anthropic streaming: {e}")
-            yield create_error_event("api_error", str(e))
+            payload = _stream_error_payload(e, "Anthropic streaming")
+            yield create_error_event("api_error", payload["error"]["message"])
         yield create_message_stop_event()
         return
 
@@ -5426,6 +5645,7 @@ async def stream_anthropic_messages(
     # For Harmony models, use tool_calls from output (parsed by HarmonyStreamingParser)
     # For other models, parse from accumulated text
     tool_calls = None
+    accumulated_text = "".join(accumulated_text_parts)
     if last_output and last_output.tool_calls:
         # Protocol parser already extracted structured tool calls.
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -5820,7 +6040,8 @@ async def create_anthropic_message(
 
         # Validate context window before sending to model
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens = await _count_chat_tokens_for_engine(
+                engine,
                 messages,
                 internal_tools,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -6202,7 +6423,7 @@ async def create_response(
                 )
                 await engine.start()
                 rf = ResponseFormat(**response_format)
-                compiled_grammar = _compile_grammar_for_request(
+                compiled_grammar = await _compile_grammar_for_request_async(
                     engine,
                     response_format=rf,
                     chat_template_kwargs=merged_ct_kwargs or None,
@@ -6256,7 +6477,8 @@ async def create_response(
 
         # Validate context window
         try:
-            num_prompt_tokens = engine.count_chat_tokens(
+            num_prompt_tokens = await _count_chat_tokens_for_engine(
+                engine,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -6498,7 +6720,9 @@ async def create_response(
                     )
 
             reasoning_token_count = (
-                len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+                await _count_prompt_tokens_for_engine(engine, reasoning_text)
+                if reasoning_text
+                else 0
             )
             usage = build_response_usage(
                 input_tokens=output.prompt_tokens,
@@ -6564,7 +6788,7 @@ async def stream_responses_api(
     start_time = time.perf_counter()
     first_token_time = None
     last_output = None
-    accumulated_text = ""
+    accumulated_text_parts: list[str] = []
     accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
@@ -6824,7 +7048,7 @@ async def stream_responses_api(
                 first_token_time = time.perf_counter()
             last_output = output
             if output.new_text:
-                accumulated_text += output.new_text
+                accumulated_text_parts.append(output.new_text)
 
             if stream_content and output.new_text:
                 thinking_delta, content_delta = thinking_parser.feed(output.new_text)
@@ -6941,6 +7165,7 @@ async def stream_responses_api(
 
     # Parse tool calls from accumulated text
     tool_calls = None
+    accumulated_text = "".join(accumulated_text_parts)
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
@@ -7225,7 +7450,9 @@ async def stream_responses_api(
             f"({tokens_per_sec:.1f} tok/s)"
         )
         reasoning_token_count = (
-            len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+            await _count_prompt_tokens_for_engine(engine, reasoning_text)
+            if reasoning_text
+            else 0
         )
         usage_data = {
             "input_tokens": last_output.prompt_tokens,

@@ -54,7 +54,10 @@ class TestSSEKeepaliveExceptionHandling:
         assert len(error_items) == 1
         error_data = json.loads(error_items[0].removeprefix("data: ").strip())
         assert "error" in error_data
-        assert "Memory limit exceeded during prefill" in error_data["error"]["message"]
+        # fork: raw exception text is sanitized out of streaming error
+        # frames (logged server-side instead).
+        assert "Memory limit exceeded" not in error_data["error"]["message"]
+        assert error_data["error"]["message"] == "Internal server error"
         assert error_data["error"]["type"] == "server_error"
 
         # Must end with [DONE]
@@ -76,7 +79,9 @@ class TestSSEKeepaliveExceptionHandling:
         error_items = [i for i in items if i.startswith("data: {")]
         assert len(error_items) == 1
         error_data = json.loads(error_items[0].removeprefix("data: ").strip())
-        assert "Block allocation failed" in error_data["error"]["message"]
+        # fork: raw exception text sanitized (see above).
+        assert "Block allocation failed" not in error_data["error"]["message"]
+        assert error_data["error"]["message"] == "Internal server error"
         assert "data: [DONE]\n\n" in items
 
     @pytest.mark.asyncio

@@ -943,6 +943,7 @@ def test_step_prefill_reclaims_before_first_guard():
         _supports_skip_lm_head=lambda: False,
         _adaptive_chunk_size=lambda n, **kwargs: events.append("adaptive") or n,
         _guard_prefill_chunk=lambda n, **kwargs: events.append("guard") or n,
+        _periodic_clear_threshold_bytes=lambda: 10**12,
         _record_chunk_transient=MagicMock(),
         _maybe_record_fixed_state_bytes=MagicMock(),
     )
@@ -1008,6 +1009,9 @@ def _requeue_ctx():
         model=SimpleNamespace(),  # no _language_model attr → rope restore skipped
         _MAX_PREFILL_OOM_RETRIES=2,
         _reclaim_prefill_headroom=lambda: 0,
+        # fork: the requeue path now unpatches SpecPrefill RoPE via
+        # _cleanup_specprefill instead of clearing only the id.
+        _cleanup_specprefill=lambda request_id: None,
     )
     return ns
 

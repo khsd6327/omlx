@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 try:
-    import mlx.core as mx
+    import mlx.core  # noqa: F401
 
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
 
+from ..engine.base import sync_and_clear_mlx_cache
 from ..model_discovery import _decode_hf_cache_model_id, _has_vision_subconfig
 
 logger = logging.getLogger(__name__)
@@ -165,6 +166,7 @@ class OQManager:
         self,
         model_dirs: list[str],
         on_complete: Optional[Callable] = None,
+        engine_pool_getter: Optional[Callable] = None,
     ):
         self._model_dirs = [Path(d) for d in model_dirs]
         self._output_dir = self._model_dirs[0] if self._model_dirs else Path(".")
@@ -174,6 +176,9 @@ class OQManager:
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
         self._quant_sem = asyncio.Semaphore(1)
+        # fork: used to refuse quantization while models are serving (see
+        # start_quantization). Callable returning the EnginePool or None.
+        self._engine_pool_getter = engine_pool_getter
 
     def update_model_dirs(self, model_dirs: list[str]) -> None:
         """Update model directory paths."""
@@ -427,6 +432,39 @@ class OQManager:
                     )
                 )
 
+        # fork: in-process quantization cannot run concurrently with
+        # inference. oq.py's sanitize plan discovery monkey-patches
+        # process-global mx.eval/mx.synchronize/mx.clear_cache (no-ops for
+        # the duration), and the streaming path calls bare mx.eval /
+        # mx.clear_cache from a non-executor thread — both race in-flight
+        # Metal command buffers of serving models (#300/#888/#1106 class).
+        # Refuse while any model is loaded or loading; that gate also
+        # guarantees the machine has headroom for the job (loaded models are
+        # the dominant memory consumers). A separate system-RAM check was
+        # dropped: psutil.available is the wrong gauge on Apple unified
+        # memory (quantization streams from the mmap'd source, and the real
+        # ceiling is the Metal/wired limit the enforcer tracks), and the
+        # fixed source+6GB estimate spuriously blocked small jobs on
+        # memory-constrained hosts and CI runners.
+        pool = self._engine_pool_getter() if self._engine_pool_getter else None
+        if pool is not None:
+            try:
+                busy_getter = getattr(pool, "get_loaded_or_loading_model_ids", None)
+                if callable(busy_getter):
+                    busy = busy_getter()
+                else:
+                    busy = pool.get_loaded_model_ids()
+            except Exception:  # noqa: BLE001 - gate must never crash start
+                busy = []
+            if busy:
+                raise ValueError(
+                    "Cannot start quantization while models are loaded or "
+                    f"loading ({', '.join(sorted(busy))}). In-process "
+                    "quantization patches global MLX evaluation and performs "
+                    "unsynchronized cache clears that corrupt concurrent "
+                    "inference. Unload all models first and wait for any "
+                    "in-progress loads to finish (Models tab)."
+                )
         task_id = str(uuid.uuid4())
         task = QuantTask(
             task_id=task_id,
@@ -521,8 +559,7 @@ class OQManager:
         if HAS_MLX:
             for _attempt in range(3):
                 try:
-                    mx.synchronize()
-                    mx.clear_cache()
+                    sync_and_clear_mlx_cache()
                     break
                 except Exception:
                     await asyncio.sleep(1.0)
@@ -568,8 +605,7 @@ class OQManager:
                 if HAS_MLX:
                     for _ in range(3):
                         try:
-                            mx.synchronize()
-                            mx.clear_cache()
+                            sync_and_clear_mlx_cache()
                             break
                         except Exception:
                             await asyncio.sleep(1.0)
