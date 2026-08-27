@@ -50,6 +50,7 @@ def _make_fixture(monkeypatch, drafter_returns_uid):
         _vlm_mtp_drafter=object(),  # a drafter is configured
         _route_to_vlm_mtp=fake_route,
         _finalize_chunked_prefill_cache_for_insert=lambda req, cache: None,
+        _sampler_for_insert=lambda request, sampler: sampler,
         _stream=mx.default_stream(mx.default_device()),
         batch_generator=SimpleNamespace(insert=fake_bg_insert),
         model=SimpleNamespace(),  # no register_rope_delta attr -> skipped

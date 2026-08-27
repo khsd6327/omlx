@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image
 
+import omlx.utils.image as image_utils
 from omlx.exceptions import InvalidRequestError
 from omlx.utils.image import (
     compute_image_hash,
@@ -115,6 +116,14 @@ class TestLoadImage:
         data = base64.b64encode(b"hello").decode()
         with pytest.raises(InvalidRequestError):
             load_image(f"data:text/plain;base64,{data}")
+
+    def test_rejects_image_data_over_size_limit(self, monkeypatch):
+        """Oversized image data is rejected before base64 allocation."""
+        monkeypatch.setattr(image_utils, "get_max_image_bytes", lambda: 8)
+        data = base64.b64encode(b"x" * 2048).decode()
+
+        with pytest.raises(InvalidRequestError, match="exceeds the"):
+            load_image(f"data:image/png;base64,{data}")
 
 
 # =============================================================================
