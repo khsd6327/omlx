@@ -129,6 +129,12 @@ _PREFILL_ABORT_MARGIN: dict[str, float] = {
 _EMERGENCY_OVER_CEILING_MARGIN_BYTES = 2 * 1024**3
 _EMERGENCY_OVER_CEILING_POLLS = 2
 _HOT_CACHE_RESERVATION_SLACK_BYTES = 512 * 1024**2
+
+# fork: once aborting in-flight requests provably cannot bring the process
+# back under the ceiling (resident model weights alone already exceed it),
+# stop re-aborting every poll. Hold off re-arming the emergency brake for this
+# many seconds so newly admitted requests aren't killed on every 1s tick.
+_EMERGENCY_ABORT_BACKOFF_SECONDS = 30.0
 # Longest a prefill waits for released dirty hot-cache blocks to reach SSD.
 _HOT_CACHE_WRITE_WAIT_S = 5.0
 # Released memory counts toward the dynamic ceiling until vm_stat reports it.
@@ -478,6 +484,10 @@ class ProcessMemoryEnforcer:
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
         self._over_ceiling_polls: int = 0
+        # fork: degraded-state latch for the "abort cannot help" case (resident
+        # weights alone exceed the ceiling).
+        self._emergency_abort_backoff_until: float = 0.0
+        self._emergency_weights_over_ceiling_warned: bool = False
         # Consecutive hard-pressure polls we have deferred destructive
         # enforcement while a fat Metal buffer pool drains at the next
         # prefill chunk / step boundary. See the grace check in
@@ -1969,20 +1979,57 @@ class ProcessMemoryEnforcer:
                             else:
                                 emergency_current = 0
                             if emergency and emergency_current >= emergency_limit:
-                                aborted = await (
-                                    self._abort_loaded_requests_for_memory_emergency()
-                                )
-                                if aborted > 0:
-                                    logger.warning(
-                                        "Emergency memory pressure: aborted "
-                                        "%d in-flight request(s) "
-                                        "(current=%s, ceiling=%s); models "
-                                        "kept loaded.",
-                                        aborted,
-                                        _format_gb(emergency_current),
-                                        _format_gb(ceiling),
+                                # fork: aborting requests only frees KV cache.
+                                # When resident weights alone exceed the
+                                # ceiling, re-aborting every poll just kills
+                                # each newly admitted request. Latch a degraded
+                                # state and back off instead.
+                                try:
+                                    resident_weights = int(
+                                        self._engine_pool.current_model_memory
                                     )
-                                    break
+                                except (TypeError, ValueError):
+                                    resident_weights = 0
+                                now = time.monotonic()
+                                abort_cannot_help = (
+                                    resident_weights > 0 and resident_weights >= ceiling
+                                )
+                                if abort_cannot_help:
+                                    if not self._emergency_weights_over_ceiling_warned:
+                                        logger.warning(
+                                            "Emergency memory pressure but "
+                                            "resident model weights (%s) alone "
+                                            "exceed the ceiling (%s): aborting "
+                                            "in-flight requests cannot recover "
+                                            "memory. Suppressing further "
+                                            "emergency aborts.",
+                                            _format_gb(resident_weights),
+                                            _format_gb(ceiling),
+                                        )
+                                        self._emergency_weights_over_ceiling_warned = (
+                                            True
+                                        )
+                                    self._emergency_abort_backoff_until = (
+                                        now + _EMERGENCY_ABORT_BACKOFF_SECONDS
+                                    )
+                                elif now >= self._emergency_abort_backoff_until:
+                                    aborted = await (
+                                        self._abort_loaded_requests_for_memory_emergency()
+                                    )
+                                    self._emergency_abort_backoff_until = (
+                                        now + _EMERGENCY_ABORT_BACKOFF_SECONDS
+                                    )
+                                    if aborted > 0:
+                                        logger.warning(
+                                            "Emergency memory pressure: aborted "
+                                            "%d in-flight request(s) "
+                                            "(current=%s, ceiling=%s); models "
+                                            "kept loaded.",
+                                            aborted,
+                                            _format_gb(emergency_current),
+                                            _format_gb(ceiling),
+                                        )
+                                        break
 
                             # Nothing to evict (all pinned) and no load to
                             # abort — but the resident footprint may still hold
@@ -2026,6 +2073,9 @@ class ProcessMemoryEnforcer:
             post_level = "hard"
         if post_ceiling <= 0 or post_current < post_ceiling:
             self._over_ceiling_polls = 0
+            # fork: recovered below the ceiling; re-arm the emergency brake.
+            self._emergency_abort_backoff_until = 0.0
+            self._emergency_weights_over_ceiling_warned = False
         if post_level == "ok":
             # Same reset as the pre-action check: eviction inside this tick
             # may already have ended the pressure episode.
